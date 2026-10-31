@@ -14,14 +14,13 @@ const BOARD_LEFT: f32 = -RESOLUTION_WIDTH / 2.0 + 3.0 * GRID_BLOCK_SIZE;
 const BOARD_TOP: f32 = RESOLUTION_HEIGHT / 2.0 - GRID_BLOCK_SIZE;
 const BOARD_RIGHT: f32 = BOARD_LEFT + BOARD_COLUMNS as f32 * GRID_BLOCK_SIZE;
 const BOARD_BOTTOM: f32 = BOARD_TOP - BOARD_ROWS as f32 * GRID_BLOCK_SIZE;
-const PLAYABLE_LEFT_X: f32 = BOARD_LEFT + GRID_BLOCK_SIZE / 2.0;
-const PLAYABLE_RIGHT_X: f32 = BOARD_RIGHT - GRID_BLOCK_SIZE / 2.0;
-const PLAYABLE_TOP_Y: f32 = BOARD_TOP - GRID_BLOCK_SIZE / 2.0;
-const PLAYABLE_BOTTOM_Y: f32 = BOARD_BOTTOM + GRID_BLOCK_SIZE / 2.0;
 const HEALTH_PANEL_INSET: f32 = 6.0;
 const HEALTH_PANEL_WIDTH: f32 = 3.0 * GRID_BLOCK_SIZE - 2.0 * HEALTH_PANEL_INSET;
 const HEALTH_PANEL_HEIGHT: f32 = GRID_BLOCK_SIZE - 2.0 * HEALTH_PANEL_INSET;
+const HEALTH_PANEL_BORDER: f32 = 3.0;
+const ENERGY_BAR_SIDE_PADDING: f32 = 6.0;
 const HEART_COUNT: usize = 5;
+const MAX_STRENGTH: u8 = 5;
 const INVENTORY_ITEMS: [(&str, &str); 14] = [
     ("Water", "items/water.png"),
     ("Salt", "items/salt.png"),
@@ -40,10 +39,59 @@ const INVENTORY_ITEMS: [(&str, &str); 14] = [
 ];
 
 #[derive(Component)]
-struct Player;
+struct Player(PlayerId);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayerId {
+    One,
+    Two,
+}
+
+impl PlayerId {
+    fn index(self) -> usize {
+        match self {
+            Self::One => 0,
+            Self::Two => 1,
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::One => Self::Two,
+            Self::Two => Self::One,
+        }
+    }
+}
+
+#[derive(Resource)]
+struct TurnState {
+    active: PlayerId,
+    strength: [u8; 2],
+    acted_this_frame: bool,
+}
+
+impl Default for TurnState {
+    fn default() -> Self {
+        Self {
+            active: PlayerId::One,
+            strength: [MAX_STRENGTH; 2],
+            acted_this_frame: false,
+        }
+    }
+}
+
+impl TurnState {
+    fn finish_action(&mut self) {
+        self.active = self.active.other();
+        self.acted_this_frame = true;
+    }
+}
 
 #[derive(Component)]
 struct HealthPanel;
+
+#[derive(Component)]
+struct EnergyFill(PlayerId);
 
 #[derive(Component)]
 struct InventoryPanel;
@@ -51,8 +99,11 @@ struct InventoryPanel;
 #[derive(Component)]
 struct InventorySlot {
     index: usize,
-    draggable: bool,
+    owner: PlayerId,
 }
+
+#[derive(Component)]
+struct TurnStatus;
 
 #[derive(Component)]
 struct DropFeedback;
@@ -61,21 +112,29 @@ struct DropFeedback;
 struct BoardItem;
 
 #[derive(Resource, Default)]
-struct DragCursor(Option<Vec2>);
+struct BoardCursor(Option<Vec2>);
 
 #[derive(Resource, Default)]
-struct InventoryDrag(Option<DraggedItem>);
+struct Selection(Option<SelectedAction>);
 
 #[derive(Resource, Default)]
-struct InventoryHover(Option<usize>);
+struct InventoryHover {
+    hovered: Option<(PlayerId, usize)>,
+    selected: Option<(PlayerId, usize)>,
+}
 
 #[derive(Resource)]
 struct InventoryImages([Handle<Image>; 14]);
 
-struct DraggedItem {
-    index: usize,
-    icon: Entity,
-    highlight: Entity,
+enum SelectedAction {
+    Item {
+        index: usize,
+        icon: Entity,
+        highlight: Entity,
+    },
+    Movement {
+        highlights: Vec<Entity>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,17 +167,21 @@ fn main() {
             },
             ..default()
         })
-        .init_resource::<DragCursor>()
-        .init_resource::<InventoryDrag>()
+        .init_resource::<BoardCursor>()
+        .init_resource::<Selection>()
         .init_resource::<InventoryHover>()
+        .init_resource::<TurnState>()
         .add_systems(Startup, (setup, spawn_board_grid))
         .add_systems(
             Update,
             (
-                move_sprite,
-                update_drag_cursor,
+                begin_turn_frame,
+                rest,
+                update_board_cursor,
+                handle_selection,
                 highlight_inventory_hover,
-                drag_inventory,
+                update_turn_status,
+                update_energy_bars,
             )
                 .chain(),
         )
@@ -151,11 +214,13 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
             ))
             .with_children(|parent| {
                 parent.spawn((
-                    Text::new("Bevy 0.20 + Aspect Ratio Mask | Board: 10 x 7"),
+                    TurnStatus,
+                    Text::new("P1 (ORANGE) 5/5 | P2 (BLUE) 5/5 | P1 TURN | R: REST"),
                     TextFont {
-                        font_size: FontSize::Px(24.0),
+                        font_size: FontSize::Px(17.0),
                         ..default()
                     },
+                    TextColor(Color::srgb(0.1, 0.07, 0.04)),
                 ));
             });
         parent
@@ -172,7 +237,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
             .with_children(|parent| {
                 parent.spawn((
                     DropFeedback,
-                    Text::new("Drag an item onto the board"),
+                    Text::new("Click your character or an item to select it"),
                     TextFont {
                         font_size: FontSize::Px(18.0),
                         ..default()
@@ -203,8 +268,17 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
             custom_size: Some(Vec2::splat(48.0)),
             ..default()
         },
-        Transform::from_xyz(GRID_BLOCK_SIZE / 2.0, 0.0, 0.0),
-        Player,
+        Transform::from_xyz(-150.0, 0.0, 0.0),
+        Player(PlayerId::One),
+    ));
+    commands.spawn((
+        Sprite {
+            color: Color::srgb(0.15, 0.45, 0.9),
+            custom_size: Some(Vec2::splat(48.0)),
+            ..default()
+        },
+        Transform::from_xyz(150.0, 0.0, 0.0),
+        Player(PlayerId::Two),
     ));
 }
 
@@ -266,7 +340,11 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
                                 Name::new(*label),
                                 InventorySlot {
                                     index,
-                                    draggable: is_left,
+                                    owner: if is_left {
+                                        PlayerId::One
+                                    } else {
+                                        PlayerId::Two
+                                    },
                                 },
                                 Node {
                                     position_type: PositionType::Absolute,
@@ -318,9 +396,10 @@ fn spawn_health_displays(commands: &mut Commands, hud: Entity, heart: Handle<Ima
                 top: Val::Px(HEALTH_PANEL_INSET),
                 width: Val::Px(HEALTH_PANEL_WIDTH),
                 height: Val::Px(HEALTH_PANEL_HEIGHT),
-                border: UiRect::all(Val::Px(3.0)),
+                border: UiRect::all(Val::Px(HEALTH_PANEL_BORDER)),
+                flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
-                justify_content: JustifyContent::SpaceEvenly,
+                justify_content: JustifyContent::Center,
                 ..default()
             };
             if is_left {
@@ -342,17 +421,61 @@ fn spawn_health_displays(commands: &mut Commands, hud: Entity, heart: Handle<Ima
                     Pickable::IGNORE,
                 ))
                 .with_children(|panel| {
-                    for _ in 0..HEART_COUNT {
-                        panel.spawn((
-                            ImageNode::new(heart.clone()),
+                    panel
+                        .spawn((
                             Node {
-                                width: Val::Px(27.0),
-                                height: Val::Px(27.0),
+                                width: Val::Percent(100.0),
+                                height: Val::Px(32.0),
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::SpaceEvenly,
+                                flex_shrink: 0.0,
                                 ..default()
                             },
                             Pickable::IGNORE,
-                        ));
-                    }
+                        ))
+                        .with_children(|row| {
+                            for _ in 0..HEART_COUNT {
+                                row.spawn((
+                                    ImageNode::new(heart.clone()),
+                                    Node {
+                                        width: Val::Px(27.0),
+                                        height: Val::Px(27.0),
+                                        ..default()
+                                    },
+                                    Pickable::IGNORE,
+                                ));
+                            }
+                        });
+                    panel
+                        .spawn((
+                            Node {
+                                width: Val::Px(
+                                    HEALTH_PANEL_WIDTH
+                                        - 2.0 * (HEALTH_PANEL_BORDER + ENERGY_BAR_SIDE_PADDING),
+                                ),
+                                height: Val::Px(7.0),
+                                flex_shrink: 0.0,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.08, 0.18, 0.09)),
+                            Pickable::IGNORE,
+                        ))
+                        .with_children(|bar| {
+                            bar.spawn((
+                                EnergyFill(if is_left {
+                                    PlayerId::One
+                                } else {
+                                    PlayerId::Two
+                                }),
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Percent(100.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.22, 0.85, 0.3)),
+                                Pickable::IGNORE,
+                            ));
+                        });
                 });
         }
     });
@@ -430,8 +553,12 @@ fn drop_target(player: Vec2, position: Vec2) -> Option<DropTarget> {
     })
 }
 
-fn left_inventory_item(position: Vec2) -> Option<usize> {
-    let x = position.x + RESOLUTION_WIDTH / 2.0;
+fn inventory_item(position: Vec2, owner: PlayerId) -> Option<usize> {
+    let left = match owner {
+        PlayerId::One => -RESOLUTION_WIDTH / 2.0,
+        PlayerId::Two => RESOLUTION_WIDTH / 2.0 - 2.0 * GRID_BLOCK_SIZE,
+    };
+    let x = position.x - left;
     let y = BOARD_TOP - position.y;
     if !position.is_finite()
         || !(0.0..2.0 * GRID_BLOCK_SIZE).contains(&x)
@@ -444,10 +571,10 @@ fn left_inventory_item(position: Vec2) -> Option<usize> {
     Some(row * 2 + column)
 }
 
-fn update_drag_cursor(
+fn update_board_cursor(
     windows: Query<&Window>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
-    mut cursor: ResMut<DragCursor>,
+    mut cursor: ResMut<BoardCursor>,
 ) {
     cursor.0 = windows
         .single()
@@ -460,8 +587,9 @@ fn update_drag_cursor(
 }
 
 fn highlight_inventory_hover(
-    cursor: Res<DragCursor>,
-    drag: Res<InventoryDrag>,
+    cursor: Res<BoardCursor>,
+    selection: Res<Selection>,
+    turn: Res<TurnState>,
     mut hover: ResMut<InventoryHover>,
     mut slots: Query<(
         &InventorySlot,
@@ -471,255 +599,355 @@ fn highlight_inventory_hover(
     )>,
     mut feedback: Query<&mut Text, With<DropFeedback>>,
 ) {
-    let hovered = if drag.0.is_none() {
-        cursor.0.and_then(left_inventory_item)
-    } else {
-        None
+    let hovered = cursor
+        .0
+        .and_then(|position| inventory_item(position, turn.active))
+        .map(|index| (turn.active, index));
+    let selected = match &selection.0 {
+        Some(SelectedAction::Item { index, .. }) => Some((turn.active, *index)),
+        _ => None,
     };
-    if hover.0 == hovered {
+    let hover_changed = hover.hovered != hovered;
+    if !hover_changed && hover.selected == selected {
         return;
     }
 
     for (slot, mut background, mut border, mut node) in &mut slots {
-        if !slot.draggable {
-            continue;
-        }
-        let is_hovered = hovered == Some(slot.index);
-        background.0 = if is_hovered {
+        let is_selected = selected == Some((slot.owner, slot.index));
+        let is_hovered = hovered == Some((slot.owner, slot.index));
+        background.0 = if is_selected {
+            Color::srgba(0.86, 0.68, 0.32, 0.6)
+        } else if is_hovered {
             Color::srgba(0.86, 0.68, 0.32, 0.35)
         } else {
             Color::NONE
         };
-        *border = BorderColor::all(if is_hovered {
+        *border = BorderColor::all(if is_selected || is_hovered {
             Color::srgb(1.0, 0.85, 0.45)
         } else {
             Color::srgba(0.86, 0.68, 0.32, 0.4)
         });
-        node.border = UiRect::all(Val::Px(if is_hovered { 2.0 } else { 0.5 }));
+        node.border = UiRect::all(Val::Px(if is_selected {
+            3.0
+        } else if is_hovered {
+            2.0
+        } else {
+            0.5
+        }));
     }
 
-    if drag.0.is_none()
+    if hover_changed
+        && selection.0.is_none()
         && let Ok(mut feedback) = feedback.single_mut()
     {
         feedback.0 = match hovered {
-            Some(index) => format!("{} - drag onto the board", INVENTORY_ITEMS[index].0),
-            None => "Drag an item onto the board".into(),
+            Some((_, index)) => format!("{} - click to select", INVENTORY_ITEMS[index].0),
+            None => "Click your character or an item to select it".into(),
         };
     }
-    hover.0 = hovered;
+    hover.hovered = hovered;
+    hover.selected = selected;
 }
 
-fn drag_inventory(
+fn preview_node(position: Vec2) -> Node {
+    const SIZE: f32 = 44.0;
+    Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(position.x + RESOLUTION_WIDTH / 2.0 - SIZE / 2.0),
+        top: Val::Px(RESOLUTION_HEIGHT / 2.0 - position.y - SIZE / 2.0),
+        width: Val::Px(SIZE),
+        height: Val::Px(SIZE),
+        ..default()
+    }
+}
+
+fn clear_selection(commands: &mut Commands, selection: &mut Selection) {
+    match selection.0.take() {
+        Some(SelectedAction::Item {
+            icon, highlight, ..
+        }) => {
+            commands.entity(icon).despawn();
+            commands.entity(highlight).despawn();
+        }
+        Some(SelectedAction::Movement { highlights }) => {
+            for entity in highlights {
+                commands.entity(entity).despawn();
+            }
+        }
+        None => {}
+    }
+}
+
+fn select_movement(commands: &mut Commands, player: Vec2, opponent: Vec2) -> SelectedAction {
+    let mut highlights = Vec::new();
+    if let Some(cell) = board_cell(player) {
+        for x in -1..=1 {
+            for y in -1..=1 {
+                if x == 0 && y == 0 {
+                    continue;
+                }
+                let center = cell_center(cell + IVec2::new(x, y));
+                if board_cell(center).is_none() || center == opponent {
+                    continue;
+                }
+                highlights.push(
+                    commands
+                        .spawn((
+                            Sprite {
+                                color: Color::srgba(0.2, 0.8, 0.3, 0.35),
+                                custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
+                                ..default()
+                            },
+                            Transform::from_xyz(center.x, center.y, 0.5),
+                        ))
+                        .id(),
+                );
+            }
+        }
+    }
+    SelectedAction::Movement { highlights }
+}
+
+fn handle_selection(
     mut commands: Commands,
-    mouse: Res<ButtonInput<MouseButton>>,
-    cursor: Res<DragCursor>,
-    images: Res<InventoryImages>,
-    mut drag: ResMut<InventoryDrag>,
-    player: Query<&Transform, With<Player>>,
+    input: (
+        Res<ButtonInput<MouseButton>>,
+        Res<ButtonInput<KeyCode>>,
+        Res<BoardCursor>,
+    ),
+    assets: (Res<InventoryImages>, Res<Hud>),
+    mut selection: ResMut<Selection>,
+    mut turn: ResMut<TurnState>,
+    mut players: Query<(Entity, &Player, &mut Transform)>,
     mut feedback: Query<&mut Text, With<DropFeedback>>,
 ) {
-    let (Ok(player), Ok(mut feedback)) = (player.single(), feedback.single_mut()) else {
+    let (mouse, keyboard, cursor) = input;
+    let (images, hud) = assets;
+    let Some((player_entity, player)) = players.iter().find_map(|(entity, player, transform)| {
+        (player.0 == turn.active).then_some((entity, transform.translation.truncate()))
+    }) else {
+        return;
+    };
+    let Some(opponent) = players.iter().find_map(|(_, player, transform)| {
+        (player.0 == turn.active.other()).then_some(transform.translation.truncate())
+    }) else {
+        return;
+    };
+    let Ok(mut feedback) = feedback.single_mut() else {
         return;
     };
 
-    if mouse.just_pressed(MouseButton::Left)
-        && drag.0.is_none()
-        && let Some(index) = cursor.0.and_then(left_inventory_item)
-    {
-        let highlight = commands
-            .spawn((
-                Sprite {
-                    color: Color::srgba(0.2, 0.8, 0.3, 0.4),
-                    custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
-                    ..default()
-                },
-                Visibility::Hidden,
-            ))
-            .id();
-        let icon = commands
-            .spawn((
-                Sprite {
-                    image: images.0[index].clone(),
-                    custom_size: Some(Vec2::splat(44.0)),
-                    ..default()
-                },
-                Visibility::Hidden,
-            ))
-            .id();
-        drag.0 = Some(DraggedItem {
+    if keyboard.just_pressed(KeyCode::Escape) && selection.0.is_some() {
+        clear_selection(&mut commands, &mut selection);
+        feedback.0 = "Selection cancelled".into();
+        return;
+    }
+
+    let cell = cursor.0.and_then(board_cell);
+    let target = cursor.0.and_then(|position| drop_target(player, position));
+    if mouse.just_pressed(MouseButton::Left) && !turn.acted_this_frame {
+        if let Some(index) = cursor
+            .0
+            .and_then(|position| inventory_item(position, turn.active))
+        {
+            let already_selected = matches!(selection.0, Some(SelectedAction::Item { index: current, .. }) if current == index);
+            clear_selection(&mut commands, &mut selection);
+            if already_selected {
+                feedback.0 = "Selection cancelled".into();
+            } else {
+                let highlight = commands
+                    .spawn((
+                        Sprite {
+                            custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
+                            ..default()
+                        },
+                        Visibility::Hidden,
+                    ))
+                    .id();
+                let icon = commands
+                    .spawn((
+                        ImageNode::new(images.0[index].clone()),
+                        preview_node(Vec2::ZERO),
+                        Visibility::Hidden,
+                        Pickable::IGNORE,
+                    ))
+                    .id();
+                commands.entity(hud.0).add_child(icon);
+                selection.0 = Some(SelectedAction::Item {
+                    index,
+                    icon,
+                    highlight,
+                });
+                feedback.0 = format!("{} selected - click a board cell", INVENTORY_ITEMS[index].0);
+            }
+            return;
+        }
+        if cell.is_some() && cell == board_cell(player) {
+            let already_selected = matches!(selection.0, Some(SelectedAction::Movement { .. }));
+            clear_selection(&mut commands, &mut selection);
+            if already_selected {
+                feedback.0 = "Selection cancelled".into();
+            } else {
+                selection.0 = Some(select_movement(&mut commands, player, opponent));
+                feedback.0 =
+                    "Click a highlighted cell to walk; click character or Esc to cancel".into();
+            }
+            return;
+        }
+        match (&selection.0, &target) {
+            (Some(SelectedAction::Item { index, .. }), Some(target))
+                if target.kind == DropKind::Place || turn.strength[turn.active.index()] > 0 =>
+            {
+                let center = cell_center(target.cell);
+                commands.spawn((
+                    Name::new(INVENTORY_ITEMS[*index].0),
+                    BoardItem,
+                    Sprite {
+                        image: images.0[*index].clone(),
+                        custom_size: Some(Vec2::splat(44.0)),
+                        ..default()
+                    },
+                    Transform::from_xyz(center.x, center.y, 0.1),
+                ));
+                if target.kind == DropKind::Throw {
+                    let index = turn.active.index();
+                    turn.strength[index] -= 1;
+                }
+                clear_selection(&mut commands, &mut selection);
+                turn.finish_action();
+                feedback.0 = "Item used - next player's turn".into();
+                return;
+            }
+            (Some(SelectedAction::Movement { .. }), Some(target))
+                if target.distance == 1 && cell_center(target.cell) != opponent =>
+            {
+                if let Ok((_, _, mut transform)) = players.get_mut(player_entity) {
+                    let center = cell_center(target.cell);
+                    transform.translation.x = center.x;
+                    transform.translation.y = center.y;
+                    clear_selection(&mut commands, &mut selection);
+                    turn.finish_action();
+                    feedback.0 = "Walk complete - next player's turn".into();
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    match &selection.0 {
+        Some(SelectedAction::Item {
             index,
             icon,
             highlight,
-        });
-    }
-
-    let Some(item) = &drag.0 else {
-        return;
-    };
-    let cell = cursor.0.and_then(board_cell);
-    let target = cursor
-        .0
-        .and_then(|position| drop_target(player.translation.truncate(), position));
-
-    if let Some(position) = cursor.0 {
-        let preview = cell.map(cell_center).unwrap_or(position);
-        commands.entity(item.icon).insert((
-            Transform::from_xyz(preview.x, preview.y, 2.0),
-            Visibility::Visible,
-        ));
-    } else {
-        commands.entity(item.icon).insert(Visibility::Hidden);
-    }
-    if let Some(cell) = cell {
-        let center = cell_center(cell);
-        let color = match target.as_ref().map(|target| &target.kind) {
-            Some(DropKind::Place) => Color::srgba(0.2, 0.8, 0.3, 0.4),
-            Some(DropKind::Throw) => Color::srgba(1.0, 0.7, 0.1, 0.4),
-            None => Color::srgba(0.9, 0.15, 0.1, 0.4),
-        };
-        commands.entity(item.highlight).insert((
-            Sprite {
-                color,
-                custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
-                ..default()
-            },
-            Transform::from_xyz(center.x, center.y, 1.0),
-            Visibility::Visible,
-        ));
-    } else {
-        commands.entity(item.highlight).insert(Visibility::Hidden);
-    }
-
-    feedback.0 = match &target {
-        Some(target) => format!(
-            "{}: {} - {} grid {}",
-            INVENTORY_ITEMS[item.index].0,
-            match target.kind {
-                DropKind::Place => "PLACE",
-                DropKind::Throw => "THROW",
-            },
-            target.distance,
-            if target.distance == 1 {
-                "step"
+        }) => {
+            let can_throw = turn.strength[turn.active.index()] > 0;
+            if let Some(position) = cursor.0 {
+                commands
+                    .entity(*icon)
+                    .insert((preview_node(position), Visibility::Visible));
             } else {
-                "steps"
+                commands.entity(*icon).insert(Visibility::Hidden);
             }
-        ),
-        None if cell.is_some() => "Cannot use the character's cell".into(),
-        None => "Drag onto a board cell".into(),
-    };
-
-    if mouse.just_released(MouseButton::Left) || !mouse.pressed(MouseButton::Left) {
-        if let Some(target) = target {
-            let center = cell_center(target.cell);
-            commands.spawn((
-                Name::new(INVENTORY_ITEMS[item.index].0),
-                BoardItem,
-                Sprite {
-                    image: images.0[item.index].clone(),
-                    custom_size: Some(Vec2::splat(44.0)),
-                    ..default()
-                },
-                Transform::from_xyz(center.x, center.y, 0.1),
-            ));
-        } else {
-            feedback.0 = "Drop cancelled - drag an item onto the board".into();
+            if let Some(cell) = cell {
+                let center = cell_center(cell);
+                let color = match target.as_ref().map(|target| &target.kind) {
+                    Some(DropKind::Place) => Color::srgba(0.2, 0.8, 0.3, 0.4),
+                    Some(DropKind::Throw) if can_throw => Color::srgba(1.0, 0.7, 0.1, 0.4),
+                    _ => Color::srgba(0.9, 0.15, 0.1, 0.4),
+                };
+                commands.entity(*highlight).insert((
+                    Sprite {
+                        color,
+                        custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
+                        ..default()
+                    },
+                    Transform::from_xyz(center.x, center.y, 1.0),
+                    Visibility::Visible,
+                ));
+            } else {
+                commands.entity(*highlight).insert(Visibility::Hidden);
+            }
+            feedback.0 = match &target {
+                Some(target) if target.kind == DropKind::Throw && !can_throw => {
+                    "Not enough energy - Esc to cancel, R to rest".into()
+                }
+                Some(target) => format!(
+                    "{}: {} - {} grid {} - click to confirm",
+                    INVENTORY_ITEMS[*index].0,
+                    if target.kind == DropKind::Place {
+                        "PLACE"
+                    } else {
+                        "THROW"
+                    },
+                    target.distance,
+                    if target.distance == 1 {
+                        "step"
+                    } else {
+                        "steps"
+                    }
+                ),
+                None if cell.is_some() => "Click your character to select movement".into(),
+                None => "Click a board cell, or click the item again / Esc to cancel".into(),
+            };
         }
-        commands.entity(item.icon).despawn();
-        commands.entity(item.highlight).despawn();
-        drag.0 = None;
+        Some(SelectedAction::Movement { .. }) => {
+            feedback.0 = match &target {
+                Some(target) if target.distance > 1 => "Jumping is not available yet".into(),
+                Some(target) if cell_center(target.cell) == opponent => {
+                    "Cell occupied by opponent".into()
+                }
+                Some(_) => "Click to walk - 1 grid step".into(),
+                None => "Click a highlighted cell to walk; click character or Esc to cancel".into(),
+            };
+        }
+        None => {}
     }
 }
 
-fn move_sprite(
+fn begin_turn_frame(mut turn: ResMut<TurnState>) {
+    turn.acted_this_frame = false;
+}
+
+fn update_turn_status(turn: Res<TurnState>, mut status: Query<&mut Text, With<TurnStatus>>) {
+    if let Ok(mut status) = status.single_mut() {
+        status.0 = format!(
+            "P1 (ORANGE) {}/{} | P2 (BLUE) {}/{} | {} TURN | R: REST",
+            turn.strength[0],
+            MAX_STRENGTH,
+            turn.strength[1],
+            MAX_STRENGTH,
+            match turn.active {
+                PlayerId::One => "P1",
+                PlayerId::Two => "P2",
+            },
+        );
+    }
+}
+
+fn update_energy_bars(turn: Res<TurnState>, mut bars: Query<(&EnergyFill, &mut Node)>) {
+    for (fill, mut node) in &mut bars {
+        node.width = Val::Percent(
+            100.0 * f32::from(turn.strength[fill.0.index()]) / f32::from(MAX_STRENGTH),
+        );
+    }
+}
+
+fn rest(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut sprite: Query<&mut Transform, With<Player>>,
+    selection: Res<Selection>,
+    mut turn: ResMut<TurnState>,
 ) {
-    let Ok(mut transform) = sprite.single_mut() else {
-        return;
-    };
-
-    let mut direction = Vec2::ZERO;
-    if keyboard.just_pressed(KeyCode::ArrowLeft) {
-        direction.x -= 1.0;
+    if keyboard.just_pressed(KeyCode::KeyR) && !turn.acted_this_frame && selection.0.is_none() {
+        let index = turn.active.index();
+        turn.strength[index] = (turn.strength[index] + 1).min(MAX_STRENGTH);
+        turn.finish_action();
     }
-    if keyboard.just_pressed(KeyCode::ArrowRight) {
-        direction.x += 1.0;
-    }
-    if keyboard.just_pressed(KeyCode::ArrowDown) {
-        direction.y -= 1.0;
-    }
-    if keyboard.just_pressed(KeyCode::ArrowUp) {
-        direction.y += 1.0;
-    }
-
-    transform.translation.x = (transform.translation.x + direction.x * GRID_BLOCK_SIZE)
-        .clamp(PLAYABLE_LEFT_X, PLAYABLE_RIGHT_X);
-    transform.translation.y = (transform.translation.y + direction.y * GRID_BLOCK_SIZE)
-        .clamp(PLAYABLE_BOTTOM_Y, PLAYABLE_TOP_Y);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn drag_app() -> App {
-        let mut app = App::new();
-        app.init_resource::<ButtonInput<MouseButton>>()
-            .init_resource::<DragCursor>()
-            .init_resource::<InventoryDrag>()
-            .init_resource::<InventoryHover>()
-            .insert_resource(InventoryImages(std::array::from_fn(|_| Handle::default())))
-            .add_systems(Update, (highlight_inventory_hover, drag_inventory).chain());
-        app.world_mut()
-            .spawn((Player, Transform::from_xyz(GRID_BLOCK_SIZE / 2.0, 0.0, 0.0)));
-        app.world_mut().spawn((DropFeedback, Text::new("")));
-        app
-    }
-
-    fn move_once(start: Vec2, key: KeyCode) -> Vec2 {
-        let mut app = App::new();
-        app.init_resource::<ButtonInput<KeyCode>>()
-            .add_systems(Update, move_sprite);
-        let player = app
-            .world_mut()
-            .spawn((Player, Transform::from_xyz(start.x, start.y, 0.0)))
-            .id();
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(key);
-        app.update();
-        app.world()
-            .get::<Transform>(player)
-            .unwrap()
-            .translation
-            .truncate()
-    }
-
-    #[test]
-    fn arrows_move_one_cell() {
-        let start = Vec2::new(GRID_BLOCK_SIZE / 2.0, 0.0);
-        for (key, direction) in [
-            (KeyCode::ArrowLeft, Vec2::NEG_X),
-            (KeyCode::ArrowRight, Vec2::X),
-            (KeyCode::ArrowUp, Vec2::Y),
-            (KeyCode::ArrowDown, Vec2::NEG_Y),
-        ] {
-            assert_eq!(move_once(start, key), start + direction * GRID_BLOCK_SIZE);
-        }
-    }
-
-    #[test]
-    fn movement_stays_within_d2_to_m8() {
-        let d2 = Vec2::new(-270.0, 180.0);
-        let m8 = Vec2::new(270.0, -180.0);
-        assert_eq!(move_once(d2, KeyCode::ArrowLeft), d2);
-        assert_eq!(move_once(d2, KeyCode::ArrowUp), d2);
-        assert_eq!(move_once(m8, KeyCode::ArrowRight), m8);
-        assert_eq!(move_once(m8, KeyCode::ArrowDown), m8);
-        assert_eq!(move_once(d2, KeyCode::ArrowRight), d2 + Vec2::X * 60.0);
-        assert_eq!(move_once(m8, KeyCode::ArrowUp), m8 + Vec2::Y * 60.0);
-    }
 
     #[test]
     fn grid_lines_are_confined_to_board() {
@@ -760,10 +988,20 @@ mod tests {
             assert_eq!(node.top, Val::Px(6.0));
             assert_eq!(node.width, Val::Px(168.0));
             assert_eq!(node.height, Val::Px(48.0));
-            assert_eq!(children.len(), 5);
-            for child in children.iter() {
+            assert_eq!(children.len(), 2);
+            let hearts = world.get::<Children>(children[0]).unwrap();
+            assert_eq!(hearts.len(), 5);
+            for child in hearts.iter() {
                 assert!(world.get::<ImageNode>(child).is_some());
             }
+            assert_eq!(node.align_items, AlignItems::Center);
+            assert_eq!(
+                world.get::<Node>(children[1]).unwrap().width,
+                Val::Px(150.0)
+            );
+            let bar = world.get::<Children>(children[1]).unwrap();
+            assert_eq!(bar.len(), 1);
+            assert!(world.get::<EnergyFill>(bar[0]).is_some());
         }
     }
 
@@ -816,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_highlights_only_draggable_item_and_shows_hint() {
+    fn hover_highlights_only_active_inventory_item_and_shows_hint() {
         fn setup_inventory(mut commands: Commands) {
             let hud = commands.spawn(Node::default()).id();
             spawn_inventories(
@@ -824,21 +1062,25 @@ mod tests {
                 hud,
                 &std::array::from_fn(|_| Handle::default()),
             );
-            commands.spawn((DropFeedback, Text::new("Drag an item onto the board")));
+            commands.spawn((
+                DropFeedback,
+                Text::new("Click your character or an item to select it"),
+            ));
         }
 
         let mut app = App::new();
-        app.init_resource::<DragCursor>()
-            .init_resource::<InventoryDrag>()
+        app.init_resource::<BoardCursor>()
+            .init_resource::<Selection>()
             .init_resource::<InventoryHover>()
+            .init_resource::<TurnState>()
             .add_systems(Startup, setup_inventory)
             .add_systems(Update, highlight_inventory_hover);
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(-450.0, 180.0));
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(-450.0, 180.0));
         app.update();
         let world = app.world_mut();
         let mut slots = world.query::<(&InventorySlot, &BackgroundColor, &Node)>();
         for (slot, background, node) in slots.iter(world) {
-            let highlighted = slot.draggable && slot.index == 0;
+            let highlighted = slot.owner == PlayerId::One && slot.index == 0;
             assert_eq!(background.0 == Color::NONE, !highlighted);
             assert_eq!(
                 node.border,
@@ -846,12 +1088,9 @@ mod tests {
             );
         }
         let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
-        assert_eq!(
-            feedback.single(world).unwrap().0,
-            "Water - drag onto the board"
-        );
+        assert_eq!(feedback.single(world).unwrap().0, "Water - click to select");
 
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(450.0, 180.0));
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(450.0, 180.0));
         app.update();
         let world = app.world_mut();
         let mut slots = world.query::<(&InventorySlot, &BackgroundColor)>();
@@ -859,7 +1098,7 @@ mod tests {
         let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
         assert_eq!(
             feedback.single(world).unwrap().0,
-            "Drag an item onto the board"
+            "Click your character or an item to select it"
         );
     }
 
@@ -877,44 +1116,48 @@ mod tests {
         assert_eq!(board_cell(Vec2::new(0.0, f32::NAN)), None);
     }
 
-    #[test]
-    fn dragging_from_left_inventory_previews_and_places_an_item() {
-        let mut app = drag_app();
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(-450.0, 180.0));
+    fn interaction_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<BoardCursor>()
+            .init_resource::<Selection>()
+            .init_resource::<InventoryHover>()
+            .init_resource::<TurnState>()
+            .insert_resource(InventoryImages(std::array::from_fn(|_| Handle::default())))
+            .add_systems(
+                Update,
+                (
+                    begin_turn_frame,
+                    rest,
+                    handle_selection,
+                    highlight_inventory_hover,
+                    update_energy_bars,
+                )
+                    .chain(),
+            );
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud));
+        app.add_systems(Startup, |mut commands: Commands, hud: Res<Hud>| {
+            spawn_inventories(
+                &mut commands,
+                hud.0,
+                &std::array::from_fn(|_| Handle::default()),
+            );
+            spawn_health_displays(&mut commands, hud.0, Handle::default());
+        });
         app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .press(MouseButton::Left);
-        app.update();
-        assert!(app.world().resource::<InventoryDrag>().0.is_some());
-
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .clear();
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(90.0, 60.0));
-        app.update();
-        let world = app.world_mut();
-        let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
-        assert_eq!(
-            feedback.single(world).unwrap().0,
-            "Water: PLACE - 1 grid step"
-        );
-
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .release(MouseButton::Left);
-        app.update();
-        let world = app.world_mut();
-        assert!(world.resource::<InventoryDrag>().0.is_none());
-        let mut items = world.query_filtered::<(&Name, &Transform), With<BoardItem>>();
-        let (name, transform) = items.single(world).unwrap();
-        assert_eq!(name.as_str(), "Water");
-        assert_eq!(transform.translation.truncate(), Vec2::new(90.0, 60.0));
+            .spawn((Player(PlayerId::One), Transform::from_xyz(30.0, 0.0, 0.0)));
+        app.world_mut().spawn((
+            Player(PlayerId::Two),
+            Transform::from_xyz(150.0, -180.0, 0.0),
+        ));
+        app.world_mut().spawn((DropFeedback, Text::new("")));
+        app
     }
 
-    #[test]
-    fn dragging_to_a_distant_cell_previews_and_throws_an_item() {
-        let mut app = drag_app();
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(-390.0, 180.0));
+    fn click(app: &mut App, position: Vec2) {
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(position);
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .press(MouseButton::Left);
@@ -922,58 +1165,355 @@ mod tests {
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .clear();
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(-270.0, 180.0));
-        app.update();
-        let world = app.world_mut();
-        let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
-        assert_eq!(
-            feedback.single(world).unwrap().0,
-            "Salt: THROW - 5 grid steps"
-        );
-
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .release(MouseButton::Left);
         app.update();
-        let world = app.world_mut();
-        let mut items = world.query_filtered::<(&Name, &Transform), With<BoardItem>>();
-        let (name, transform) = items.single(world).unwrap();
-        assert_eq!(name.as_str(), "Salt");
-        assert_eq!(transform.translation.truncate(), Vec2::new(-270.0, 180.0));
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
     }
 
-    #[test]
-    fn right_inventory_and_invalid_drops_do_not_create_items() {
-        let mut app = drag_app();
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(450.0, 180.0));
+    fn press_key(app: &mut App, key: KeyCode) {
         app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .press(MouseButton::Left);
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
         app.update();
-        assert!(app.world().resource::<InventoryDrag>().0.is_none());
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.clear();
+        keys.release(key);
+        keys.clear();
+    }
 
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .release(MouseButton::Left);
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .clear();
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(-450.0, 180.0));
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .press(MouseButton::Left);
-        app.update();
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .clear();
-        app.world_mut().resource_mut::<DragCursor>().0 = Some(Vec2::new(30.0, 0.0));
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .release(MouseButton::Left);
-        app.update();
+    fn item_count(app: &mut App) -> usize {
         let world = app.world_mut();
-        assert!(world.resource::<InventoryDrag>().0.is_none());
         let mut items = world.query_filtered::<Entity, With<BoardItem>>();
-        assert_eq!(items.iter(world).count(), 0);
+        items.iter(world).count()
+    }
+
+    #[test]
+    fn item_requires_two_clicks_and_previews_after_release() {
+        let mut app = interaction_app();
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Item { index: 0, .. })
+        ));
+        assert_eq!(item_count(&mut app), 0);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(90.0, 60.0));
+        app.update();
+        let world = app.world_mut();
+        let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
+        assert!(
+            feedback
+                .single(world)
+                .unwrap()
+                .0
+                .contains("PLACE - 1 grid step")
+        );
+        assert_eq!(item_count(&mut app), 0);
+        click(&mut app, Vec2::new(90.0, 60.0));
+        assert_eq!(item_count(&mut app), 1);
+        assert!(app.world().resource::<Selection>().0.is_none());
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+        assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
+    }
+
+    #[test]
+    fn selected_item_preview_is_centered_on_cursor_in_hud() {
+        let mut app = interaction_app();
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        let icon = match &app.world().resource::<Selection>().0 {
+            Some(SelectedAction::Item { icon, .. }) => *icon,
+            _ => panic!("item should be selected"),
+        };
+        assert!(app.world().get::<ImageNode>(icon).is_some());
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(90.0, 60.0));
+        app.update();
+        let node = app.world().get::<Node>(icon).unwrap();
+        assert_eq!(node.left, Val::Px(548.0));
+        assert_eq!(node.top, Val::Px(188.0));
+        assert_eq!(node.width, Val::Px(44.0));
+        assert_eq!(node.height, Val::Px(44.0));
+        assert_eq!(
+            app.world().get::<Visibility>(icon),
+            Some(&Visibility::Visible)
+        );
+        app.world_mut().resource_mut::<BoardCursor>().0 = None;
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(icon),
+            Some(&Visibility::Hidden)
+        );
+    }
+
+    fn slot_border(app: &mut App, owner: PlayerId, index: usize) -> UiRect {
+        let world = app.world_mut();
+        let mut slots = world.query::<(&InventorySlot, &Node)>();
+        slots
+            .iter(world)
+            .find_map(|(slot, node)| {
+                (slot.owner == owner && slot.index == index).then_some(node.border)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn selected_slot_remains_highlighted_until_cancelled_or_placed() {
+        let mut app = interaction_app();
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        assert_eq!(
+            slot_border(&mut app, PlayerId::One, 0),
+            UiRect::all(Val::Px(3.0))
+        );
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(-390.0, 180.0));
+        app.update();
+        assert_eq!(
+            slot_border(&mut app, PlayerId::One, 0),
+            UiRect::all(Val::Px(3.0))
+        );
+        assert_eq!(
+            slot_border(&mut app, PlayerId::One, 1),
+            UiRect::all(Val::Px(2.0))
+        );
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(
+            slot_border(&mut app, PlayerId::One, 0),
+            UiRect::all(Val::Px(0.5))
+        );
+
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, Vec2::new(90.0, 60.0));
+        assert_eq!(
+            slot_border(&mut app, PlayerId::One, 0),
+            UiRect::all(Val::Px(0.5))
+        );
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+    }
+
+    #[test]
+    fn item_selection_can_be_cancelled_or_changed_without_a_turn() {
+        let mut app = interaction_app();
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        assert!(app.world().resource::<Selection>().0.is_none());
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, Vec2::new(-390.0, 180.0));
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Item { index: 1, .. })
+        ));
+        press_key(&mut app, KeyCode::Escape);
+        assert!(app.world().resource::<Selection>().0.is_none());
+        assert_eq!(item_count(&mut app), 0);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+    }
+
+    #[test]
+    fn switching_between_item_and_character_clears_previews() {
+        let mut app = interaction_app();
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        let (icon, highlight) = match &app.world().resource::<Selection>().0 {
+            Some(SelectedAction::Item {
+                icon, highlight, ..
+            }) => (*icon, *highlight),
+            _ => panic!("item should be selected"),
+        };
+        click(&mut app, Vec2::new(30.0, 0.0));
+        assert!(app.world().get_entity(icon).is_err());
+        assert!(app.world().get_entity(highlight).is_err());
+        let highlights = match &app.world().resource::<Selection>().0 {
+            Some(SelectedAction::Movement { highlights }) => highlights.clone(),
+            _ => panic!("character should be selected"),
+        };
+        assert_eq!(highlights.len(), 8);
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        assert!(
+            highlights
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Item { .. })
+        ));
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+    }
+
+    #[test]
+    fn player_selection_walks_diagonally_and_rejects_jumps_and_occupied_cells() {
+        let mut app = interaction_app();
+        click(&mut app, Vec2::new(30.0, 0.0));
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Movement { .. })
+        ));
+        click(&mut app, Vec2::new(-270.0, 180.0));
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Movement { .. })
+        ));
+        let world = app.world_mut();
+        let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
+        assert_eq!(
+            feedback.single(world).unwrap().0,
+            "Jumping is not available yet"
+        );
+
+        click(&mut app, Vec2::new(30.0, 0.0));
+        assert!(app.world().resource::<Selection>().0.is_none());
+        click(&mut app, Vec2::new(30.0, 0.0));
+        click(&mut app, Vec2::new(90.0, 60.0));
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+        let world = app.world_mut();
+        let mut players = world.query::<(&Player, &Transform)>();
+        let player = players
+            .iter(world)
+            .find(|(player, _)| player.0 == PlayerId::One)
+            .unwrap()
+            .1;
+        assert_eq!(player.translation.truncate(), Vec2::new(90.0, 60.0));
+        assert!(world.resource::<Selection>().0.is_none());
+    }
+
+    #[test]
+    fn opponent_cell_and_outside_board_do_not_consume_turn() {
+        let mut app = interaction_app();
+        let opponent = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &Player)>();
+            query
+                .iter(world)
+                .find(|(_, player)| player.0 == PlayerId::Two)
+                .unwrap()
+                .0
+        };
+        app.world_mut()
+            .get_mut::<Transform>(opponent)
+            .unwrap()
+            .translation = Vec3::new(90.0, 0.0, 0.0);
+        click(&mut app, Vec2::new(30.0, 0.0));
+        click(&mut app, Vec2::new(90.0, 0.0));
+        click(&mut app, Vec2::new(301.0, 0.0));
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Movement { .. })
+        ));
+        press_key(&mut app, KeyCode::Escape);
+        assert!(app.world().resource::<Selection>().0.is_none());
+    }
+
+    #[test]
+    fn turns_strength_and_right_inventory_apply_to_two_click_actions() {
+        let mut app = interaction_app();
+        click(&mut app, Vec2::new(450.0, 180.0));
+        assert!(app.world().resource::<Selection>().0.is_none());
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, Vec2::new(-270.0, 180.0));
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+        assert_eq!(app.world().resource::<TurnState>().strength, [4, 5]);
+        click(&mut app, Vec2::new(450.0, 180.0));
+        click(&mut app, Vec2::new(-270.0, 180.0));
+        assert_eq!(item_count(&mut app), 2);
+        assert_eq!(app.world().resource::<TurnState>().strength, [4, 4]);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+    }
+
+    fn energy_bar_width(app: &mut App, player: PlayerId) -> Val {
+        let world = app.world_mut();
+        let mut bars = world.query::<(&EnergyFill, &Node)>();
+        bars.iter(world)
+            .find_map(|(fill, node)| (fill.0 == player).then_some(node.width))
+            .unwrap()
+    }
+
+    #[test]
+    fn energy_bars_follow_each_players_throw_and_rest() {
+        let mut app = interaction_app();
+        app.update();
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::One),
+            Val::Percent(100.0)
+        );
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::Two),
+            Val::Percent(100.0)
+        );
+
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, Vec2::new(-270.0, 180.0));
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::One),
+            Val::Percent(80.0)
+        );
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::Two),
+            Val::Percent(100.0)
+        );
+
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::One),
+            Val::Percent(80.0)
+        );
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::One),
+            Val::Percent(100.0)
+        );
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::Two),
+            Val::Percent(100.0)
+        );
+
+        app.world_mut().resource_mut::<TurnState>().strength[1] = 0;
+        app.update();
+        assert_eq!(energy_bar_width(&mut app, PlayerId::Two), Val::Percent(0.0));
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(
+            energy_bar_width(&mut app, PlayerId::Two),
+            Val::Percent(20.0)
+        );
+    }
+
+    #[test]
+    fn insufficient_strength_keeps_selection_until_cancelled() {
+        let mut app = interaction_app();
+        app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, Vec2::new(-270.0, 180.0));
+        assert_eq!(item_count(&mut app), 0);
+        assert!(app.world().resource::<Selection>().0.is_some());
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+        let world = app.world_mut();
+        let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
+        assert!(
+            feedback
+                .single(world)
+                .unwrap()
+                .0
+                .contains("Not enough energy")
+        );
+        press_key(&mut app, KeyCode::Escape);
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<TurnState>().strength, [1, 5]);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+    }
+
+    #[test]
+    fn exhausted_player_can_still_place_and_arrow_keys_do_not_move() {
+        let mut app = interaction_app();
+        app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
+        press_key(&mut app, KeyCode::ArrowRight);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, Vec2::new(90.0, 60.0));
+        assert_eq!(item_count(&mut app), 1);
+        assert_eq!(app.world().resource::<TurnState>().strength, [0, 5]);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
     }
 }
