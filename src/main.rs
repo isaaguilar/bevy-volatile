@@ -9,6 +9,7 @@ use rand::{Rng, RngExt};
 mod ai;
 mod aquatic;
 mod board;
+mod history;
 mod menu;
 mod serpent;
 mod thorn;
@@ -740,6 +741,9 @@ struct BoardItem;
 struct GroundTile(IVec2);
 
 #[derive(Component)]
+struct PersistentWorld;
+
+#[derive(Component)]
 struct Collectible {
     index: usize,
     cell: IVec2,
@@ -1096,6 +1100,7 @@ fn main() {
         .init_resource::<PlayerHealth>()
         .init_resource::<Weather>()
         .init_resource::<ai::BotController>()
+        .add_plugins(history::plugin)
         .add_plugins(menu::plugin)
         .add_systems(
             Startup,
@@ -1114,6 +1119,7 @@ fn main() {
             )
                 .chain(),
         )
+        .add_systems(Update, reset_match.before(menu::GameplaySystems))
         .add_systems(
             Update,
             (
@@ -1180,6 +1186,64 @@ fn main() {
                 .run_if(menu::in_game),
         )
         .run();
+}
+
+#[derive(SystemParam)]
+struct MatchReset<'w, 's> {
+    frontend: ResMut<'w, menu::Frontend>,
+    turn: ResMut<'w, TurnState>,
+    board: ResMut<'w, Board>,
+    health: ResMut<'w, PlayerHealth>,
+    weather: ResMut<'w, Weather>,
+    bot: ResMut<'w, ai::BotController>,
+    history: ResMut<'w, history::ComputerHistory>,
+    selection: ResMut<'w, Selection>,
+    hover: ResMut<'w, InventoryHover>,
+    cursor: ResMut<'w, BoardCursor>,
+    images: Res<'w, InventoryImages>,
+    rng: Single<'w, 's, &'static mut WyRand, With<GlobalRng>>,
+    players: Query<'w, 's, (&'static Player, &'static mut Transform)>,
+    temporary: Query<'w, 's, Entity, TemporarySprites>,
+}
+
+type TemporarySprites = (With<Sprite>, Without<PersistentWorld>, Without<ChildOf>);
+
+fn reset_match(mut commands: Commands, mut state: MatchReset) {
+    if !state.frontend.take_restart_request() {
+        return;
+    }
+    if let Some(SelectedAction::Item { icon, .. }) = state.selection.0.take() {
+        commands.entity(icon).despawn();
+    }
+    for entity in &state.temporary {
+        commands.entity(entity).despawn();
+    }
+    for (player, mut transform) in &mut state.players {
+        let start = cell_center(PLAYER_STARTS[player.0.index()]);
+        transform.translation.x = start.x;
+        transform.translation.y = start.y;
+    }
+    *state.turn = TurnState::default();
+    *state.health = PlayerHealth::default();
+    *state.bot = ai::BotController::default();
+    *state.history = history::ComputerHistory::default();
+    *state.cursor = BoardCursor::default();
+    state.hover.hovered = Some((PlayerId::One, usize::MAX));
+    state.hover.selected = None;
+    *state.board = Board::generate(state.rng.as_mut());
+    state.turn.wind = WindDirection::random(state.rng.as_mut());
+    state.weather.rain = state.rng.random_range(RAIN_INTERVAL);
+    state.weather.earthquake = state.rng.random_range(EARTHQUAKE_INTERVAL);
+    let mut candidates = ingredient_spawn_candidates(&state.board, &PLAYER_STARTS, None);
+    for index in [SUNSTONE_ITEM_INDEX, LIFE_ESSENCE_ITEM_INDEX] {
+        assert!(
+            !candidates.is_empty(),
+            "not enough space for initial ingredients"
+        );
+        let cell = candidates.swap_remove(state.rng.random_range(0..candidates.len()));
+        spawn_collectible(&mut commands, &state.images, index, cell);
+        state.turn.spawned_ingredients[index] += 1;
+    }
 }
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) {
@@ -1284,6 +1348,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
     commands.insert_resource(InventoryImages(item_images));
 
     commands.spawn((
+        PersistentWorld,
         Sprite {
             image: asset_server.load("backgroundboard.png"),
             custom_size: Some(Vec2::new(RESOLUTION_WIDTH, RESOLUTION_HEIGHT)),
@@ -1293,6 +1358,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
     ));
 
     commands.spawn((
+        PersistentWorld,
         Sprite {
             color: ORANGE.into(),
             custom_size: Some(Vec2::splat(48.0)),
@@ -1302,6 +1368,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
         Player(PlayerId::One),
     ));
     commands.spawn((
+        PersistentWorld,
         Sprite {
             color: Color::srgb(0.15, 0.45, 0.9),
             custom_size: Some(Vec2::splat(48.0)),
@@ -1776,6 +1843,7 @@ fn spawn_board_terrain(mut commands: Commands, board: Res<Board>) {
             let center = cell_center(cell);
             commands.spawn((
                 GroundTile(cell),
+                PersistentWorld,
                 Sprite {
                     color: board
                         .ground(cell)
@@ -1799,6 +1867,7 @@ fn spawn_board_grid(mut commands: Commands) {
             BOARD_RIGHT - GRID_LINE_WIDTH / 2.0,
         );
         commands.spawn((
+            PersistentWorld,
             Sprite {
                 color: Color::srgba(0.25, 0.25, 0.25, 0.5),
                 custom_size: Some(Vec2::new(GRID_LINE_WIDTH, height)),
@@ -1814,6 +1883,7 @@ fn spawn_board_grid(mut commands: Commands) {
             BOARD_TOP - GRID_LINE_WIDTH / 2.0,
         );
         commands.spawn((
+            PersistentWorld,
             Sprite {
                 color: Color::srgba(0.25, 0.25, 0.25, 0.5),
                 custom_size: Some(Vec2::new(width, GRID_LINE_WIDTH)),
@@ -2258,10 +2328,14 @@ fn handle_actions(
     mut selection: ResMut<Selection>,
     players: Query<(&Player, &Transform)>,
     collectibles: Query<(Entity, &Collectible, Option<&Visibility>)>,
-    mut feedback: Query<&mut Text, With<DropFeedback>>,
+    output: (
+        Query<&mut Text, With<DropFeedback>>,
+        Option<ResMut<history::ComputerHistory>>,
+    ),
 ) {
     let (mouse, cursor, bot) = input;
     let (mut turn, mut board, mut health) = game;
+    let (mut feedback, mut history) = output;
     if turn.acted_this_frame
         || turn.animation_active()
         || turn.pending_placement.as_ref().is_some_and(|p| p.ready)
@@ -2339,6 +2413,9 @@ fn handle_actions(
     if action == Action::Rest.row() {
         match finish_rest(&mut turn, &mut board, &mut health, &players) {
             Ok(()) => {
+                if bot_turn && let Some(history) = &mut history {
+                    history.add("Computer rested".into(), None);
+                }
                 clear_selection(&mut commands, &mut selection);
                 feedback.0 = "Rested - next player's turn".into();
             }
@@ -2358,6 +2435,7 @@ fn handle_actions(
         return;
     };
     let mut picked_up = Vec::new();
+    let mut picked_up_indices = Vec::new();
     let mut undo_items = Vec::new();
     for (entity, item, visibility) in &collectibles {
         if item.cell != cell || is_unlimited(item.index) {
@@ -2379,10 +2457,21 @@ fn handle_actions(
             commands.entity(entity).despawn();
         }
         picked_up.push(INVENTORY_ITEMS[item.index].0);
+        picked_up_indices.push(item.index);
     }
     if picked_up.is_empty() {
         feedback.0 = "No collectible ingredient on this tile".into();
         return;
+    }
+    if bot_turn && let Some(history) = &mut history {
+        history.add(
+            format!(
+                "Computer picked up {} at {}",
+                picked_up.join(", "),
+                history::cell_label(cell)
+            ),
+            (picked_up_indices.len() == 1).then_some(picked_up_indices[0]),
+        );
     }
     clear_selection(&mut commands, &mut selection);
     if turn.actions_used == 0 {
@@ -2878,8 +2967,12 @@ fn handle_selection(
     mut selection: ResMut<Selection>,
     mut turn: ResMut<TurnState>,
     actors: SelectionActors,
-    mut feedback: Query<&mut Text, With<DropFeedback>>,
+    output: (
+        Query<&mut Text, With<DropFeedback>>,
+        Option<ResMut<history::ComputerHistory>>,
+    ),
 ) {
+    let (mut feedback, mut history) = output;
     if turn.animation_active() {
         return;
     }
@@ -3366,6 +3459,16 @@ fn handle_selection(
                         feedback.0 = "Item queued - choose another action or rest".into();
                         return;
                     }
+                }
+                if bot_turn && let Some(history) = &mut history {
+                    history.add(
+                        format!(
+                            "Computer used {} at {}",
+                            INVENTORY_ITEMS[*index].0,
+                            history::cell_label(target.cell)
+                        ),
+                        Some(*index),
+                    );
                 }
                 let stone_absorbs_acid = is_stone && !stone_life && board.is_acidic(target.cell);
                 let fills_ground = (is_stone
@@ -4167,6 +4270,12 @@ fn handle_selection(
                 )
                 .expect("movement was validated");
                 if let Ok((_, _, mut transform)) = players.get_mut(player_entity) {
+                    if bot_turn && let Some(history) = &mut history {
+                        history.add(
+                            format!("Computer moved to {}", history::cell_label(target.cell)),
+                            None,
+                        );
+                    }
                     let active = turn.active;
                     for cell in [board_cell(player), Some(target.cell)]
                         .into_iter()
@@ -4580,6 +4689,7 @@ fn spawn_hover_shadow(
 ) {
     commands.spawn((
         HoverShadow(owner),
+        PersistentWorld,
         Sprite {
             image,
             custom_size: Some(Vec2::new(44.0, 14.0)),
@@ -5052,6 +5162,80 @@ fn finish_rest(
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    #[test]
+    fn new_match_resets_board_players_and_temporary_entities() {
+        let mut app = App::new();
+        app.add_plugins(EntropyPlugin::<WyRand>::with_seed([7; 8]))
+            .insert_resource(menu::Frontend::computer_match())
+            .init_resource::<TurnState>()
+            .init_resource::<Board>()
+            .init_resource::<PlayerHealth>()
+            .init_resource::<Weather>()
+            .init_resource::<ai::BotController>()
+            .init_resource::<history::ComputerHistory>()
+            .init_resource::<Selection>()
+            .init_resource::<InventoryHover>()
+            .init_resource::<BoardCursor>()
+            .insert_resource(InventoryImages(std::array::from_fn(|_| Handle::default())))
+            .add_systems(Update, reset_match);
+        let world = app.world_mut();
+        world.resource_mut::<PlayerHealth>().0 = [0, 3];
+        world.resource_mut::<Board>().add_acid(PLAYER_STARTS[0]);
+        world.resource_mut::<TurnState>().strength = [0, 1];
+        world
+            .resource_mut::<history::ComputerHistory>()
+            .add("Old move".into(), None);
+        for player in [PlayerId::One, PlayerId::Two] {
+            world.spawn((
+                Player(player),
+                PersistentWorld,
+                Sprite::default(),
+                Transform::from_xyz(0.0, 0.0, 0.0),
+            ));
+        }
+        let old_item = world.spawn((BoardItem, Sprite::default())).id();
+        let highlight = world.spawn(Sprite::default()).id();
+        let icon = world.spawn(ImageNode::default()).id();
+        world.resource_mut::<Selection>().0 = Some(SelectedAction::Item {
+            index: SUNSTONE_ITEM_INDEX,
+            icon,
+            highlight,
+        });
+        app.update();
+        let world = app.world_mut();
+        assert_eq!(world.resource::<PlayerHealth>().0, [10, 10]);
+        assert_eq!(world.resource::<TurnState>().active, PlayerId::One);
+        assert_eq!(world.resource::<TurnState>().strength, [MAX_STRENGTH; 2]);
+        assert_eq!(
+            world.resource::<TurnState>().spawned_ingredients[SUNSTONE_ITEM_INDEX],
+            3
+        );
+        assert_eq!(
+            world.resource::<TurnState>().spawned_ingredients[LIFE_ESSENCE_ITEM_INDEX],
+            3
+        );
+        assert!(!world.resource::<Board>().is_acidic(PLAYER_STARTS[0]));
+        assert!(
+            world
+                .resource::<history::ComputerHistory>()
+                .entries()
+                .is_empty()
+        );
+        assert!(world.resource::<Selection>().0.is_none());
+        assert!(world.get_entity(old_item).is_err());
+        assert!(world.get_entity(highlight).is_err());
+        assert!(world.get_entity(icon).is_err());
+        let mut players = world.query::<(&Player, &Transform)>();
+        for (player, transform) in players.iter(world) {
+            assert_eq!(
+                board_cell(transform.translation.truncate()),
+                Some(PLAYER_STARTS[player.0.index()])
+            );
+        }
+        let mut items = world.query::<&Collectible>();
+        assert_eq!(items.iter(world).count(), 2);
+    }
 
     #[test]
     fn seeded_bevy_rng_generates_and_renders_the_board_at_startup() {
@@ -5545,6 +5729,7 @@ mod tests {
         let mut app = interaction_app();
         app.insert_resource(menu::Frontend::computer_match())
             .init_resource::<ai::BotController>()
+            .init_resource::<history::ComputerHistory>()
             .add_systems(Update, ai::plan.after(begin_turn_frame).before(rest));
         app.update();
         {
@@ -5598,6 +5783,11 @@ mod tests {
             app.world().resource::<Board>().ground(IVec2::new(1, 1)),
             Some(Ground::Water)
         );
+        let entries = app.world().resource::<history::ComputerHistory>().entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].text, "Computer used Tlaloc's Water at E3");
+        assert_eq!(entries[0].item, Some(WATER_ITEM_INDEX));
+        assert_eq!(entries[1].text, "Computer used Sunstone at E3");
     }
 
     #[test]
@@ -5691,6 +5881,15 @@ mod tests {
         assert_eq!(turn.active, PlayerId::One);
         assert_eq!(turn.inventory[1][STORM_SHARD_ITEM_INDEX], 0);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
+        let entries = app.world().resource::<history::ComputerHistory>().entries();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries[0]
+                .text
+                .starts_with("Computer picked up Storm Shard at ")
+        );
+        assert_eq!(entries[0].item, Some(STORM_SHARD_ITEM_INDEX));
+        assert!(entries[1].text.starts_with("Computer used Storm Shard at "));
     }
 
     #[test]
@@ -5711,6 +5910,12 @@ mod tests {
         assert_ne!(destination, start);
         assert!(!world.resource::<Board>().is_acidic(destination));
         assert_eq!(world.resource::<TurnState>().actions_used, 1);
+        let entries = world.resource::<history::ComputerHistory>().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].text,
+            format!("Computer moved to {}", history::cell_label(destination))
+        );
     }
 
     #[test]

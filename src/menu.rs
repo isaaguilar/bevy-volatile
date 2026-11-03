@@ -1,7 +1,7 @@
 use bevy::{picking::hover::Hovered, prelude::*, ui::Pressed, ui_widgets::Button};
 use bevy_aspect_ratio_mask::Hud;
 
-use crate::{RESOLUTION_HEIGHT, RESOLUTION_WIDTH};
+use crate::{PlayerHealth, RESOLUTION_HEIGHT, RESOLUTION_WIDTH};
 
 const SPLASH_SECONDS: f32 = 1.5;
 const RULE_PAGE_CHARS: usize = 750;
@@ -16,9 +16,14 @@ pub(crate) fn plugin(app: &mut App) {
         .add_systems(Startup, render_screen.after(crate::setup))
         .add_systems(
             Update,
-            (handle_frontend, render_screen, fade_splash)
+            (
+                detect_game_over,
+                handle_frontend,
+                render_screen,
+                fade_splash,
+            )
                 .chain()
-                .after(GameplaySystems),
+                .after(crate::history::HistorySystems),
         );
 }
 
@@ -30,11 +35,20 @@ enum Screen {
     Credits,
     Rulebook,
     Game,
+    GameOver,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Win,
+    Lose,
+    Draw,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GameMode {
     Computer,
+    #[allow(dead_code)]
     TwoPlayer,
 }
 
@@ -42,6 +56,8 @@ enum GameMode {
 pub(crate) struct Frontend {
     screen: Screen,
     mode: Option<GameMode>,
+    outcome: Option<Outcome>,
+    restart_requested: bool,
     timer: Timer,
     selected: usize,
     page: usize,
@@ -55,6 +71,8 @@ impl Default for Frontend {
         Self {
             screen: Screen::BevySplash,
             mode: None,
+            outcome: None,
+            restart_requested: false,
             timer: Timer::from_seconds(SPLASH_SECONDS, TimerMode::Once),
             selected: 0,
             page: 0,
@@ -87,10 +105,14 @@ impl Frontend {
         match action {
             MenuAction::Computer => {
                 self.mode = Some(GameMode::Computer);
+                self.outcome = None;
+                self.restart_requested = true;
                 self.show(Screen::Game);
             }
             MenuAction::TwoPlayer => {
                 self.mode = Some(GameMode::TwoPlayer);
+                self.outcome = None;
+                self.restart_requested = true;
                 self.show(Screen::Game);
             }
             MenuAction::Credits => self.show(Screen::Credits),
@@ -110,6 +132,10 @@ impl Frontend {
             MenuAction::Previous | MenuAction::Next => {}
         }
     }
+
+    pub(crate) fn take_restart_request(&mut self) -> bool {
+        std::mem::take(&mut self.restart_requested)
+    }
 }
 
 #[derive(Component)]
@@ -118,6 +144,7 @@ struct SplashImage;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAction {
     Computer,
+    #[allow(dead_code)]
     TwoPlayer,
     Credits,
     Rulebook,
@@ -126,12 +153,27 @@ enum MenuAction {
     Next,
 }
 
-const TITLE_ACTIONS: [(MenuAction, &str); 4] = [
+const TITLE_ACTIONS: [(MenuAction, &str); 3] = [
     (MenuAction::Computer, "PLAY VS COMPUTER"),
-    (MenuAction::TwoPlayer, "PLAYER 2 PLAYER"),
     (MenuAction::Credits, "CREDITS"),
     (MenuAction::Rulebook, "RULEBOOK"),
 ];
+
+pub(crate) fn detect_game_over(health: Res<PlayerHealth>, mut frontend: ResMut<Frontend>) {
+    if frontend.screen != Screen::Game {
+        return;
+    }
+    let outcome = match health.0 {
+        [0, 0] => Some(Outcome::Draw),
+        [0, _] => Some(Outcome::Lose),
+        [_, 0] => Some(Outcome::Win),
+        _ => None,
+    };
+    if let Some(outcome) = outcome {
+        frontend.outcome = Some(outcome);
+        frontend.show(Screen::GameOver);
+    }
+}
 
 pub(crate) fn in_game(frontend: Res<Frontend>) -> bool {
     frontend.screen == Screen::Game
@@ -268,7 +310,11 @@ fn render_screen(
                 justify_content: JustifyContent::Center,
                 ..default()
             },
-            BackgroundColor(Color::BLACK),
+            BackgroundColor(if frontend.screen == Screen::GameOver {
+                Color::srgba(0.0, 0.0, 0.0, 0.65)
+            } else {
+                Color::BLACK
+            }),
             GlobalZIndex(100),
         ))
         .id();
@@ -296,6 +342,9 @@ fn render_screen(
             Screen::Title => title_screen(parent, &asset_server),
             Screen::Credits => credits_screen(parent),
             Screen::Rulebook => rulebook_screen(parent, &frontend),
+            Screen::GameOver => {
+                game_over_screen(parent, frontend.outcome.expect("game has an outcome"))
+            }
             Screen::Game => unreachable!(),
         });
     frontend.root = Some(root);
@@ -358,13 +407,38 @@ fn title_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
                 for (action, label) in TITLE_ACTIONS {
                     button(options, action, label, 46.0);
                 }
-                text(
-                    options,
-                    "Player 2 player currently starts the local prototype.",
-                    12.0,
-                    TEXT,
-                );
             });
+        });
+}
+
+fn game_over_screen(parent: &mut ChildSpawnerCommands, outcome: Outcome) {
+    parent
+        .spawn((
+            Node {
+                width: Val::Px(360.0),
+                padding: UiRect::all(Val::Px(24.0)),
+                border: UiRect::all(Val::Px(3.0)),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(24.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.08, 0.06, 0.05, 0.96)),
+            BorderColor::all(GOLD),
+        ))
+        .with_children(|content| {
+            text(
+                content,
+                match outcome {
+                    Outcome::Win => "YOU WIN!",
+                    Outcome::Lose => "YOU LOSE",
+                    Outcome::Draw => "DRAW",
+                },
+                52.0,
+                GOLD,
+            );
+            button(content, MenuAction::Computer, "NEW GAME", 46.0);
+            button(content, MenuAction::Back, "BACK TO MENU", 46.0);
         });
 }
 
@@ -473,16 +547,57 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn both_modes_start_the_existing_game() {
-        for (action, expected) in [
-            (MenuAction::Computer, GameMode::Computer),
-            (MenuAction::TwoPlayer, GameMode::TwoPlayer),
+    fn computer_game_requests_a_fresh_match() {
+        let mut frontend = Frontend::default();
+        frontend.activate(MenuAction::Computer);
+        assert_eq!(frontend.screen, Screen::Game);
+        assert!(frontend.take_restart_request());
+        assert!(!frontend.take_restart_request());
+    }
+
+    #[test]
+    fn zero_health_ends_the_match_and_preserves_the_first_result() {
+        for (health, expected) in [
+            ([0, 5], Outcome::Lose),
+            ([5, 0], Outcome::Win),
+            ([0, 0], Outcome::Draw),
         ] {
-            let mut frontend = Frontend::default();
-            frontend.activate(action);
+            let mut app = App::new();
+            app.insert_resource(Frontend::computer_match())
+                .insert_resource(PlayerHealth(health))
+                .add_systems(Update, detect_game_over);
+            assert!(
+                app.world_mut()
+                    .resource_mut::<Frontend>()
+                    .take_restart_request()
+            );
+            app.update();
+            assert_eq!(app.world().resource::<Frontend>().screen, Screen::GameOver);
+            assert_eq!(app.world().resource::<Frontend>().outcome, Some(expected));
+            app.world_mut().resource_mut::<PlayerHealth>().0 = [0, 0];
+            app.update();
+            assert_eq!(app.world().resource::<Frontend>().outcome, Some(expected));
+            let mut frontend = app.world_mut().resource_mut::<Frontend>();
+            frontend.activate(MenuAction::Back);
+            assert_eq!(frontend.screen, Screen::Title);
+            frontend.activate(MenuAction::Computer);
             assert_eq!(frontend.screen, Screen::Game);
-            assert_eq!(frontend.mode, Some(expected));
+            assert!(frontend.take_restart_request());
+            assert_eq!(frontend.outcome, None);
         }
+    }
+
+    #[test]
+    fn multiplayer_remains_available_internally_but_not_in_the_title_menu() {
+        assert!(
+            TITLE_ACTIONS
+                .iter()
+                .all(|(action, _)| *action != MenuAction::TwoPlayer)
+        );
+        let mut frontend = Frontend::default();
+        frontend.activate(MenuAction::TwoPlayer);
+        assert_eq!(frontend.screen, Screen::Game);
+        assert!(!frontend.computer_game());
     }
 
     #[test]
@@ -546,8 +661,7 @@ mod tests {
             .press(KeyCode::Enter);
         app.update();
         let frontend = app.world().resource::<Frontend>();
-        assert_eq!(frontend.screen, Screen::Game);
-        assert_eq!(frontend.mode, Some(GameMode::TwoPlayer));
+        assert_eq!(frontend.screen, Screen::Credits);
     }
 
     #[test]
@@ -572,10 +686,10 @@ mod tests {
         app.update();
         app.world_mut().entity_mut(credits).insert(Hovered(true));
         app.update();
-        assert_eq!(app.world().resource::<Frontend>().selected, 2);
+        assert_eq!(app.world().resource::<Frontend>().selected, 1);
         app.world_mut().entity_mut(credits).insert(Hovered(false));
         app.update();
-        assert_eq!(app.world().resource::<Frontend>().selected, 2);
+        assert_eq!(app.world().resource::<Frontend>().selected, 1);
         assert_eq!(
             app.world().get::<BackgroundColor>(credits).unwrap().0,
             Color::srgb(0.40, 0.28, 0.14)
@@ -584,7 +698,7 @@ mod tests {
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::ArrowDown);
         app.update();
-        assert_eq!(app.world().resource::<Frontend>().selected, 3);
+        assert_eq!(app.world().resource::<Frontend>().selected, 2);
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .clear();
@@ -614,24 +728,24 @@ mod tests {
                 BackgroundColor(Color::BLACK),
             ))
             .id();
-        let two_player = app
+        let computer = app
             .world_mut()
             .spawn((
                 Button,
                 Hovered(false),
-                MenuAction::TwoPlayer,
+                MenuAction::Computer,
                 BackgroundColor(Color::BLACK),
             ))
             .id();
         app.update();
-        assert_eq!(app.world().resource::<Frontend>().selected, 2);
+        assert_eq!(app.world().resource::<Frontend>().selected, 1);
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::ArrowUp);
         app.update();
-        assert_eq!(app.world().resource::<Frontend>().selected, 1);
+        assert_eq!(app.world().resource::<Frontend>().selected, 0);
         assert_eq!(
-            app.world().get::<BackgroundColor>(two_player).unwrap().0,
+            app.world().get::<BackgroundColor>(computer).unwrap().0,
             Color::srgb(0.40, 0.28, 0.14)
         );
         assert_ne!(
@@ -643,10 +757,10 @@ mod tests {
             .clear();
         app.world_mut().entity_mut(credits).insert(Hovered(false));
         app.update();
-        assert_eq!(app.world().resource::<Frontend>().selected, 1);
+        assert_eq!(app.world().resource::<Frontend>().selected, 0);
         app.world_mut().entity_mut(credits).insert(Hovered(true));
         app.update();
-        assert_eq!(app.world().resource::<Frontend>().selected, 2);
+        assert_eq!(app.world().resource::<Frontend>().selected, 1);
     }
 
     #[test]
@@ -703,5 +817,60 @@ mod tests {
             .press(KeyCode::Escape);
         app.update();
         assert_eq!(app.world().resource::<Frontend>().screen, Screen::Title);
+    }
+
+    #[test]
+    fn game_over_buttons_respond_to_pointer_presses() {
+        use bevy::{
+            camera::NormalizedRenderTarget,
+            picking::{
+                backend::HitData,
+                events::{Pointer, PointerPress},
+                pointer::{Location, PointerButton, PointerId},
+            },
+            ui_widgets::ButtonPlugin,
+        };
+
+        for (action, expected) in [
+            (MenuAction::Computer, Screen::Game),
+            (MenuAction::Back, Screen::Title),
+        ] {
+            let mut app = App::new();
+            app.add_plugins(ButtonPlugin)
+                .init_resource::<Time>()
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<Frontend>()
+                .add_systems(Update, handle_frontend);
+            app.world_mut()
+                .resource_mut::<Frontend>()
+                .show(Screen::GameOver);
+            let button = app
+                .world_mut()
+                .spawn((Button, Hovered(true), action, BackgroundColor(Color::BLACK)))
+                .id();
+            app.world_mut().trigger(PointerPress {
+                entity: button,
+                pointer: Pointer::new(
+                    PointerId::Mouse,
+                    Location {
+                        target: NormalizedRenderTarget::None {
+                            width: 960,
+                            height: 540,
+                        },
+                        position: Vec2::ZERO,
+                    },
+                ),
+                button: PointerButton::Primary,
+                hit: HitData::new(button, 0.0, None, None),
+                count: 1,
+            });
+            app.update();
+            let mut frontend = app.world_mut().resource_mut::<Frontend>();
+            assert_eq!(frontend.screen, expected);
+            assert_eq!(
+                frontend.take_restart_request(),
+                action == MenuAction::Computer
+            );
+        }
     }
 }
