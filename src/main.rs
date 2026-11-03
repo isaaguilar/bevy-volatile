@@ -6,8 +6,10 @@ use bevy_aspect_ratio_mask::{AspectRatioPlugin, Hud, Resolution};
 use bevy_rand::prelude::{EntropyPlugin, GlobalRng, WyRand};
 use rand::{Rng, RngExt};
 
+mod ai;
 mod aquatic;
 mod board;
+mod menu;
 mod serpent;
 mod thorn;
 mod void;
@@ -683,7 +685,7 @@ struct HoverShadow(PlayerId);
 struct PickupHighlight;
 
 #[derive(Component)]
-struct InventoryPanel;
+struct InventoryPanel(PlayerId);
 
 #[derive(Component)]
 struct InventorySlot {
@@ -838,6 +840,7 @@ struct SelectionInput<'w, 's> {
     mouse: Res<'w, ButtonInput<MouseButton>>,
     keyboard: Res<'w, ButtonInput<KeyCode>>,
     cursor: Res<'w, BoardCursor>,
+    bot: Option<Res<'w, ai::BotController>>,
     rng: Single<'w, 's, &'static mut WyRand, With<GlobalRng>>,
 }
 
@@ -1092,6 +1095,8 @@ fn main() {
         .init_resource::<TurnState>()
         .init_resource::<PlayerHealth>()
         .init_resource::<Weather>()
+        .init_resource::<ai::BotController>()
+        .add_plugins(menu::plugin)
         .add_systems(
             Startup,
             (
@@ -1114,6 +1119,7 @@ fn main() {
             (
                 (
                     begin_turn_frame,
+                    ai::plan,
                     advance_serpent_animation,
                     advance_aquatic_animation,
                     rest,
@@ -1147,6 +1153,7 @@ fn main() {
                     update_wind_status,
                     update_energy_bars,
                     update_magic_bars,
+                    update_private_panels,
                     update_hover_shadows,
                     update_pickup_highlight,
                     update_hearts,
@@ -1168,7 +1175,9 @@ fn main() {
                 )
                     .chain(),
             )
-                .chain(),
+                .chain()
+                .in_set(menu::GameplaySystems)
+                .run_if(menu::in_game),
         )
         .run();
 }
@@ -1332,7 +1341,16 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
                     } else {
                         "Right inventory"
                     }),
-                    InventoryPanel,
+                    InventoryPanel(if is_left {
+                        PlayerId::One
+                    } else {
+                        PlayerId::Two
+                    }),
+                    if is_left {
+                        Visibility::Visible
+                    } else {
+                        Visibility::Hidden
+                    },
                     node,
                     Pickable::IGNORE,
                 ))
@@ -1462,6 +1480,11 @@ fn spawn_actions(commands: &mut Commands, hud: Entity, images: [Handle<Image>; 3
                 parent
                     .spawn((
                         ActionSlot { owner, action },
+                        if owner == PlayerId::One {
+                            Visibility::Visible
+                        } else {
+                            Visibility::Hidden
+                        },
                         Node {
                             position_type: PositionType::Absolute,
                             left: Val::Px(left + HEALTH_PANEL_INSET),
@@ -1503,6 +1526,33 @@ fn spawn_actions(commands: &mut Commands, hud: Entity, images: [Handle<Image>; 3
             }
         }
     });
+}
+
+fn update_private_panels(
+    turn: Res<TurnState>,
+    bot: Option<Res<ai::BotController>>,
+    mut panels: Query<(&InventoryPanel, &mut Visibility), Without<ActionSlot>>,
+    mut actions: Query<(&ActionSlot, &mut Visibility), Without<InventoryPanel>>,
+) {
+    let visible_player = if bot.as_ref().is_some_and(|bot| bot.computer_mode) {
+        PlayerId::One
+    } else {
+        turn.active
+    };
+    for (panel, mut visibility) in &mut panels {
+        *visibility = if panel.0 == visible_player {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    for (action, mut visibility) in &mut actions {
+        *visibility = if action.owner == visible_player {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
 }
 
 fn update_inventory_counts(turn: Res<TurnState>, mut counts: Query<(&InventoryCount, &mut Text)>) {
@@ -2102,15 +2152,20 @@ fn action_cell(position: Vec2, owner: PlayerId) -> Option<usize> {
 
 fn undo_action(
     mut commands: Commands,
-    input: (Res<ButtonInput<MouseButton>>, Res<BoardCursor>),
+    input: (
+        Res<ButtonInput<MouseButton>>,
+        Res<BoardCursor>,
+        Option<Res<ai::BotController>>,
+    ),
     mut turn: ResMut<TurnState>,
     board: Res<Board>,
     mut selection: ResMut<Selection>,
     mut players: Query<(&Player, &mut Transform)>,
     mut feedback: Query<&mut Text, With<DropFeedback>>,
 ) {
-    let (mouse, cursor) = input;
-    if !mouse.just_pressed(MouseButton::Left)
+    let (mouse, cursor, bot) = input;
+    if bot.as_ref().is_some_and(|bot| bot.bot_turn)
+        || !mouse.just_pressed(MouseButton::Left)
         || turn.acted_this_frame
         || turn.animation_active()
         || cursor
@@ -2194,26 +2249,40 @@ fn finalize_undo(mut commands: Commands, mut turn: ResMut<TurnState>) {
 
 fn handle_actions(
     mut commands: Commands,
-    input: (Res<ButtonInput<MouseButton>>, Res<BoardCursor>),
+    input: (
+        Res<ButtonInput<MouseButton>>,
+        Res<BoardCursor>,
+        Option<Res<ai::BotController>>,
+    ),
     game: (ResMut<TurnState>, ResMut<Board>, ResMut<PlayerHealth>),
     mut selection: ResMut<Selection>,
     players: Query<(&Player, &Transform)>,
     collectibles: Query<(Entity, &Collectible, Option<&Visibility>)>,
     mut feedback: Query<&mut Text, With<DropFeedback>>,
 ) {
-    let (mouse, cursor) = input;
+    let (mouse, cursor, bot) = input;
     let (mut turn, mut board, mut health) = game;
-    if !mouse.just_pressed(MouseButton::Left)
-        || turn.acted_this_frame
+    if turn.acted_this_frame
         || turn.animation_active()
         || turn.pending_placement.as_ref().is_some_and(|p| p.ready)
     {
         return;
     }
-    let Some(action) = cursor
-        .0
-        .and_then(|position| action_cell(position, turn.active))
-    else {
+    let bot_turn = bot.as_ref().is_some_and(|bot| bot.bot_turn);
+    let action = if bot_turn {
+        match bot.as_ref().and_then(|bot| bot.action) {
+            Some(ai::BotAction::Pickup) => Some(Action::Pickup.row()),
+            Some(ai::BotAction::Rest) => Some(Action::Rest.row()),
+            _ => None,
+        }
+    } else if mouse.just_pressed(MouseButton::Left) {
+        cursor
+            .0
+            .and_then(|position| action_cell(position, turn.active))
+    } else {
+        None
+    };
+    let Some(action) = action else {
         return;
     };
     let Some(position) = players.iter().find_map(|(player, transform)| {
@@ -2658,7 +2727,7 @@ fn highlight_inventory_hover(
     cursor: Res<BoardCursor>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     selection: Res<Selection>,
-    turn: Res<TurnState>,
+    game: (Res<TurnState>, Option<Res<ai::BotController>>),
     mut hover: ResMut<InventoryHover>,
     mut slots: Query<(
         &InventorySlot,
@@ -2668,6 +2737,10 @@ fn highlight_inventory_hover(
     )>,
     mut feedback: Query<&mut Text, With<DropFeedback>>,
 ) {
+    let (turn, bot) = game;
+    if bot.as_ref().is_some_and(|bot| bot.bot_turn) {
+        return;
+    }
     let hovered = cursor
         .0
         .and_then(|position| inventory_item(position, turn.active))
@@ -2814,6 +2887,7 @@ fn handle_selection(
         mouse,
         keyboard,
         cursor,
+        bot,
         mut rng,
     } = input;
     let (images, hud, mut board, mut health) = assets;
@@ -2850,15 +2924,36 @@ fn handle_selection(
     };
 
     let resolving_pending = turn.pending_placement.as_ref().is_some_and(|p| p.ready);
-    if !resolving_pending && keyboard.just_pressed(KeyCode::Escape) && selection.0.is_some() {
+    let bot_turn = bot.as_ref().is_some_and(|bot| bot.bot_turn);
+    let bot_action = bot.as_ref().and_then(|bot| bot.action);
+    if bot_turn && !resolving_pending && bot_action.is_none() {
+        return;
+    }
+    if !bot_turn
+        && !resolving_pending
+        && keyboard.just_pressed(KeyCode::Escape)
+        && selection.0.is_some()
+    {
         clear_selection(&mut commands, &mut selection);
         feedback.0 = "Selection cancelled".into();
         return;
     }
 
-    let cell = cursor.0.and_then(board_cell);
-    let mut target = cursor.0.and_then(|position| {
-        if matches!(selection.0, Some(SelectedAction::Item { .. })) {
+    let input_position = if bot_turn {
+        match bot_action {
+            Some(ai::BotAction::Move(cell) | ai::BotAction::Place { cell, .. }) => {
+                Some(cell_center(cell))
+            }
+            _ => None,
+        }
+    } else {
+        cursor.0
+    };
+    let cell = input_position.and_then(board_cell);
+    let mut target = input_position.and_then(|position| {
+        if matches!(bot_action, Some(ai::BotAction::Place { .. }))
+            || (!bot_turn && matches!(selection.0, Some(SelectedAction::Item { .. })))
+        {
             item_target(player, position)
         } else {
             drop_target(player, position)
@@ -2903,8 +2998,18 @@ fn handle_selection(
         pending_index = Some(pending.index);
         previous_free_action = pending.previous_free_action;
     }
-    if (mouse.just_pressed(MouseButton::Left) || resolving_pending) && !turn.acted_this_frame {
-        if !resolving_pending
+    let human_click = !bot_turn && mouse.just_pressed(MouseButton::Left);
+    let bot_selection = bot_turn
+        && matches!(
+            bot_action,
+            Some(ai::BotAction::Move(_) | ai::BotAction::Place { .. })
+        );
+    if (human_click || bot_selection || resolving_pending)
+        && !turn.acted_this_frame
+        && (resolving_pending || !bot_turn || turn.actions_used < 2)
+    {
+        if human_click
+            && !resolving_pending
             && let Some(index) = cursor
                 .0
                 .and_then(|position| inventory_item(position, turn.active))
@@ -2948,7 +3053,8 @@ fn handle_selection(
             }
             return;
         }
-        if !resolving_pending
+        if human_click
+            && !resolving_pending
             && cell.is_some()
             && cell == board_cell(player)
             && !matches!(&selection.0, Some(SelectedAction::Item { .. }))
@@ -2979,14 +3085,21 @@ fn handle_selection(
             Item(usize),
             Movement,
         }
-        let active_selection =
-            pending_index
-                .map(ActiveSelection::Item)
-                .or_else(|| match &selection.0 {
+        let active_selection = pending_index.map(ActiveSelection::Item).or_else(|| {
+            if bot_turn {
+                match bot_action {
+                    Some(ai::BotAction::Place { item, .. }) => Some(ActiveSelection::Item(item)),
+                    Some(ai::BotAction::Move(_)) => Some(ActiveSelection::Movement),
+                    _ => None,
+                }
+            } else {
+                match &selection.0 {
                     Some(SelectedAction::Item { index, .. }) => Some(ActiveSelection::Item(*index)),
                     Some(SelectedAction::Movement { .. }) => Some(ActiveSelection::Movement),
                     None => None,
-                });
+                }
+            }
+        });
         match (&active_selection, &target) {
             (Some(ActiveSelection::Item(index)), Some(target))
                 if queued_placement_error(
@@ -2997,6 +3110,10 @@ fn handle_selection(
                     has_dust_reaction(target.cell),
                 )
                 .is_none()
+                    && (resolving_pending
+                        || (!must_land(&turn, &board, player)
+                            && (is_unlimited(*index)
+                                || turn.inventory[turn.active.index()][*index] > 0)))
                     && (resolving_pending
                         || u32::from(turn.strength[turn.active.index()])
                             >= item_energy_cost(target)) =>
@@ -4405,7 +4522,11 @@ fn advance_wind(mut turn: ResMut<TurnState>, mut rng: Single<&mut WyRand, With<G
     }
 }
 
-fn update_turn_progress(turn: Res<TurnState>, mut status: Query<&mut Text, With<TurnProgress>>) {
+fn update_turn_progress(
+    turn: Res<TurnState>,
+    bot: Option<Res<ai::BotController>>,
+    mut status: Query<&mut Text, With<TurnProgress>>,
+) {
     if let Ok(mut status) = status.single_mut() {
         status.0 = if turn.aquatic_animation.is_some() {
             "AQUATIC CREATURE MOVING...".into()
@@ -4424,6 +4545,9 @@ fn update_turn_progress(turn: Res<TurnState>, mut status: Query<&mut Text, With<
                 if turn.actions_used > 0 { "+2" } else { "FULL" },
             )
         };
+        if bot.as_ref().is_some_and(|bot| bot.computer_mode) && turn.active == PlayerId::Two {
+            status.0 = format!("COMPUTER | {}", status.0);
+        }
     }
 }
 
@@ -4867,7 +4991,7 @@ fn update_aquatic_visuals(
 }
 
 fn rest(
-    keyboard: Res<ButtonInput<KeyCode>>,
+    input: (Res<ButtonInput<KeyCode>>, Option<Res<ai::BotController>>),
     selection: Res<Selection>,
     mut turn: ResMut<TurnState>,
     mut board: ResMut<Board>,
@@ -4875,7 +4999,9 @@ fn rest(
     players: Query<(&Player, &Transform)>,
     mut feedback: Query<&mut Text, With<DropFeedback>>,
 ) {
-    if keyboard.just_pressed(KeyCode::KeyR)
+    let (keyboard, bot) = input;
+    if !bot.as_ref().is_some_and(|bot| bot.bot_turn)
+        && keyboard.just_pressed(KeyCode::KeyR)
         && !turn.acted_this_frame
         && !turn.animation_active()
         && !turn.pending_placement.as_ref().is_some_and(|p| p.ready)
@@ -5108,6 +5234,59 @@ mod tests {
                 assert_eq!(slot.top, Val::Px(expected_y));
                 assert_eq!(name.as_str(), *expected);
                 assert_eq!(world.get::<Text>(children[1]).unwrap().0, *expected);
+            }
+        }
+    }
+
+    #[test]
+    fn only_active_players_inventory_and_actions_are_visible() {
+        fn setup_panels(mut commands: Commands) {
+            let hud = commands.spawn(Node::default()).id();
+            spawn_inventories(
+                &mut commands,
+                hud,
+                &std::array::from_fn(|_| Handle::default()),
+            );
+            spawn_actions(
+                &mut commands,
+                hud,
+                std::array::from_fn(|_| Handle::default()),
+            );
+        }
+
+        let mut app = App::new();
+        app.init_resource::<TurnState>()
+            .add_systems(Startup, setup_panels)
+            .add_systems(Update, update_private_panels);
+        for active in [PlayerId::One, PlayerId::Two, PlayerId::One] {
+            app.world_mut().resource_mut::<TurnState>().active = active;
+            app.update();
+            let world = app.world_mut();
+            let mut inventories = world.query::<(&InventoryPanel, &Visibility)>();
+            let panels: Vec<_> = inventories.iter(world).collect();
+            assert_eq!(panels.len(), 2);
+            for (panel, visibility) in panels {
+                assert_eq!(
+                    *visibility,
+                    if panel.0 == active {
+                        Visibility::Visible
+                    } else {
+                        Visibility::Hidden
+                    }
+                );
+            }
+            let mut actions = world.query::<(&ActionSlot, &Visibility)>();
+            let actions: Vec<_> = actions.iter(world).collect();
+            assert_eq!(actions.len(), 8);
+            for (action, visibility) in actions {
+                assert_eq!(
+                    *visibility,
+                    if action.owner == active {
+                        Visibility::Visible
+                    } else {
+                        Visibility::Hidden
+                    }
+                );
             }
         }
     }
@@ -5360,6 +5539,295 @@ mod tests {
             .resource_mut::<TurnState>()
             .spawned_ingredients[SUNSTONE_ITEM_INDEX] = INGREDIENT_POOL_SIZE as u8;
         app
+    }
+
+    fn computer_app() -> App {
+        let mut app = interaction_app();
+        app.insert_resource(menu::Frontend::computer_match())
+            .init_resource::<ai::BotController>()
+            .add_systems(Update, ai::plan.after(begin_turn_frame).before(rest));
+        app.update();
+        {
+            let mut turn = app.world_mut().resource_mut::<TurnState>();
+            turn.active = PlayerId::Two;
+            turn.inventory = [[0; 14]; 2];
+            turn.inventory[1][SUNSTONE_ITEM_INDEX] = 1;
+            turn.inventory[1][LIFE_ESSENCE_ITEM_INDEX] = 1;
+            turn.wind = WindDirection::West;
+        }
+        app
+    }
+
+    fn computer_step(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(0.7));
+        app.update();
+    }
+
+    #[test]
+    fn computer_queues_water_and_sunstone_through_normal_turn_resolution() {
+        let mut app = computer_app();
+        {
+            let world = app.world_mut();
+            let mut players = world.query::<(&Player, &mut Transform)>();
+            for (player, mut transform) in players.iter_mut(world) {
+                let cell = if player.0 == PlayerId::One {
+                    IVec2::new(1, 1)
+                } else {
+                    IVec2::new(4, 1)
+                };
+                transform.translation = cell_center(cell).extend(0.0);
+            }
+        }
+        computer_step(&mut app);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.active, PlayerId::Two);
+        assert_eq!(turn.actions_used, 1);
+        assert_eq!(
+            turn.pending_placement.as_ref().unwrap().index,
+            WATER_ITEM_INDEX
+        );
+        computer_step(&mut app);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.active, PlayerId::One);
+        assert!(turn.pending_placement.is_none());
+        assert_eq!(turn.inventory[1][SUNSTONE_ITEM_INDEX], 0);
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 10]);
+        assert_eq!(
+            app.world().resource::<Board>().ground(IVec2::new(1, 1)),
+            Some(Ground::Water)
+        );
+    }
+
+    #[test]
+    fn computer_thaws_itself_and_finishes_its_turn() {
+        for on_water in [false, true] {
+            let mut app = computer_app();
+            let cell = IVec2::new(7, 3);
+            {
+                let world = app.world_mut();
+                let mut players = world.query::<(&Player, &mut Transform)>();
+                for (player, mut transform) in players.iter_mut(world) {
+                    if player.0 == PlayerId::Two {
+                        transform.translation = cell_center(cell).extend(0.0);
+                    }
+                }
+                if on_water {
+                    let mut board = world.resource_mut::<Board>();
+                    board.make_water(cell);
+                    assert!(board.freeze_water(cell));
+                }
+                world.resource_mut::<TurnState>().frozen_turns[1] = 2;
+            }
+            computer_step(&mut app);
+            assert_eq!(
+                app.world()
+                    .resource::<TurnState>()
+                    .pending_placement
+                    .as_ref()
+                    .unwrap()
+                    .index,
+                SUNSTONE_ITEM_INDEX
+            );
+            computer_step(&mut app);
+            let turn = app.world().resource::<TurnState>();
+            assert_eq!(turn.active, PlayerId::One);
+            assert_eq!(turn.frozen_turns[1], 0);
+            assert!(!app.world().resource::<Board>().is_frozen(cell));
+            assert_eq!(app.world().resource::<PlayerHealth>().0[1], 10);
+        }
+    }
+
+    #[test]
+    fn human_input_is_ignored_during_computer_turn_and_bot_inventory_stays_hidden() {
+        let mut app = computer_app();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.add_systems(Update, update_private_panels.after(ai::plan));
+        app.update();
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+        assert_eq!(app.world().resource::<TurnState>().actions_used, 0);
+        let world = app.world_mut();
+        let mut panels = world.query::<(&InventoryPanel, &Visibility)>();
+        for (panel, visibility) in panels.iter(world) {
+            assert_eq!(
+                *visibility,
+                if panel.0 == PlayerId::One {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                }
+            );
+        }
+        world.resource_mut::<ButtonInput<KeyCode>>().clear();
+        world.resource_mut::<BoardCursor>().0 = Some(Vec2::new(150.0, -180.0));
+        world
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.update();
+        assert!(app.world().resource::<Selection>().0.is_none());
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+    }
+
+    #[test]
+    fn computer_picks_up_and_uses_an_item_through_the_normal_handlers() {
+        let mut app = computer_app();
+        let cell = board_cell(Vec2::new(150.0, -180.0)).unwrap();
+        app.world_mut().spawn((
+            Collectible {
+                index: STORM_SHARD_ITEM_INDEX,
+                cell,
+            },
+            BoardItem,
+        ));
+        computer_step(&mut app);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.actions_used, 1);
+        assert_eq!(turn.inventory[1][STORM_SHARD_ITEM_INDEX], 1);
+        computer_step(&mut app);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.active, PlayerId::One);
+        assert_eq!(turn.inventory[1][STORM_SHARD_ITEM_INDEX], 0);
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
+    }
+
+    #[test]
+    fn computer_moves_out_of_damaging_terrain() {
+        let mut app = computer_app();
+        let start = board_cell(Vec2::new(150.0, -180.0)).unwrap();
+        app.world_mut().resource_mut::<Board>().add_acid(start);
+        computer_step(&mut app);
+        let world = app.world_mut();
+        let mut players = world.query::<(&Player, &Transform)>();
+        let destination = players
+            .iter(world)
+            .find_map(|(player, transform)| {
+                (player.0 == PlayerId::Two)
+                    .then(|| board_cell(transform.translation.truncate()).unwrap())
+            })
+            .unwrap();
+        assert_ne!(destination, start);
+        assert!(!world.resource::<Board>().is_acidic(destination));
+        assert_eq!(world.resource::<TurnState>().actions_used, 1);
+    }
+
+    #[test]
+    fn computer_lands_before_resolving_a_pending_placement() {
+        let mut app = computer_app();
+        let computer = IVec2::new(4, 1);
+        {
+            let world = app.world_mut();
+            let mut players = world.query::<(&Player, &mut Transform)>();
+            for (player, mut transform) in players.iter_mut(world) {
+                let cell = if player.0 == PlayerId::One {
+                    IVec2::new(1, 1)
+                } else {
+                    computer
+                };
+                transform.translation = cell_center(cell).extend(0.0);
+            }
+        }
+        computer_step(&mut app);
+        assert!(
+            app.world()
+                .resource::<TurnState>()
+                .pending_placement
+                .is_some()
+        );
+        {
+            let world = app.world_mut();
+            world.resource_mut::<Board>().set(computer, Ground::Hole);
+            let mut turn = world.resource_mut::<TurnState>();
+            turn.hovering[1] = true;
+            turn.magic[1] = 1;
+        }
+        computer_step(&mut app);
+        let world = app.world_mut();
+        let mut players = world.query::<(&Player, &Transform)>();
+        let destination = players
+            .iter(world)
+            .find_map(|(player, transform)| {
+                (player.0 == PlayerId::Two)
+                    .then(|| board_cell(transform.translation.truncate()).unwrap())
+            })
+            .unwrap();
+        assert_ne!(destination, computer);
+        assert!(
+            world
+                .resource::<Board>()
+                .ground(destination)
+                .is_some_and(Ground::walkable)
+        );
+        assert_eq!(world.resource::<TurnState>().active, PlayerId::One);
+    }
+
+    #[test]
+    fn computer_avoids_electrocuting_itself_on_connected_water() {
+        let mut app = computer_app();
+        {
+            let world = app.world_mut();
+            let enemy = IVec2::new(4, 3);
+            let computer = IVec2::new(5, 3);
+            let mut players = world.query::<(&Player, &mut Transform)>();
+            for (player, mut transform) in players.iter_mut(world) {
+                let cell = if player.0 == PlayerId::One {
+                    enemy
+                } else {
+                    computer
+                };
+                transform.translation = cell_center(cell).extend(0.0);
+            }
+            let mut board = world.resource_mut::<Board>();
+            board.make_water(enemy);
+            board.make_water(computer);
+            let mut turn = world.resource_mut::<TurnState>();
+            turn.inventory[1][STORM_SHARD_ITEM_INDEX] = 1;
+            turn.inventory[1][SUNSTONE_ITEM_INDEX] = 0;
+        }
+        computer_step(&mut app);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.inventory[1][STORM_SHARD_ITEM_INDEX], 1);
+        assert!(turn.pending_placement.is_none());
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
+    }
+
+    #[test]
+    fn computer_action_cannot_use_an_item_it_does_not_have() {
+        let mut app = interaction_app();
+        app.update();
+        app.world_mut().resource_mut::<TurnState>().active = PlayerId::Two;
+        app.world_mut().resource_mut::<TurnState>().inventory[1][SUNSTONE_ITEM_INDEX] = 0;
+        let mut bot = ai::BotController::default();
+        bot.bot_turn = true;
+        bot.action = Some(ai::BotAction::Place {
+            item: SUNSTONE_ITEM_INDEX,
+            cell: board_cell(Vec2::new(30.0, 0.0)).unwrap(),
+        });
+        app.insert_resource(bot);
+        app.update();
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.active, PlayerId::Two);
+        assert_eq!(turn.actions_used, 0);
+        assert_eq!(turn.inventory[1][SUNSTONE_ITEM_INDEX], 0);
+        assert!(turn.pending_placement.is_none());
+    }
+
+    #[test]
+    fn local_two_player_turn_remains_human_controlled() {
+        let mut app = interaction_app();
+        app.insert_resource(menu::Frontend::default())
+            .init_resource::<ai::BotController>()
+            .add_systems(Update, ai::plan.after(begin_turn_frame).before(rest));
+        app.update();
+        app.world_mut().resource_mut::<TurnState>().active = PlayerId::Two;
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.update();
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+        assert!(!app.world().resource::<ai::BotController>().computer_mode);
     }
 
     fn random_spawn_app() -> App {
