@@ -51,7 +51,12 @@ pub(crate) fn plugin(app: &mut App) {
         .add_systems(Startup, setup.after(crate::setup))
         .add_systems(
             Update,
-            (update_panel, render, scroll, update_scrollbar)
+            (
+                update_panel,
+                render,
+                scroll::<HistoryViewport>,
+                update_scrollbar::<HistoryViewport, HistoryScrollbar>,
+            )
                 .chain()
                 .after(menu::GameplaySystems)
                 .in_set(HistorySystems)
@@ -220,9 +225,9 @@ fn render(
     });
 }
 
-fn scroll(
+pub(crate) fn scroll<V: Component>(
     mut wheel: MessageReader<MouseWheel>,
-    mut viewport: Query<(&Hovered, &ComputedNode, &mut ScrollPosition), With<HistoryViewport>>,
+    mut viewport: Query<(&Hovered, &ComputedNode, &mut ScrollPosition), With<V>>,
 ) {
     let Ok((hovered, computed, mut position)) = viewport.single_mut() else {
         return;
@@ -242,9 +247,9 @@ fn scroll(
     }
 }
 
-fn update_scrollbar(
-    viewport: Query<&ComputedNode, With<HistoryViewport>>,
-    mut scrollbar: Query<&mut Visibility, With<HistoryScrollbar>>,
+pub(crate) fn update_scrollbar<V: Component, S: Component>(
+    viewport: Query<&ComputedNode, With<V>>,
+    mut scrollbar: Query<&mut Visibility, With<S>>,
 ) {
     let (Ok(computed), Ok(mut visibility)) = (viewport.single(), scrollbar.single_mut()) else {
         return;
@@ -301,8 +306,14 @@ mod tests {
         use bevy::input::touch::TouchPhase;
 
         let mut app = App::new();
-        app.add_message::<MouseWheel>()
-            .add_systems(Update, (scroll, update_scrollbar).chain());
+        app.add_message::<MouseWheel>().add_systems(
+            Update,
+            (
+                scroll::<HistoryViewport>,
+                update_scrollbar::<HistoryViewport, HistoryScrollbar>,
+            )
+                .chain(),
+        );
         let viewport = app
             .world_mut()
             .spawn((

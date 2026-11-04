@@ -9,6 +9,7 @@ use rand::{Rng, RngExt};
 mod ai;
 mod aquatic;
 mod board;
+mod help;
 mod history;
 mod menu;
 mod serpent;
@@ -1100,6 +1101,7 @@ fn main() {
         .init_resource::<PlayerHealth>()
         .init_resource::<Weather>()
         .init_resource::<ai::BotController>()
+        .add_plugins(help::plugin)
         .add_plugins(history::plugin)
         .add_plugins(menu::plugin)
         .add_systems(
@@ -1183,7 +1185,8 @@ fn main() {
             )
                 .chain()
                 .in_set(menu::GameplaySystems)
-                .run_if(menu::in_game),
+                .run_if(menu::in_game)
+                .run_if(help::closed),
         )
         .run();
 }
@@ -1196,6 +1199,7 @@ struct MatchReset<'w, 's> {
     health: ResMut<'w, PlayerHealth>,
     weather: ResMut<'w, Weather>,
     bot: ResMut<'w, ai::BotController>,
+    help: ResMut<'w, help::Help>,
     history: ResMut<'w, history::ComputerHistory>,
     selection: ResMut<'w, Selection>,
     hover: ResMut<'w, InventoryHover>,
@@ -1212,6 +1216,7 @@ fn reset_match(mut commands: Commands, mut state: MatchReset) {
     if !state.frontend.take_restart_request() {
         return;
     }
+    state.help.reset(&mut commands);
     if let Some(SelectedAction::Item { icon, .. }) = state.selection.0.take() {
         commands.entity(icon).despawn();
     }
@@ -4372,26 +4377,32 @@ fn handle_selection(
             } else {
                 commands.entity(*highlight).insert(Visibility::Hidden);
             }
-            feedback.0 = match (&target, placement_error) {
-                (_, Some(message)) => message.into(),
-                (Some(target), None) if !can_use => format!(
-                    "Not enough energy - needs {} - Esc, then walk, place nearby, or rest",
-                    item_energy_cost(target)
-                ),
-                (Some(target), None) => format!(
-                    "{}: PLACE - {} grid {} - {} energy - click to confirm",
-                    INVENTORY_ITEMS[*index].0,
-                    target.distance,
-                    if target.distance == 1 {
-                        "step"
-                    } else {
-                        "steps"
-                    },
-                    item_energy_cost(target),
-                ),
-                (None, None) if cell.is_some() => "Click your character to select movement".into(),
-                (None, None) => {
-                    "Click a board cell, or click the item again / Esc to cancel".into()
+            feedback.0 = if cursor.0.is_some_and(help::contains_target) {
+                format!("Click ? to see {} reactions", INVENTORY_ITEMS[*index].0)
+            } else {
+                match (&target, placement_error) {
+                    (_, Some(message)) => message.into(),
+                    (Some(target), None) if !can_use => format!(
+                        "Not enough energy - needs {} - Esc, then walk, place nearby, or rest",
+                        item_energy_cost(target)
+                    ),
+                    (Some(target), None) => format!(
+                        "{}: PLACE - {} grid {} - {} energy - click to confirm",
+                        INVENTORY_ITEMS[*index].0,
+                        target.distance,
+                        if target.distance == 1 {
+                            "step"
+                        } else {
+                            "steps"
+                        },
+                        item_energy_cost(target),
+                    ),
+                    (None, None) if cell.is_some() => {
+                        "Click your character to select movement".into()
+                    }
+                    (None, None) => {
+                        "Click a board cell, or click the item again / Esc to cancel".into()
+                    }
                 }
             };
         }
@@ -5173,6 +5184,7 @@ mod tests {
             .init_resource::<PlayerHealth>()
             .init_resource::<Weather>()
             .init_resource::<ai::BotController>()
+            .init_resource::<help::Help>()
             .init_resource::<history::ComputerHistory>()
             .init_resource::<Selection>()
             .init_resource::<InventoryHover>()
@@ -5678,7 +5690,11 @@ mod tests {
                     )
                         .chain(),
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(menu::GameplaySystems)
+                    .run_if(|help: Option<Res<help::Help>>| {
+                        help.is_none_or(|help| help.item().is_none())
+                    }),
             );
         app.add_systems(Startup, initialize_wind);
         let hud = app.world_mut().spawn(Node::default()).id();
@@ -5741,6 +5757,96 @@ mod tests {
             turn.wind = WindDirection::West;
         }
         app
+    }
+
+    fn ingredient_help_app() -> App {
+        let mut app = interaction_app();
+        app.insert_resource(menu::Frontend::computer_match())
+            .init_resource::<ai::BotController>()
+            .add_message::<bevy::input::mouse::MouseWheel>()
+            .add_plugins(help::plugin);
+        app.update();
+        app
+    }
+
+    #[test]
+    fn ingredient_help_preserves_pending_action_and_pauses_controls() {
+        let mut app = ingredient_help_app();
+        let target = cell_center(IVec2::new(6, 3));
+        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, target);
+        assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
+        click_part(&mut app, Vec2::new(-390.0, 180.0));
+        let before = {
+            let turn = app.world().resource::<TurnState>();
+            (
+                turn.inventory,
+                turn.strength,
+                turn.actions_used,
+                turn.active,
+            )
+        };
+        click_part(&mut app, Vec2::new(-330.0, -240.0));
+        assert_eq!(
+            app.world().resource::<help::Help>().item(),
+            Some(SUNSTONE_ITEM_INDEX)
+        );
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Item {
+                index: SUNSTONE_ITEM_INDEX,
+                ..
+            })
+        ));
+        press_key(&mut app, KeyCode::KeyR);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(
+            (
+                turn.inventory,
+                turn.strength,
+                turn.actions_used,
+                turn.active
+            ),
+            before
+        );
+        assert_eq!(
+            turn.pending_placement.as_ref().unwrap().index,
+            WATER_ITEM_INDEX
+        );
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(app.world().resource::<help::Help>().item(), None);
+        assert!(matches!(
+            app.world().resource::<Selection>().0,
+            Some(SelectedAction::Item {
+                index: SUNSTONE_ITEM_INDEX,
+                ..
+            })
+        ));
+        click_part(&mut app, target);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+        assert!(app.world().resource::<Board>().is_water(IVec2::new(6, 3)));
+    }
+
+    #[test]
+    fn every_selected_ingredient_opens_its_own_guide() {
+        let mut app = ingredient_help_app();
+        for (index, (name, _)) in INVENTORY_ITEMS.iter().enumerate() {
+            let position = Vec2::new(
+                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
+                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
+            );
+            click_part(&mut app, position);
+            click_part(&mut app, Vec2::new(-330.0, -240.0));
+            assert_eq!(app.world().resource::<help::Help>().item(), Some(index));
+            let world = app.world_mut();
+            let mut labels = world.query::<&Text>();
+            assert!(labels.iter(world).any(|text| text.0 == *name), "{name}");
+            press_key(&mut app, KeyCode::Escape);
+            click_part(&mut app, position);
+        }
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.active, PlayerId::One);
+        assert_eq!(turn.actions_used, 0);
     }
 
     fn computer_step(app: &mut App) {
