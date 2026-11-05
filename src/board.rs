@@ -28,7 +28,7 @@ pub enum Ground {
     Hole,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TerrainGrowthKind {
     Void,
     Stone,
@@ -412,6 +412,12 @@ impl Board {
         self.terrain_growth
             .iter()
             .flat_map(|(_, growth)| growth.cells())
+    }
+
+    pub fn terrain_growth_kind_at(&self, cell: IVec2) -> Option<TerrainGrowthKind> {
+        self.terrain_growth
+            .iter()
+            .find_map(|(kind, growth)| growth.cells().any(|part| part == cell).then_some(*kind))
     }
 
     pub fn advance_terrain_growth(&mut self) {

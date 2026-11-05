@@ -9,6 +9,7 @@ use rand::{Rng, RngExt};
 mod ai;
 mod aquatic;
 mod board;
+mod ground_art;
 mod help;
 mod history;
 mod menu;
@@ -1102,6 +1103,7 @@ fn main() {
         .init_resource::<Weather>()
         .init_resource::<ai::BotController>()
         .add_plugins(help::plugin)
+        .add_plugins(ground_art::plugin)
         .add_plugins(history::plugin)
         .add_plugins(menu::plugin)
         .add_systems(
