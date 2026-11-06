@@ -107,7 +107,7 @@ const GUIDES: [Guide; 14] = [
         ],
     },
     Guide {
-        basics: "A direct hit freezes a grounded player for two turns. Hovering prevents freezing; frozen players cannot start hovering.",
+        basics: "Freezes grounded players for two turns. On dry ground, a missed crystal waits until a player steps or lands on it; hovering does not trigger it.",
         reactions: &[
             (
                 "Water",
@@ -135,7 +135,7 @@ const GUIDES: [Guide; 14] = [
                     ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX),
                     ReactionVisual::Explosion,
                 ],
-                "Stone Dust turns frozen water to ground; explosions thaw ice.",
+                "Stone Dust turns frozen water to ground; explosions thaw ice. A new hole or ridge frees a frozen player on it.",
             ),
         ],
     },
@@ -436,12 +436,12 @@ const GUIDES: [Guide; 14] = [
             (
                 "Void Dust",
                 &[ReactionVisual::Ingredient(VOID_DUST_ITEM_INDEX)],
-                "Grows two opposite arms that become holes after four growth turns; the center stays unchanged.",
+                "Grows two opposite arms that become holes along with the center after four growth turns.",
             ),
             (
                 "Stone Dust",
                 &[ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX)],
-                "Grows two opposite arms that become ridges after four growth turns; the center stays unchanged.",
+                "Grows two opposite arms that become ridges along with the center after four growth turns.",
             ),
             (
                 "Coatl's Egg",

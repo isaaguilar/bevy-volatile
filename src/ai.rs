@@ -118,7 +118,7 @@ fn choose_action(
     };
     let index = PlayerId::Two.index();
     let hovering = turn.hovering[index];
-    let frozen = turn.frozen_turns[index] > 0;
+    let frozen = turn.is_frozen(PlayerId::Two);
     let current_danger = danger(board, cell, hovering);
 
     if frozen

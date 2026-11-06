@@ -58,6 +58,8 @@ const AQUATIC_STEP_SECONDS: f32 = 0.2;
 const ITEM_FLIGHT_SECONDS: f32 = 0.45;
 const ITEM_FLIGHT_HEIGHT: f32 = GRID_BLOCK_SIZE * 0.8;
 const ITEM_CORNER_OFFSET: f32 = 15.0;
+const PLAYER_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(333);
+const PLAYER_FRAME_SIZE: f32 = 48.0;
 const WATER_ITEM_INDEX: usize = 0;
 const SUNSTONE_ITEM_INDEX: usize = 1;
 const FROST_CRYSTAL_ITEM_INDEX: usize = 2;
@@ -92,6 +94,23 @@ const INVENTORY_ITEMS: [(&str, &str); 14] = [
 
 #[derive(Component)]
 struct Player(PlayerId);
+
+#[derive(Component)]
+struct PlayerAnimation {
+    timer: Timer,
+    hovering: bool,
+    frame: usize,
+}
+
+impl Default for PlayerAnimation {
+    fn default() -> Self {
+        Self {
+            timer: Timer::new(PLAYER_FRAME_DURATION, TimerMode::Repeating),
+            hovering: false,
+            frame: 0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayerId {
@@ -326,6 +345,11 @@ impl Default for TurnState {
 }
 
 impl TurnState {
+    fn is_frozen(&self, player: PlayerId) -> bool {
+        self.frozen_turns[player.index()] > 0
+            || self.pending_effects.frozen_players[player.index()] > 0
+    }
+
     fn animation_active(&self) -> bool {
         self.item_flight.is_some()
             || self.aquatic_animation.is_some()
@@ -447,7 +471,7 @@ impl TurnState {
     ) {
         let mut combined = std::mem::take(&mut self.pending_effects);
         combined.merge(effects);
-        let effects = combined;
+        let mut effects = combined;
         let mut health_changes = effects.health_changes;
         let mut positions: Vec<_> = positions
             .into_iter()
@@ -471,11 +495,10 @@ impl TurnState {
                 continue;
             }
             let player = positions[index].0;
+            self.frozen_turns[player.index()] = 0;
+            effects.frozen_players[player.index()] = 0;
             let hover_cost = u8::from(player == self.active);
-            let frozen =
-                self.frozen_turns[player.index()] > 0 || effects.frozen_players[player.index()] > 0;
-            if self.magic[player.index()] > hover_cost && (self.hovering[player.index()] || !frozen)
-            {
+            if self.magic[player.index()] > hover_cost {
                 self.hovering[player.index()] = true;
                 continue;
             }
@@ -496,8 +519,10 @@ impl TurnState {
             if let Some(destination) = destination {
                 positions[index].1 = Some(destination);
                 positions[index].2 = board.is_frozen(destination);
+                self.hovering[player.index()] = false;
                 self.terrain_displacements
                     .push((positions[index].0, destination));
+                health_changes.damage(player, 1);
             } else {
                 error!("No unoccupied safe tile for player displaced by terrain");
             }
@@ -655,10 +680,10 @@ fn apply_direct_hit(
     let mut hit_player = false;
     for (player, position) in positions {
         if board_cell(position) == Some(hit.cell) {
-            if hit.frost {
-                if !hovering[player.index()] {
-                    frozen_players[player.index()] = frozen_players[player.index()].max(2);
-                }
+            if hit.frost && hovering[player.index()] {
+                continue;
+            } else if hit.frost {
+                frozen_players[player.index()] = frozen_players[player.index()].max(2);
             } else {
                 health_changes.damage(player, 1);
             }
@@ -745,9 +770,6 @@ struct EnergyFill(PlayerId);
 
 #[derive(Component)]
 struct MagicFill(PlayerId);
-
-#[derive(Component)]
-struct HoverShadow(PlayerId);
 
 #[derive(Component)]
 struct PickupHighlight;
@@ -854,6 +876,8 @@ enum UndoAction {
         strength: u8,
         hovering: bool,
         moved_while_hovering: bool,
+        triggered_frost: Vec<UndoPickup>,
+        previous_pending_freeze: u8,
     },
     Placement {
         strength: u8,
@@ -1153,7 +1177,7 @@ fn movement_target(
 
 fn must_land(turn: &TurnState, board: &Board, position: Vec2) -> bool {
     let index = turn.active.index();
-    turn.frozen_turns[index] == 0
+    !turn.is_frozen(turn.active)
         && turn.hovering[index]
         && turn.magic[index] == 1
         && board_cell(position)
@@ -1235,6 +1259,8 @@ fn main() {
                     handle_selection.run_if(pending_placement_ready),
                     effects::capture,
                     apply_terrain_changes,
+                    trigger_placed_frost,
+                    effects::capture,
                 )
                     .chain(),
                 (
@@ -1259,7 +1285,7 @@ fn main() {
                     update_energy_bars,
                     update_magic_bars,
                     update_private_panels,
-                    update_hover_shadows,
+                    animate_players,
                     update_pickup_highlight,
                     update_hearts,
                 )
@@ -1506,15 +1532,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
         .with_settings(|settings: &mut ImageLoaderSettings| {
             settings.sampler = ImageSampler::nearest();
         })
-        .load("player-Sheet.png");
+        .load("players-animated-Sheet.png");
     spawn_players(&mut commands, player_sheet);
-    let shadow = asset_server.load("actions/hover-shadow.png");
-    for (owner, start) in [PlayerId::One, PlayerId::Two]
-        .into_iter()
-        .zip(PLAYER_STARTS)
-    {
-        spawn_hover_shadow(&mut commands, owner, cell_center(start), shadow.clone());
-    }
 }
 
 fn spawn_players(commands: &mut Commands, sheet: Handle<Image>) {
@@ -1522,18 +1541,44 @@ fn spawn_players(commands: &mut Commands, sheet: Handle<Image>) {
         .into_iter()
         .zip(PLAYER_STARTS)
     {
-        let x = owner.index() as f32 * 32.0;
         commands.spawn((
             PersistentWorld,
             Sprite {
                 image: sheet.clone(),
-                rect: Some(Rect::new(x, 0.0, x + 32.0, 32.0)),
-                custom_size: Some(Vec2::splat(48.0)),
+                rect: Some(player_frame_rect(owner, false, 0)),
+                custom_size: Some(Vec2::splat(PLAYER_FRAME_SIZE * 1.5)),
                 ..default()
             },
             Transform::from_translation(cell_center(start).extend(0.0)),
             Player(owner),
+            PlayerAnimation::default(),
         ));
+    }
+}
+
+fn player_frame_rect(owner: PlayerId, hovering: bool, frame: usize) -> Rect {
+    let x = (usize::from(hovering) * 2 + frame) as f32 * PLAYER_FRAME_SIZE;
+    let y = owner.index() as f32 * PLAYER_FRAME_SIZE;
+    Rect::new(x, y, x + PLAYER_FRAME_SIZE, y + PLAYER_FRAME_SIZE)
+}
+
+fn animate_players(
+    time: Res<Time>,
+    turn: Res<TurnState>,
+    mut players: Query<(&Player, &mut PlayerAnimation, &mut Sprite)>,
+) {
+    for (player, mut animation, mut sprite) in &mut players {
+        let hovering = turn.hovering[player.0.index()];
+        if animation.hovering != hovering {
+            animation.hovering = hovering;
+            animation.frame = 0;
+            animation.timer.reset();
+        } else {
+            animation.timer.tick(time.delta());
+            animation.frame =
+                (animation.frame + animation.timer.times_finished_this_tick() as usize) % 2;
+        }
+        sprite.rect = Some(player_frame_rect(player.0, hovering, animation.frame));
     }
 }
 
@@ -2416,6 +2461,8 @@ fn undo_action(
             strength,
             hovering,
             moved_while_hovering,
+            triggered_frost,
+            previous_pending_freeze,
         } => {
             let (_, mut transform) = players
                 .iter_mut()
@@ -2425,6 +2472,20 @@ fn undo_action(
             transform.translation.y = origin.y;
             turn.strength[index] = strength;
             turn.moved_while_hovering = moved_while_hovering;
+            turn.pending_effects.frozen_players[index] = previous_pending_freeze;
+            for item in triggered_frost {
+                let mut entity = commands.entity(item.entity);
+                entity.remove::<PickedUpForUndo>();
+                entity.insert(Collectible {
+                    index: item.index,
+                    cell: item.cell,
+                });
+                if let Some(visibility) = item.visibility {
+                    entity.insert(visibility);
+                } else {
+                    entity.remove::<Visibility>();
+                }
+            }
             turn.aquatic_contacts.clear();
             if board_cell(origin)
                 .is_some_and(|cell| !board.ground(cell).is_some_and(Ground::walkable))
@@ -2467,10 +2528,23 @@ fn undo_action(
 fn finalize_undo(mut commands: Commands, mut turn: ResMut<TurnState>) {
     if turn.acted_this_frame
         && let Some(undo) = turn.undo.take()
-        && let UndoAction::Pickup { items } = undo
     {
-        for item in items {
-            commands.entity(item.entity).despawn();
+        match undo {
+            UndoAction::Pickup { items } => {
+                for item in items {
+                    commands.entity(item.entity).despawn();
+                }
+            }
+            UndoAction::Movement {
+                triggered_frost, ..
+            } => {
+                for item in triggered_frost {
+                    commands.entity(item.entity).despawn();
+                    turn.ingredient_respawns
+                        .push((FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY));
+                }
+            }
+            UndoAction::Placement { .. } => {}
         }
     }
 }
@@ -2536,7 +2610,7 @@ fn handle_actions(
             feedback.0 = "Selection cancelled".into();
         } else if turn.actions_used >= 2 {
             feedback.0 = "Both actions have been used".into();
-        } else if turn.frozen_turns[index] > 0 {
+        } else if turn.is_frozen(turn.active) {
             feedback.0 = "Frozen in place - use an item, pick up, or rest".into();
         } else if let Some(opponent) = players.iter().find_map(|(player, transform)| {
             (player.0 == turn.active.other()).then_some(transform.translation.truncate())
@@ -2563,7 +2637,7 @@ fn handle_actions(
                 return;
             }
             turn.hovering[index] = false;
-        } else if turn.frozen_turns[index] > 0 || turn.pending_effects.frozen_players[index] > 0 {
+        } else if turn.is_frozen(turn.active) {
             feedback.0 = "Frozen players cannot start hovering".into();
             return;
         } else if turn.magic[index] > 0 {
@@ -2694,6 +2768,87 @@ fn apply_terrain_changes(
         && let Ok(mut feedback) = feedback.single_mut()
     {
         feedback.0 = "Terrain growth blocked by the 60% ridge and hole limit".into();
+    }
+}
+
+type WaitingFrostFilter = (With<PlacedItem>, Without<PickedUpForUndo>);
+type WaitingFrost = (
+    Entity,
+    &'static PendingFrost,
+    &'static Collectible,
+    Option<&'static Visibility>,
+);
+
+fn trigger_placed_frost(
+    mut commands: Commands,
+    mut turn: ResMut<TurnState>,
+    players: Query<(&Player, &Transform)>,
+    crystals: Query<WaitingFrost, WaitingFrostFilter>,
+    mut selection: ResMut<Selection>,
+    mut feedback: Query<&mut Text, With<DropFeedback>>,
+) {
+    for (player, transform) in &players {
+        let index = player.0.index();
+        if turn.hovering[index] {
+            continue;
+        }
+        let Some(cell) = board_cell(transform.translation.truncate()) else {
+            continue;
+        };
+        let mut triggered = false;
+        for (entity, frost, item, visibility) in &crystals {
+            if frost.0 != cell
+                || turn
+                    .pending_direct_hit
+                    .as_ref()
+                    .is_some_and(|hit| hit.item == Some(entity))
+            {
+                continue;
+            }
+            let reversible = player.0 == turn.active
+                && !turn.completed_turn
+                && matches!(turn.undo, Some(UndoAction::Movement { .. }));
+            if reversible {
+                if let Some(UndoAction::Movement {
+                    triggered_frost, ..
+                }) = &mut turn.undo
+                {
+                    triggered_frost.push(UndoPickup {
+                        entity,
+                        index: item.index,
+                        cell: item.cell,
+                        visibility: visibility.copied(),
+                    });
+                }
+                commands
+                    .entity(entity)
+                    .remove::<Collectible>()
+                    .insert((PickedUpForUndo, Visibility::Hidden));
+            } else {
+                if !turn.completed_turn && turn.existing_respawns.is_none() {
+                    turn.existing_respawns = Some(turn.ingredient_respawns.len());
+                }
+                commands.entity(entity).despawn();
+                turn.ingredient_respawns
+                    .push((FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY));
+            }
+            triggered = true;
+        }
+        if triggered {
+            if player.0 == turn.active && !turn.completed_turn {
+                turn.pending_effects.frozen_players[index] =
+                    turn.pending_effects.frozen_players[index].max(2);
+            } else {
+                turn.frozen_turns[index] = turn.frozen_turns[index].max(2);
+            }
+            commands.spawn(effects::EffectSignal(cell, effects::Effect::Freeze));
+            if player.0 == turn.active {
+                clear_selection(&mut commands, &mut selection);
+                if let Ok(mut feedback) = feedback.single_mut() {
+                    feedback.0 = "Frost Crystal triggered - frozen in place".into();
+                }
+            }
+        }
     }
 }
 
@@ -3742,6 +3897,11 @@ fn handle_selection(
                         let player_on_target = players.iter().any(|(_, _, transform)| {
                             board_cell(transform.translation.truncate()) == Some(target.cell)
                         });
+                        let grounded_player_on_target =
+                            players.iter().any(|(_, player, transform)| {
+                                board_cell(transform.translation.truncate()) == Some(target.cell)
+                                    && !turn.hovering[player.0.index()]
+                            });
                         let frozen_player_on_target =
                             players.iter().any(|(_, player, transform)| {
                                 board_cell(transform.translation.truncate()) == Some(target.cell)
@@ -3760,7 +3920,10 @@ fn handle_selection(
                                 !board.is_frozen(target.cell)
                                     && board.ground(target.cell).is_some_and(Ground::walkable)
                             }
-                            FROST_CRYSTAL_ITEM_INDEX => board.is_water(target.cell) || direct_hit,
+                            FROST_CRYSTAL_ITEM_INDEX => {
+                                board.is_water(target.cell)
+                                    || (grounded_player_on_target && !defer_direct_hit)
+                            }
                             STORM_SHARD_ITEM_INDEX => {
                                 board.is_water(target.cell)
                                     || board.is_acidic(target.cell)
@@ -4295,12 +4458,14 @@ fn handle_selection(
                 }
                 refreshed_water.extend(blast_result.refreshed_water);
                 let mut blast_cells = Vec::new();
-                let mut oil_sources = Vec::new();
+                let oil_sources: Vec<_> = blast_result
+                    .blasts
+                    .iter()
+                    .filter(|blast| matches!(blast.kind, BlastKind::Oil))
+                    .map(|blast| blast.source)
+                    .collect();
                 for blast in &blast_result.blasts {
                     let cells = blast.cells(&board);
-                    if matches!(blast.kind, BlastKind::Oil) {
-                        oil_sources.push(blast.source);
-                    }
                     for (_, player, transform) in &players {
                         if let Some(cell) = board_cell(transform.translation.truncate())
                             && cells.contains(&cell)
@@ -4317,28 +4482,26 @@ fn handle_selection(
                         if !blast_cells.contains(&cell) {
                             blast_cells.push(cell);
                         }
+                        let center = cell_center(cell);
+                        commands.spawn((
+                            FireFlash(Timer::from_seconds(0.65, TimerMode::Once)),
+                            Sprite {
+                                color: Color::srgba(
+                                    1.0,
+                                    0.35,
+                                    0.0,
+                                    if oil_sources.contains(&cell) {
+                                        0.65
+                                    } else {
+                                        0.35
+                                    },
+                                ),
+                                custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
+                                ..default()
+                            },
+                            Transform::from_xyz(center.x, center.y, 1.6),
+                        ));
                     }
-                }
-                for &cell in &blast_cells {
-                    let center = cell_center(cell);
-                    commands.spawn((
-                        FireFlash(Timer::from_seconds(0.65, TimerMode::Once)),
-                        Sprite {
-                            color: Color::srgba(
-                                1.0,
-                                0.35,
-                                0.0,
-                                if oil_sources.contains(&cell) {
-                                    0.65
-                                } else {
-                                    0.35
-                                },
-                            ),
-                            custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
-                            ..default()
-                        },
-                        Transform::from_xyz(center.x, center.y, 1.6),
-                    ));
                 }
                 board.burn_thorns(&blast_cells);
                 if makes_steam {
@@ -4665,7 +4828,7 @@ fn handle_selection(
                 return;
             }
             (Some(ActiveSelection::Movement), Some(target))
-                if turn.frozen_turns[turn.active.index()] == 0
+                if !turn.is_frozen(turn.active)
                     && movement_target(
                         &board,
                         target,
@@ -4710,6 +4873,9 @@ fn handle_selection(
                             strength: turn.strength[turn.active.index()],
                             hovering: turn.hovering[turn.active.index()],
                             moved_while_hovering: turn.moved_while_hovering,
+                            triggered_frost: Vec::new(),
+                            previous_pending_freeze: turn.pending_effects.frozen_players
+                                [turn.active.index()],
                         });
                     }
                     turn.moved_while_hovering |= turn.hovering[turn.active.index()];
@@ -5255,10 +5421,11 @@ fn update_turn_progress(
                 }
                 .to_owned(),
             )
-        } else if turn.frozen_turns[turn.active.index()] > 0 {
+        } else if turn.is_frozen(turn.active) {
             Some(format!(
                 "FROZEN: {} TURN(S)",
                 turn.frozen_turns[turn.active.index()]
+                    .max(turn.pending_effects.frozen_players[turn.active.index()])
             ))
         } else {
             None
@@ -5294,46 +5461,6 @@ fn update_magic_bars(turn: Res<TurnState>, mut bars: Query<(&MagicFill, &mut Nod
     for (fill, mut node) in &mut bars {
         node.width =
             Val::Percent(100.0 * f32::from(turn.magic[fill.0.index()]) / f32::from(MAX_MAGIC));
-    }
-}
-
-fn spawn_hover_shadow(
-    commands: &mut Commands,
-    owner: PlayerId,
-    position: Vec2,
-    image: Handle<Image>,
-) {
-    commands.spawn((
-        HoverShadow(owner),
-        PersistentWorld,
-        Sprite {
-            image,
-            custom_size: Some(Vec2::new(44.0, 14.0)),
-            ..default()
-        },
-        Transform::from_xyz(position.x, position.y - 23.0, -0.1),
-        Visibility::Hidden,
-    ));
-}
-
-fn update_hover_shadows(
-    turn: Res<TurnState>,
-    players: Query<(&Player, &Transform), Without<HoverShadow>>,
-    mut shadows: Query<(&HoverShadow, &mut Transform, &mut Visibility), Without<Player>>,
-) {
-    for (shadow, mut transform, mut visibility) in &mut shadows {
-        if let Some(position) = players
-            .iter()
-            .find_map(|(player, transform)| (player.0 == shadow.0).then_some(transform.translation))
-        {
-            transform.translation.x = position.x;
-            transform.translation.y = position.y - 23.0;
-        }
-        *visibility = if turn.hovering[shadow.0.index()] {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
     }
 }
 
@@ -5454,7 +5581,7 @@ fn update_frozen_tiles(
     let mut displayed = [false; 2];
     for (entity, impact, mut transform, mut visibility) in &mut impacts {
         let index = impact.0.index();
-        if turn.frozen_turns[index] == 0 {
+        if !turn.is_frozen(impact.0) {
             commands.entity(entity).despawn();
         } else if let Some((_, player_transform)) =
             players.iter().find(|(player, _)| player.0 == impact.0)
@@ -5476,7 +5603,7 @@ fn update_frozen_tiles(
     }
     for (player, transform) in &players {
         let index = player.0.index();
-        if turn.frozen_turns[index] > 0 && !displayed[index] {
+        if turn.is_frozen(player.0) && !displayed[index] {
             commands.spawn((
                 FrostImpact(player.0),
                 Sprite {
@@ -5631,9 +5758,19 @@ fn update_acid_visuals(
 fn update_void_growth_visuals(
     mut commands: Commands,
     board: Res<Board>,
+    effects: Option<Res<effects::Effects>>,
     tiles: Query<(Entity, &VoidGrowthTile)>,
 ) {
-    let cells: Vec<_> = board.terrain_growth_cells().collect();
+    let cells: Vec<_> = (0..ROWS)
+        .flat_map(|y| (0..COLUMNS).map(move |x| IVec2::new(x as i32, y as i32)))
+        .filter(|&cell| {
+            effects
+                .as_ref()
+                .and_then(|effects| effects.held(cell))
+                .map_or_else(|| board.terrain_growth_kind_at(cell), |old| old.growth)
+                .is_some()
+        })
+        .collect();
     let mut displayed = Vec::new();
     for (entity, tile) in &tiles {
         if cells.contains(&tile.0) {
@@ -5662,12 +5799,19 @@ fn update_void_growth_visuals(
 fn update_life_essence_visuals(
     mut commands: Commands,
     board: Res<Board>,
+    effects: Option<Res<effects::Effects>>,
     images: Res<InventoryImages>,
     tiles: Query<(Entity, &LifeEssenceTile)>,
 ) {
+    let visible = |cell| {
+        effects
+            .as_ref()
+            .and_then(|effects| effects.held(cell))
+            .map_or_else(|| board.has_life_essence(cell), |old| old.healing)
+    };
     let mut displayed = Vec::new();
     for (entity, tile) in &tiles {
-        if board.has_life_essence(tile.0) {
+        if visible(tile.0) {
             displayed.push(tile.0);
         } else {
             commands.entity(entity).despawn();
@@ -5676,7 +5820,7 @@ fn update_life_essence_visuals(
     for y in 0..ROWS {
         for x in 0..COLUMNS {
             let cell = IVec2::new(x as i32, y as i32);
-            if board.has_life_essence(cell) && !displayed.contains(&cell) {
+            if visible(cell) && !displayed.contains(&cell) {
                 let center = cell_center(cell);
                 commands.spawn((
                     LifeEssenceTile(cell),
@@ -5695,11 +5839,18 @@ fn update_life_essence_visuals(
 fn update_thorn_visuals(
     mut commands: Commands,
     board: Res<Board>,
+    effects: Option<Res<effects::Effects>>,
     tiles: Query<(Entity, &ThornTile)>,
 ) {
+    let visible = |cell| {
+        effects
+            .as_ref()
+            .and_then(|effects| effects.held(cell))
+            .map_or_else(|| board.has_thorns(cell), |old| old.thorns)
+    };
     let mut displayed = Vec::new();
     for (entity, tile) in &tiles {
-        if board.has_thorns(tile.0) {
+        if visible(tile.0) {
             displayed.push(tile.0);
         } else {
             commands.entity(entity).despawn();
@@ -5708,7 +5859,7 @@ fn update_thorn_visuals(
     for y in 0..ROWS {
         for x in 0..COLUMNS {
             let cell = IVec2::new(x as i32, y as i32);
-            if board.has_thorns(cell) && !displayed.contains(&cell) {
+            if visible(cell) && !displayed.contains(&cell) {
                 let center = cell_center(cell);
                 commands.spawn((
                     ThornTile(cell),
@@ -5846,18 +5997,76 @@ mod tests {
             assert!(!seen[player.0.index()]);
             seen[player.0.index()] = true;
             let rect = match player.0 {
-                PlayerId::One => Rect::new(0.0, 0.0, 32.0, 32.0),
-                PlayerId::Two => Rect::new(32.0, 0.0, 64.0, 32.0),
+                PlayerId::One => Rect::new(0.0, 0.0, 48.0, 48.0),
+                PlayerId::Two => Rect::new(0.0, 48.0, 48.0, 96.0),
             };
             assert_eq!(sprite.image, sheet);
             assert_eq!(sprite.rect, Some(rect));
-            assert_eq!(sprite.custom_size, Some(Vec2::splat(48.0)));
+            assert_eq!(sprite.custom_size, Some(Vec2::splat(72.0)));
             assert_eq!(
                 transform.translation,
                 cell_center(PLAYER_STARTS[player.0.index()]).extend(0.0)
             );
             assert!(persistent);
         }
+    }
+
+    #[test]
+    fn player_standing_and_hover_animations_loop_and_restart_on_transition() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<TurnState>()
+            .add_systems(Startup, |mut commands: Commands| {
+                spawn_players(&mut commands, Handle::default());
+            })
+            .add_systems(Update, animate_players);
+        app.update();
+
+        fn frames(app: &mut App) -> [Rect; 2] {
+            let world = app.world_mut();
+            let mut query = world.query::<(&Player, &Sprite)>();
+            let mut frames = [Rect::default(); 2];
+            for (player, sprite) in query.iter(world) {
+                frames[player.0.index()] = sprite.rect.unwrap();
+            }
+            frames
+        }
+
+        fn tick(app: &mut App, millis: u64) {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_millis(millis));
+            app.update();
+        }
+
+        assert_eq!(
+            frames(&mut app),
+            [
+                Rect::new(0.0, 0.0, 48.0, 48.0),
+                Rect::new(0.0, 48.0, 48.0, 96.0)
+            ]
+        );
+        tick(&mut app, 332);
+        assert_eq!(frames(&mut app)[0].min.x, 0.0);
+        tick(&mut app, 1);
+        assert_eq!(frames(&mut app)[0].min.x, 48.0);
+        assert_eq!(frames(&mut app)[1].min.x, 48.0);
+
+        app.world_mut().resource_mut::<TurnState>().hovering[0] = true;
+        tick(&mut app, 0);
+        assert_eq!(frames(&mut app)[0].min.x, 96.0);
+        assert_eq!(frames(&mut app)[1].min.x, 48.0);
+        tick(&mut app, 333);
+        assert_eq!(frames(&mut app)[0].min.x, 144.0);
+        assert_eq!(frames(&mut app)[1].min.x, 0.0);
+
+        app.world_mut().resource_mut::<TurnState>().hovering = [false, true];
+        tick(&mut app, 0);
+        assert_eq!(frames(&mut app)[0].min.x, 0.0);
+        assert_eq!(frames(&mut app)[1].min.x, 96.0);
+        tick(&mut app, 999);
+        assert_eq!(frames(&mut app)[0].min.x, 48.0);
+        assert_eq!(frames(&mut app)[1].min.x, 144.0);
     }
 
     #[test]
@@ -6472,6 +6681,8 @@ mod tests {
                         handle_selection.run_if(pending_placement_ready),
                         effects::capture.run_if(resource_exists::<effects::Effects>),
                         apply_terrain_changes,
+                        trigger_placed_frost,
+                        effects::capture.run_if(resource_exists::<effects::Effects>),
                     )
                         .chain(),
                     (
@@ -6494,7 +6705,7 @@ mod tests {
                         update_wind_status,
                         update_energy_bars,
                         update_magic_bars,
-                        update_hover_shadows,
+                        animate_players,
                         update_pickup_highlight,
                         update_hearts,
                     )
@@ -6536,23 +6747,17 @@ mod tests {
                 std::array::from_fn(|_| Handle::default()),
             );
             spawn_health_displays(&mut commands, hud.0, full_heart.clone(), half_heart.clone());
-            spawn_hover_shadow(
-                &mut commands,
-                PlayerId::One,
-                Vec2::new(30.0, 0.0),
-                Handle::default(),
-            );
-            spawn_hover_shadow(
-                &mut commands,
-                PlayerId::Two,
-                Vec2::new(150.0, -180.0),
-                Handle::default(),
-            );
         });
-        app.world_mut()
-            .spawn((Player(PlayerId::One), Transform::from_xyz(30.0, 0.0, 0.0)));
+        app.world_mut().spawn((
+            Player(PlayerId::One),
+            PlayerAnimation::default(),
+            Sprite::default(),
+            Transform::from_xyz(30.0, 0.0, 0.0),
+        ));
         app.world_mut().spawn((
             Player(PlayerId::Two),
+            PlayerAnimation::default(),
+            Sprite::default(),
             Transform::from_xyz(150.0, -180.0, 0.0),
         ));
         app.world_mut().spawn((DropFeedback, Text::new("")));
@@ -6634,6 +6839,111 @@ mod tests {
         tick_coatl_animation(&mut app, 1.5);
         assert!(!app.world().resource::<TurnState>().effects_active);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+    }
+
+    #[test]
+    fn expiring_poison_remains_visible_until_new_water_and_poison_arrive() {
+        let mut app = interaction_app();
+        let source = IVec2::new(6, 4);
+        let target = IVec2::new(6, 3);
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.make_water(source);
+            board.add_poison(source);
+            board.finish_turn([], []);
+            board.finish_turn([], []);
+            assert!(board.is_poisoned(source));
+        }
+        app.init_resource::<effects::Effects>();
+        app.update();
+        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, cell_center(target));
+        assert!(!app.world().resource::<Board>().is_poisoned(source));
+        assert!(app.world().resource::<Board>().is_poisoned(target));
+        let effects = app.world().resource::<effects::Effects>();
+        assert!(effects.animating(target, effects::Effect::Water));
+        assert!(effects.animating(target, effects::Effect::Poison));
+        assert!(effects.held(source).unwrap().poison);
+        assert!(!effects.held(target).unwrap().poison);
+        {
+            let world = app.world_mut();
+            let tiles: Vec<_> = world
+                .query::<&PoisonTile>()
+                .iter(world)
+                .map(|p| p.0)
+                .collect();
+            assert!(tiles.contains(&source));
+            assert!(!tiles.contains(&target));
+        }
+        tick_coatl_animation(&mut app, 0.5);
+        assert!(
+            app.world()
+                .resource::<effects::Effects>()
+                .held(source)
+                .unwrap()
+                .poison
+        );
+        tick_coatl_animation(&mut app, 0.5);
+        let world = app.world_mut();
+        let tiles: Vec<_> = world
+            .query::<&PoisonTile>()
+            .iter(world)
+            .map(|p| p.0)
+            .collect();
+        assert!(!tiles.contains(&source));
+        assert!(tiles.contains(&target));
+        assert!(!world.resource::<TurnState>().effects_active);
+    }
+
+    #[test]
+    fn completed_growth_stays_visible_until_its_terrain_animations_finish() {
+        for kind in [TerrainGrowthKind::Void, TerrainGrowthKind::Stone] {
+            let mut app = interaction_app();
+            app.init_resource::<effects::Effects>();
+            app.update();
+            app.world_mut()
+                .resource_mut::<Board>()
+                .start_terrain_growth(IVec2::new(4, 3), 7, kind);
+            for _ in 0..5 {
+                press_key(&mut app, KeyCode::KeyR);
+            }
+            assert_eq!(
+                app.world_mut()
+                    .query::<&VoidGrowthTile>()
+                    .iter(app.world())
+                    .count(),
+                5
+            );
+            press_key(&mut app, KeyCode::KeyR);
+            assert!(app.world().resource::<TurnState>().effects_active);
+            {
+                let world = app.world_mut();
+                let tiles: Vec<_> = world
+                    .query::<&VoidGrowthTile>()
+                    .iter(world)
+                    .map(|tile| tile.0)
+                    .collect();
+                assert_eq!(tiles.len(), 5);
+                for cell in tiles {
+                    assert!(
+                        world
+                            .resource::<effects::Effects>()
+                            .held(cell)
+                            .unwrap()
+                            .growth
+                            == Some(kind)
+                    );
+                }
+            }
+            tick_coatl_animation(&mut app, 1.0);
+            assert_eq!(
+                app.world_mut()
+                    .query::<&VoidGrowthTile>()
+                    .iter(app.world())
+                    .count(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -7825,7 +8135,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_frost_hit_does_not_freeze_a_hovering_player() {
+    fn queued_frost_hit_leaves_a_crystal_under_a_hovering_player() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, target);
@@ -7837,11 +8147,236 @@ mod tests {
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 0);
         assert!(app.world().resource::<TurnState>().hovering[1]);
         assert!(
-            app.world()
+            !app.world()
                 .resource::<TurnState>()
                 .ingredient_respawns
                 .iter()
                 .any(|(item, _)| *item == FROST_CRYSTAL_ITEM_INDEX)
+        );
+        assert_eq!(
+            app.world_mut()
+                .query::<&PendingFrost>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn frost_missed_by_hovering_player_lands_in_corner_and_triggers_on_landing() {
+        let mut app = interaction_app();
+        app.init_resource::<effects::Effects>();
+        app.update();
+        let cell = IVec2::new(6, 3);
+        move_player_to(&mut app, PlayerId::Two, cell);
+        app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
+        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, cell_center(cell));
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.update();
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::KeyR);
+            keys.clear();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<TurnState>()
+                .item_flight
+                .as_ref()
+                .unwrap()
+                .destination,
+            cell_center(cell) + Vec2::splat(ITEM_CORNER_OFFSET)
+        );
+        tick_coatl_animation(&mut app, ITEM_FLIGHT_SECONDS + 0.01);
+        {
+            let world = app.world_mut();
+            assert!(!world.resource::<TurnState>().effects_active);
+            assert!(!world.resource::<TurnState>().is_frozen(PlayerId::Two));
+            let mut crystals =
+                world.query_filtered::<(&Collectible, &Transform, &Sprite), With<PendingFrost>>();
+            let (item, transform, sprite) = crystals.single(world).unwrap();
+            assert_eq!(item.cell, cell);
+            assert_eq!(
+                transform.translation.truncate(),
+                cell_center(cell) + Vec2::splat(ITEM_CORNER_OFFSET)
+            );
+            assert_eq!(sprite.custom_size, Some(Vec2::splat(24.0)));
+            assert!(world.resource::<TurnState>().ingredient_respawns.is_empty());
+        }
+        click_part(&mut app, Vec2::new(330.0, 120.0));
+        assert!(!app.world().resource::<TurnState>().hovering[1]);
+        assert!(app.world().resource::<TurnState>().is_frozen(PlayerId::Two));
+        assert!(app.world().resource::<TurnState>().effects_active);
+        assert_eq!(item_count(&mut app), 0);
+        tick_coatl_animation(&mut app, 1.0);
+        select_move(&mut app);
+        assert!(app.world().resource::<Selection>().0.is_none());
+        press_key(&mut app, KeyCode::KeyR);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.frozen_turns[1], 2);
+        assert_eq!(
+            turn.ingredient_respawns,
+            [(FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)]
+        );
+    }
+
+    #[test]
+    fn stepping_on_placed_frost_can_be_undone_before_the_turn_finishes() {
+        let mut app = interaction_app();
+        let cell = IVec2::new(6, 3);
+        move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
+        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, cell_center(cell));
+        select_move(&mut app);
+        click_part(&mut app, cell_center(cell));
+        assert!(app.world().resource::<TurnState>().is_frozen(PlayerId::Two));
+        {
+            let world = app.world_mut();
+            let mut hidden = world.query_filtered::<&Visibility, With<PickedUpForUndo>>();
+            assert_eq!(hidden.single(world).unwrap(), &Visibility::Hidden);
+            assert_eq!(world.query::<&Collectible>().iter(world).count(), 0);
+        }
+        assert!(
+            app.world()
+                .resource::<TurnState>()
+                .ingredient_respawns
+                .is_empty()
+        );
+        click_part(&mut app, Vec2::new(330.0, -60.0));
+        assert!(!app.world().resource::<TurnState>().is_frozen(PlayerId::Two));
+        assert_eq!(item_count(&mut app), 1);
+        assert!(
+            app.world()
+                .resource::<TurnState>()
+                .ingredient_respawns
+                .is_empty()
+        );
+
+        select_move(&mut app);
+        click_part(&mut app, cell_center(cell));
+        assert!(app.world().resource::<TurnState>().is_frozen(PlayerId::Two));
+        press_key(&mut app, KeyCode::KeyR);
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.frozen_turns[1], 2);
+        assert_eq!(
+            turn.ingredient_respawns,
+            [(FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)]
+        );
+        assert_eq!(item_count(&mut app), 0);
+    }
+
+    #[test]
+    fn automatic_landing_on_placed_frost_freezes_the_player() {
+        let mut app = interaction_app();
+        let cell = IVec2::new(6, 3);
+        move_player_to(&mut app, PlayerId::Two, cell);
+        app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
+        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, cell_center(cell));
+        app.world_mut().resource_mut::<TurnState>().magic[1] = 1;
+        press_key(&mut app, KeyCode::KeyR);
+        let turn = app.world().resource::<TurnState>();
+        assert!(!turn.hovering[1]);
+        assert_eq!(turn.frozen_turns[1], 2);
+        assert_eq!(
+            turn.ingredient_respawns,
+            [(FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)]
+        );
+        assert_eq!(item_count(&mut app), 0);
+    }
+
+    #[test]
+    fn hovering_over_placed_frost_and_walking_over_spawned_frost_are_safe() {
+        for placed in [false, true] {
+            let mut app = interaction_app();
+            let cell = IVec2::new(6, 3);
+            app.world_mut().resource_mut::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX] = 0;
+            let mut crystal = app.world_mut().spawn((
+                BoardItem,
+                PendingFrost(cell),
+                Collectible {
+                    index: FROST_CRYSTAL_ITEM_INDEX,
+                    cell,
+                },
+            ));
+            if placed {
+                crystal.insert(PlacedItem);
+                app.world_mut().resource_mut::<TurnState>().hovering[0] = true;
+            }
+            select_move(&mut app);
+            click_part(&mut app, cell_center(cell));
+            assert!(!app.world().resource::<TurnState>().is_frozen(PlayerId::One));
+            assert_eq!(item_count(&mut app), 1);
+            if !placed {
+                click_part(&mut app, Vec2::new(-330.0, 60.0));
+                assert_eq!(
+                    app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frost_triggered_by_second_move_lasts_two_future_turns() {
+        let mut app = interaction_app();
+        let cell = IVec2::new(7, 3);
+        app.world_mut().spawn((
+            BoardItem,
+            PlacedItem,
+            PendingFrost(cell),
+            Collectible {
+                index: FROST_CRYSTAL_ITEM_INDEX,
+                cell,
+            },
+        ));
+        select_move(&mut app);
+        click_part(&mut app, cell_center(IVec2::new(6, 3)));
+        select_move(&mut app);
+        click_part(&mut app, cell_center(cell));
+        assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 2);
+        assert_eq!(item_count(&mut app), 0);
+        press_key(&mut app, KeyCode::KeyR);
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 1);
+        press_key(&mut app, KeyCode::KeyR);
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 0);
+    }
+
+    #[test]
+    fn multiple_placed_frost_crystals_are_restored_or_consumed_together() {
+        let mut app = interaction_app();
+        let cell = IVec2::new(6, 3);
+        for _ in 0..2 {
+            app.world_mut().spawn((
+                BoardItem,
+                PlacedItem,
+                PendingFrost(cell),
+                Collectible {
+                    index: FROST_CRYSTAL_ITEM_INDEX,
+                    cell,
+                },
+            ));
+        }
+        select_move(&mut app);
+        click_part(&mut app, cell_center(cell));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
+        assert_eq!(item_count(&mut app), 2);
+        assert!(!app.world().resource::<TurnState>().is_frozen(PlayerId::One));
+        select_move(&mut app);
+        click_part(&mut app, cell_center(cell));
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(item_count(&mut app), 0);
+        assert_eq!(
+            app.world().resource::<TurnState>().ingredient_respawns,
+            [
+                (FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY),
+                (FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)
+            ]
         );
     }
 
@@ -10029,7 +10564,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_toggle_preserves_item_selection_and_updates_magic_bar_and_shadow() {
+    fn hover_toggle_preserves_item_selection_and_updates_magic_bar_and_sprite() {
         let mut app = interaction_app();
         click(&mut app, Vec2::new(-390.0, 180.0));
         assert!(app.world().resource::<Selection>().0.is_some());
@@ -10045,13 +10580,13 @@ mod tests {
                 .unwrap();
             assert_eq!(fill.0, PlayerId::One);
             assert_eq!(node.width, Val::Percent(100.0));
-            let mut shadows = world.query::<(&HoverShadow, &Transform, &Visibility)>();
-            let (_, transform, visibility) = shadows
+            let mut players = world.query::<(&Player, &Transform, &Sprite)>();
+            let (_, transform, sprite) = players
                 .iter(world)
-                .find(|(shadow, _, _)| shadow.0 == PlayerId::One)
+                .find(|(player, _, _)| player.0 == PlayerId::One)
                 .unwrap();
-            assert_eq!(*visibility, Visibility::Visible);
-            assert_eq!(transform.translation.truncate(), Vec2::new(30.0, -23.0));
+            assert_eq!(transform.translation.truncate(), Vec2::new(30.0, 0.0));
+            assert!(sprite.rect.unwrap().min.x >= 96.0);
         }
         click(&mut app, cell_center(IVec2::new(6, 2)));
         assert_eq!(app.world().resource::<TurnState>().magic[0], 4);
@@ -10062,31 +10597,25 @@ mod tests {
         click(&mut app, destination);
         {
             let world = app.world_mut();
-            let mut shadows = world.query::<(&HoverShadow, &Transform, &Visibility)>();
-            let (_, transform, visibility) = shadows
+            let mut players = world.query::<(&Player, &Transform, &Sprite)>();
+            let (_, transform, sprite) = players
                 .iter(world)
-                .find(|(shadow, _, _)| shadow.0 == PlayerId::One)
+                .find(|(player, _, _)| player.0 == PlayerId::One)
                 .unwrap();
-            assert_eq!(*visibility, Visibility::Visible);
-            assert_eq!(
-                transform.translation.truncate(),
-                destination + Vec2::new(0.0, -23.0)
-            );
+            assert!(sprite.rect.unwrap().min.x >= 96.0);
+            assert_eq!(transform.translation.truncate(), destination);
         }
         press_key(&mut app, KeyCode::KeyR);
         click(&mut app, Vec2::new(-330.0, 120.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert_eq!(app.world().resource::<TurnState>().magic[0], 3);
         let world = app.world_mut();
-        let mut shadows = world.query::<(&HoverShadow, &Visibility)>();
-        assert_eq!(
-            *shadows
-                .iter(world)
-                .find(|(shadow, _)| shadow.0 == PlayerId::One)
-                .unwrap()
-                .1,
-            Visibility::Hidden
-        );
+        let mut players = world.query::<(&Player, &Sprite)>();
+        let (_, sprite) = players
+            .iter(world)
+            .find(|(player, _)| player.0 == PlayerId::One)
+            .unwrap();
+        assert!(sprite.rect.unwrap().min.x < 96.0);
     }
 
     #[test]
@@ -10355,6 +10884,7 @@ mod tests {
             0
         );
         press_key(&mut app, KeyCode::KeyR);
+        click(&mut app, Vec2::new(-330.0, 120.0));
         select_move(&mut app);
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
@@ -12595,7 +13125,7 @@ mod tests {
             assert_eq!(world.query::<&PendingStormShard>().iter(world).count(), 0);
             assert_eq!(world.query::<&PendingSunstone>().iter(world).count(), 0);
             assert_eq!(world.query::<&PendingObsidian>().iter(world).count(), 0);
-            let mut expected = vec![target];
+            let mut expected = vec![target, target];
             for direction in [
                 IVec2::X,
                 IVec2::NEG_X,
@@ -13244,16 +13774,16 @@ mod tests {
                     .iter()
                     .filter(|ground| **ground == Ground::Hole)
                     .count(),
-                4
+                5
             );
             assert_eq!(
                 grounds
                     .iter()
                     .filter(|ground| **ground == Ground::Water)
                     .count(),
-                usize::from(ground == Ground::Water)
+                0
             );
-            assert_eq!(board.ground(center), Some(ground));
+            assert_eq!(board.ground(center), Some(Ground::Hole));
         }
     }
 
@@ -13630,7 +14160,7 @@ mod tests {
             }
             press_key(&mut app, KeyCode::KeyR);
             let board = app.world().resource::<Board>();
-            assert_eq!(board.ground(center), Some(ground));
+            assert_eq!(board.ground(center), Some(Ground::Ridge));
             for cell in &cells[1..3] {
                 assert_eq!(board.ground(*cell), Some(Ground::Ridge));
             }
@@ -13690,7 +14220,7 @@ mod tests {
                 .terrain_growth_cells()
                 .collect();
             assert_eq!(cells.len(), 5);
-            move_player_to(&mut app, PlayerId::One, cells[1]);
+            move_player_to(&mut app, PlayerId::One, cells[0]);
             move_player_to(&mut app, PlayerId::Two, cells[2]);
             app.world_mut().resource_mut::<TurnState>().magic = [0, 0];
             press_key(&mut app, KeyCode::KeyR);
@@ -13707,7 +14237,7 @@ mod tests {
                 .collect();
             for (player, cell) in &positions {
                 let origin = if *player == PlayerId::One {
-                    cells[1]
+                    cells[0]
                 } else {
                     cells[2]
                 };
@@ -13715,11 +14245,12 @@ mod tests {
                 assert!(world.resource::<Board>().ground(*cell).unwrap().walkable());
             }
             assert_ne!(positions[0].1, positions[1].1);
+            assert_eq!(world.resource::<PlayerHealth>().0, [9, 9]);
         }
     }
 
     #[test]
-    fn new_unsafe_terrain_displaces_frozen_players_instead_of_starting_hover() {
+    fn new_unsafe_terrain_frees_directly_frozen_players_and_starts_hover() {
         for player in [PlayerId::One, PlayerId::Two] {
             for pending_freeze in [false, true] {
                 let mut board = Board::default();
@@ -13747,14 +14278,373 @@ mod tests {
                     }),
                     TurnEffects::default(),
                 );
-                assert!(!turn.hovering[player.index()]);
-                let destination = turn
-                    .terrain_displacements
-                    .iter()
-                    .find_map(|&(owner, cell)| (owner == player).then_some(cell))
-                    .expect("frozen player should be displaced");
-                assert!(board.ground(destination).unwrap().walkable());
+                assert!(turn.hovering[player.index()]);
+                assert_eq!(turn.frozen_turns[player.index()], 0);
+                assert!(turn.terrain_displacements.is_empty());
+                assert_eq!(health.0[player.index()], 10);
             }
+        }
+    }
+
+    #[test]
+    fn terrain_changes_free_a_player_frozen_by_a_direct_hit_on_dry_ground() {
+        for (item, expected_ground) in [
+            (VOID_DUST_ITEM_INDEX, Ground::Hole),
+            (STONE_DUST_ITEM_INDEX, Ground::Ridge),
+        ] {
+            for magic in [0, 2] {
+                let mut app = interaction_app();
+                let cell = IVec2::new(6, 3);
+                move_player_to(&mut app, PlayerId::Two, cell);
+                click(&mut app, Vec2::new(-450.0, 120.0));
+                click(&mut app, cell_center(cell));
+                assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
+                assert!(!app.world().resource::<Board>().is_frozen(cell));
+                assert_eq!(
+                    app.world_mut()
+                        .query::<&FrostImpact>()
+                        .iter(app.world())
+                        .count(),
+                    1
+                );
+                app.world_mut().resource_mut::<TurnState>().magic[1] = magic;
+                if item == STONE_DUST_ITEM_INDEX {
+                    app.world_mut().spawn((
+                        BoardItem,
+                        PendingObsidian(cell),
+                        Collectible {
+                            index: OBSIDIAN_ITEM_INDEX,
+                            cell,
+                        },
+                    ));
+                }
+                let inventory = Vec2::new(
+                    390.0 + (item % 2) as f32 * GRID_BLOCK_SIZE,
+                    180.0 - (item / 2) as f32 * GRID_BLOCK_SIZE,
+                );
+                click(&mut app, inventory);
+                click(&mut app, cell_center(cell));
+
+                let world = app.world_mut();
+                assert_eq!(
+                    world.resource::<Board>().ground(cell),
+                    Some(expected_ground)
+                );
+                assert_eq!(world.resource::<TurnState>().frozen_turns[1], 0);
+                assert_eq!(world.resource::<TurnState>().hovering[1], magic > 0);
+                let explosion_damage = if item == STONE_DUST_ITEM_INDEX { 2 } else { 0 };
+                assert_eq!(
+                    world.resource::<PlayerHealth>().0[1],
+                    10 - explosion_damage - u8::from(magic == 0)
+                );
+                let mut players = world.query::<(&Player, &Transform)>();
+                let (_, transform) = players
+                    .iter(world)
+                    .find(|(player, _)| player.0 == PlayerId::Two)
+                    .unwrap();
+                let destination = board_cell(transform.translation.truncate()).unwrap();
+                assert_eq!(destination == cell, magic > 0);
+                if magic == 0 {
+                    assert!(
+                        world
+                            .resource::<Board>()
+                            .ground(destination)
+                            .unwrap()
+                            .walkable()
+                    );
+                }
+                assert_eq!(world.query::<&FrostImpact>().iter(world).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn animated_hole_frees_directly_frozen_player_without_moving_ice() {
+        let mut app = interaction_app();
+        app.init_resource::<effects::Effects>();
+        app.update();
+        let cell = IVec2::new(6, 3);
+        move_player_to(&mut app, PlayerId::Two, cell);
+        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, cell_center(cell));
+        assert!(app.world().resource::<TurnState>().effects_active);
+        tick_coatl_animation(&mut app, 1.0);
+        assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
+        assert_eq!(
+            app.world_mut()
+                .query::<&FrostImpact>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+        app.world_mut().resource_mut::<TurnState>().magic[1] = 0;
+        click(&mut app, Vec2::new(450.0, 60.0));
+        click(&mut app, cell_center(cell));
+        assert!(app.world().resource::<TurnState>().effects_active);
+        tick_coatl_animation(&mut app, 1.0);
+        let world = app.world_mut();
+        assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Hole));
+        assert_eq!(world.resource::<TurnState>().frozen_turns[1], 0);
+        assert_eq!(world.resource::<PlayerHealth>().0[1], 9);
+        assert_eq!(world.query::<&FrostImpact>().iter(world).count(), 0);
+        let mut players = world.query::<(&Player, &Transform)>();
+        let (_, transform) = players
+            .iter(world)
+            .find(|(player, _)| player.0 == PlayerId::Two)
+            .unwrap();
+        assert_ne!(board_cell(transform.translation.truncate()), Some(cell));
+    }
+
+    #[test]
+    fn animated_terrain_explosion_clears_ice_and_frees_its_occupant() {
+        for (item, expected_ground) in [
+            (VOID_DUST_ITEM_INDEX, Ground::Hole),
+            (STONE_DUST_ITEM_INDEX, Ground::Ridge),
+        ] {
+            let mut app = interaction_app();
+            app.init_resource::<effects::Effects>();
+            app.update();
+            let cell = IVec2::new(6, 3);
+            move_player_to(&mut app, PlayerId::Two, cell);
+            app.world_mut().resource_mut::<Board>().make_water(cell);
+            app.world_mut().spawn((
+                BoardItem,
+                PendingObsidian(cell),
+                Collectible {
+                    index: OBSIDIAN_ITEM_INDEX,
+                    cell,
+                },
+            ));
+            app.update();
+            tick_coatl_animation(&mut app, 1.0);
+            click(&mut app, Vec2::new(-450.0, 120.0));
+            click(&mut app, cell_center(cell));
+            tick_coatl_animation(&mut app, 1.0);
+            assert!(app.world().resource::<Board>().is_frozen(cell));
+            assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
+            assert_eq!(frozen_sprite_count(&mut app), 1);
+            app.world_mut().resource_mut::<TurnState>().magic[1] = 0;
+            let inventory = Vec2::new(
+                390.0 + (item % 2) as f32 * GRID_BLOCK_SIZE,
+                180.0 - (item / 2) as f32 * GRID_BLOCK_SIZE,
+            );
+            click(&mut app, inventory);
+            click(&mut app, cell_center(cell));
+            assert!(app.world().resource::<TurnState>().effects_active);
+            tick_coatl_animation(&mut app, 1.0);
+            tick_coatl_animation(&mut app, 1.0);
+            let world = app.world_mut();
+            assert_eq!(
+                world.resource::<Board>().ground(cell),
+                Some(expected_ground)
+            );
+            assert!(!world.resource::<Board>().is_frozen(cell));
+            assert_eq!(world.resource::<TurnState>().frozen_turns[1], 0);
+            assert_eq!(world.resource::<PlayerHealth>().0[1], 7);
+            assert_eq!(world.query::<&FrozenTile>().iter(world).count(), 0);
+            assert_eq!(world.query::<&FrostImpact>().iter(world).count(), 0);
+            let mut players = world.query::<(&Player, &Transform)>();
+            let (_, transform) = players
+                .iter(world)
+                .find(|(player, _)| player.0 == PlayerId::Two)
+                .unwrap();
+            assert_ne!(board_cell(transform.translation.truncate()), Some(cell));
+        }
+    }
+
+    #[test]
+    fn unsafe_terrain_thaws_frozen_occupants_before_hover_or_displacement() {
+        for kind in [TerrainGrowthKind::Void, TerrainGrowthKind::Stone] {
+            for player in [PlayerId::One, PlayerId::Two] {
+                for acting in [false, true] {
+                    for magic in [0, 1, 2] {
+                        for blast_thaws_first in [false, true] {
+                            let mut board = Board::default();
+                            let mut turn = TurnState::default();
+                            let mut health = PlayerHealth::default();
+                            let origin = PLAYER_STARTS[player.index()];
+                            turn.active = if acting { player } else { player.other() };
+                            turn.magic[player.index()] = magic;
+                            turn.frozen_turns[player.index()] = 2;
+                            turn.pending_effects.frozen_players[player.index()] = 2;
+                            board.make_water(origin);
+                            assert!(board.freeze_water(origin));
+                            if blast_thaws_first {
+                                board.thaw(origin);
+                            }
+                            match kind {
+                                TerrainGrowthKind::Void => assert!(board.make_hole(origin)),
+                                TerrainGrowthKind::Stone => assert!(board.make_ridge(origin)),
+                            }
+                            turn.finish_action(
+                                &mut board,
+                                &mut health,
+                                PLAYER_STARTS.into_iter().enumerate().map(|(index, cell)| {
+                                    (
+                                        if index == 0 {
+                                            PlayerId::One
+                                        } else {
+                                            PlayerId::Two
+                                        },
+                                        cell_center(cell),
+                                    )
+                                }),
+                                TurnEffects::default(),
+                            );
+
+                            let can_hover = magic > u8::from(acting);
+                            assert!(!board.is_frozen(origin));
+                            assert_eq!(turn.frozen_turns[player.index()], 0);
+                            assert_eq!(turn.hovering[player.index()], can_hover);
+                            assert_eq!(health.0[player.index()], if can_hover { 10 } else { 9 });
+                            let destination = turn
+                                .terrain_displacements
+                                .iter()
+                                .find_map(|&(owner, cell)| (owner == player).then_some(cell));
+                            assert_eq!(destination.is_none(), can_hover);
+                            if let Some(destination) = destination {
+                                assert!(board.ground(destination).unwrap().walkable());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_hole_frees_player_even_if_tile_was_thawed_in_an_earlier_turn() {
+        let mut board = Board::default();
+        let mut turn = TurnState::default();
+        let mut health = PlayerHealth::default();
+        let origin = PLAYER_STARTS[1];
+        let positions = || {
+            PLAYER_STARTS.into_iter().enumerate().map(|(index, cell)| {
+                (
+                    if index == 0 {
+                        PlayerId::One
+                    } else {
+                        PlayerId::Two
+                    },
+                    cell_center(cell),
+                )
+            })
+        };
+        board.make_water(origin);
+        assert!(board.freeze_water(origin));
+        board.thaw(origin);
+        turn.finish_action(&mut board, &mut health, positions(), TurnEffects::default());
+        turn.frozen_turns[1] = 2;
+        assert!(board.make_hole(origin));
+        turn.finish_action(&mut board, &mut health, positions(), TurnEffects::default());
+        assert!(turn.hovering[1]);
+        assert_eq!(turn.frozen_turns[1], 0);
+        assert!(turn.terrain_displacements.is_empty());
+        assert_eq!(health.0[1], 10);
+    }
+
+    #[test]
+    fn unsafe_terrain_removes_frozen_tile_art_after_its_effect() {
+        for kind in [TerrainGrowthKind::Void, TerrainGrowthKind::Stone] {
+            let mut app = interaction_app();
+            app.init_resource::<effects::Effects>();
+            app.update();
+            let cell = IVec2::new(4, 3);
+            {
+                let mut board = app.world_mut().resource_mut::<Board>();
+                board.make_water(cell);
+                assert!(board.freeze_water(cell));
+            }
+            app.world_mut().spawn((
+                FrozenTile(cell),
+                Sprite::default(),
+                Visibility::Inherited,
+                Transform::from_translation(cell_center(cell).extend(-0.5)),
+            ));
+            app.update();
+            tick_coatl_animation(&mut app, 1.0);
+            assert_eq!(frozen_sprite_count(&mut app), 1);
+            {
+                let mut board = app.world_mut().resource_mut::<Board>();
+                match kind {
+                    TerrainGrowthKind::Void => assert!(board.make_hole(cell)),
+                    TerrainGrowthKind::Stone => assert!(board.make_ridge(cell)),
+                }
+            }
+            app.update();
+            assert!(app.world().resource::<TurnState>().effects_active);
+            tick_coatl_animation(&mut app, 1.0);
+            assert!(!app.world().resource::<Board>().is_frozen(cell));
+            assert_eq!(frozen_sprite_count(&mut app), 0);
+        }
+    }
+
+    #[test]
+    fn obsidian_terrain_explosion_frees_a_player_frozen_on_ice() {
+        for (item, expected_ground) in [
+            (VOID_DUST_ITEM_INDEX, Ground::Hole),
+            (STONE_DUST_ITEM_INDEX, Ground::Ridge),
+        ] {
+            let mut app = interaction_app();
+            let cell = IVec2::new(6, 3);
+            move_player_to(&mut app, PlayerId::Two, cell);
+            {
+                let mut board = app.world_mut().resource_mut::<Board>();
+                board.make_water(cell);
+                assert!(board.freeze_water(cell));
+            }
+            app.world_mut().resource_mut::<TurnState>().frozen_turns[1] = 2;
+            app.world_mut().spawn((
+                FrozenTile(cell),
+                Sprite::default(),
+                Visibility::Inherited,
+                Transform::from_translation(cell_center(cell).extend(-0.5)),
+            ));
+            app.update();
+            assert_eq!(frozen_sprite_count(&mut app), 1);
+            assert_eq!(
+                app.world_mut()
+                    .query::<&FrostImpact>()
+                    .iter(app.world())
+                    .count(),
+                1
+            );
+            app.world_mut().spawn((
+                BoardItem,
+                PendingObsidian(cell),
+                Collectible {
+                    index: OBSIDIAN_ITEM_INDEX,
+                    cell,
+                },
+            ));
+            let inventory = Vec2::new(
+                -450.0 + (item % 2) as f32 * GRID_BLOCK_SIZE,
+                180.0 - (item / 2) as f32 * GRID_BLOCK_SIZE,
+            );
+            click(&mut app, inventory);
+            click(&mut app, cell_center(cell));
+            let world = app.world_mut();
+            assert_eq!(
+                world.resource::<Board>().ground(cell),
+                Some(expected_ground)
+            );
+            assert!(!world.resource::<Board>().is_frozen(cell));
+            assert_eq!(world.resource::<TurnState>().frozen_turns[1], 0);
+            assert!(world.resource::<TurnState>().hovering[1]);
+            assert!(
+                world
+                    .resource::<TurnState>()
+                    .terrain_displacements
+                    .is_empty()
+            );
+            let mut players = world.query::<(&Player, &Transform)>();
+            let (_, transform) = players
+                .iter(world)
+                .find(|(player, _)| player.0 == PlayerId::Two)
+                .unwrap();
+            assert_eq!(board_cell(transform.translation.truncate()), Some(cell));
+            assert_eq!(world.query::<&FrozenTile>().iter(world).count(), 0);
+            assert_eq!(world.query::<&FrostImpact>().iter(world).count(), 0);
         }
     }
 
@@ -13963,10 +14853,68 @@ mod tests {
 
     #[test]
     fn displaced_player_receives_destination_tile_effects() {
+        for already_hovering in [false, true] {
+            let mut app = interaction_app();
+            let origin = IVec2::new(5, 3);
+            let destination = origin + IVec2::X;
+            move_player_to(&mut app, PlayerId::One, origin);
+            {
+                let mut turn = app.world_mut().resource_mut::<TurnState>();
+                turn.magic[0] = u8::from(already_hovering);
+                turn.hovering[0] = already_hovering;
+            }
+            {
+                let mut board = app.world_mut().resource_mut::<Board>();
+                for y in -1..=1 {
+                    for x in -1..=1 {
+                        let cell = origin + IVec2::new(x, y);
+                        if cell != origin && cell != destination {
+                            board.set(cell, Ground::Ridge);
+                        }
+                    }
+                }
+                board.add_acid(destination);
+                assert!(board.make_hole(origin));
+            }
+            let positions: Vec<_> = {
+                let world = app.world_mut();
+                let mut players = world.query::<(&Player, &Transform)>();
+                players
+                    .iter(world)
+                    .map(|(player, transform)| (player.0, transform.translation.truncate()))
+                    .collect()
+            };
+            app.world_mut()
+                .resource_scope(|world, mut turn: Mut<TurnState>| {
+                    world.resource_scope(|world, mut board: Mut<Board>| {
+                        let mut health = world.resource_mut::<PlayerHealth>();
+                        turn.finish_action(
+                            &mut board,
+                            &mut health,
+                            positions,
+                            TurnEffects::default(),
+                        );
+                    });
+                });
+            app.update();
+            let world = app.world_mut();
+            let position = world
+                .query::<(&Player, &Transform)>()
+                .iter(world)
+                .find(|(player, _)| player.0 == PlayerId::One)
+                .map(|(_, transform)| board_cell(transform.translation.truncate()).unwrap())
+                .unwrap();
+            assert_eq!(position, destination);
+            assert!(!world.resource::<TurnState>().hovering[0]);
+            assert_eq!(world.resource::<PlayerHealth>().0[0], 8);
+        }
+    }
+
+    #[test]
+    fn terrain_displacement_onto_placed_frost_preserves_destination_hazards() {
         let mut app = interaction_app();
         let origin = IVec2::new(5, 3);
         let destination = origin + IVec2::X;
-        move_player_to(&mut app, PlayerId::One, origin);
         app.world_mut().resource_mut::<TurnState>().magic[0] = 0;
         {
             let mut board = app.world_mut().resource_mut::<Board>();
@@ -13981,16 +14929,45 @@ mod tests {
             board.add_acid(destination);
             assert!(board.make_hole(origin));
         }
-        press_key(&mut app, KeyCode::KeyR);
+        app.world_mut().spawn((
+            BoardItem,
+            PlacedItem,
+            PendingFrost(destination),
+            Collectible {
+                index: FROST_CRYSTAL_ITEM_INDEX,
+                cell: destination,
+            },
+        ));
+        let positions: Vec<_> = {
+            let world = app.world_mut();
+            let mut players = world.query::<(&Player, &Transform)>();
+            players
+                .iter(world)
+                .map(|(player, transform)| (player.0, transform.translation.truncate()))
+                .collect()
+        };
+        app.world_mut()
+            .resource_scope(|world, mut turn: Mut<TurnState>| {
+                world.resource_scope(|world, mut board: Mut<Board>| {
+                    let mut health = world.resource_mut::<PlayerHealth>();
+                    turn.finish_action(&mut board, &mut health, positions, TurnEffects::default());
+                });
+            });
+        app.update();
         let world = app.world_mut();
-        let position = world
+        let player_cell = world
             .query::<(&Player, &Transform)>()
             .iter(world)
             .find(|(player, _)| player.0 == PlayerId::One)
-            .map(|(_, transform)| board_cell(transform.translation.truncate()).unwrap())
-            .unwrap();
-        assert_eq!(position, destination);
-        assert_eq!(world.resource::<PlayerHealth>().0[0], 9);
+            .and_then(|(_, transform)| board_cell(transform.translation.truncate()));
+        assert_eq!(player_cell, Some(destination));
+        assert_eq!(world.resource::<PlayerHealth>().0[0], 8);
+        assert_eq!(world.resource::<TurnState>().frozen_turns[0], 2);
+        assert_eq!(
+            world.resource::<TurnState>().ingredient_respawns,
+            [(FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)]
+        );
+        assert_eq!(world.query::<&PendingFrost>().iter(world).count(), 0);
     }
 
     #[test]
@@ -14031,6 +15008,7 @@ mod tests {
                 for cell in &cells[3..5] {
                     assert_eq!(board.ground(*cell), Some(Ground::Solid));
                 }
+                assert_eq!(board.ground(cells[0]), Some(Ground::Solid));
                 assert!(board.take_terrain_events().1);
             }
 
@@ -14056,6 +15034,7 @@ mod tests {
             for cell in &cells[1..3] {
                 assert_eq!(board.ground(*cell), Some(Ground::Solid));
             }
+            assert_eq!(board.ground(cells[0]), Some(Ground::Solid));
             for cell in &cells[3..5] {
                 assert_eq!(
                     board.ground(*cell),
@@ -14444,7 +15423,8 @@ mod tests {
         let mut unique = cells.clone();
         unique.sort_unstable_by_key(|cell| (cell.x, cell.y));
         unique.dedup();
-        assert_eq!(cells.len(), unique.len());
+        assert_eq!(cells.len(), 4 * 9);
+        assert!(cells.len() > unique.len());
         for source in burning {
             let (_, sprite) = flashes
                 .iter(world)
@@ -15410,20 +16390,21 @@ mod tests {
     }
 
     #[test]
-    fn water_on_placed_frost_freezes_occupant_without_damage() {
+    fn water_on_placed_frost_freezes_water_without_harming_hovering_occupant() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
         click(&mut app, Vec2::new(-450.0, 120.0));
         click(&mut app, cell_center(cell));
         press_key(&mut app, KeyCode::KeyR);
+        click(&mut app, Vec2::new(-330.0, 120.0));
         select_move(&mut app);
         click(&mut app, cell_center(cell));
         click(&mut app, Vec2::new(390.0, 180.0));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().is_frozen(cell));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
-        assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 2);
+        assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 0);
     }
 
     #[test]
@@ -15636,24 +16617,36 @@ mod tests {
                 assert!(!app.world().resource::<Board>().is_frozen(cell));
                 {
                     let world = app.world_mut();
+                    let missed = frost && hover;
                     assert_eq!(
                         world.query::<&FrostImpact>().iter(world).count(),
                         usize::from(frost && !hover)
                     );
-                    assert_eq!(world.query::<&PendingFrost>().iter(world).count(), 0);
-                    assert_eq!(world.query::<&PendingStormShard>().iter(world).count(), 0);
-                    assert_eq!(world.query::<&Collectible>().iter(world).count(), 0);
                     assert_eq!(
-                        world.resource::<TurnState>().ingredient_respawns,
-                        [(
-                            if frost {
-                                FROST_CRYSTAL_ITEM_INDEX
-                            } else {
-                                STORM_SHARD_ITEM_INDEX
-                            },
-                            INGREDIENT_RESPAWN_DELAY
-                        )]
+                        world.query::<&PendingFrost>().iter(world).count(),
+                        usize::from(missed)
                     );
+                    assert_eq!(world.query::<&PendingStormShard>().iter(world).count(), 0);
+                    assert_eq!(
+                        world.query::<&Collectible>().iter(world).count(),
+                        usize::from(missed)
+                    );
+                    let respawns = &world.resource::<TurnState>().ingredient_respawns;
+                    if missed {
+                        assert!(respawns.is_empty());
+                    } else {
+                        assert_eq!(
+                            respawns,
+                            &[(
+                                if frost {
+                                    FROST_CRYSTAL_ITEM_INDEX
+                                } else {
+                                    STORM_SHARD_ITEM_INDEX
+                                },
+                                INGREDIENT_RESPAWN_DELAY
+                            )]
+                        );
+                    }
                 }
                 app.update();
                 assert_eq!(app.world().resource::<PlayerHealth>().0, expected_health);

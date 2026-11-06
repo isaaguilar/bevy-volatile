@@ -257,11 +257,16 @@ fn animated_effect_rect(
             .map_or_else(
                 || effect.present(board, neighbor),
                 |old| match effect {
+                    Effect::Wet => old.wet,
                     Effect::Frozen => old.frozen,
                     Effect::Poison => old.poison,
                     Effect::Acid => old.acid && !old.electric_acid,
                     Effect::ElectricAcid => old.electric_acid,
                     Effect::Ember => old.fuel,
+                    Effect::Healing => old.healing,
+                    Effect::Thorns => old.thorns,
+                    Effect::VoidGrowth => old.growth == Some(TerrainGrowthKind::Void),
+                    Effect::StoneGrowth => old.growth == Some(TerrainGrowthKind::Stone),
                     _ => effect.present(board, neighbor),
                 },
             );
@@ -371,14 +376,18 @@ fn update_ground_art(
                 };
             }
             GroundArtPart::Overlay(effect) => {
-                let present = if effect == Effect::Ember {
-                    effects
-                        .as_ref()
-                        .and_then(|effects| effects.held(piece.cell))
-                        .map_or_else(|| effect.present(&board, piece.cell), |old| old.fuel)
-                } else {
-                    effect.present(&board, piece.cell)
-                };
+                let present = effects
+                    .as_ref()
+                    .and_then(|effects| effects.held(piece.cell))
+                    .map_or_else(
+                        || effect.present(&board, piece.cell),
+                        |old| match effect {
+                            Effect::Wet => old.wet,
+                            Effect::Ember => old.fuel,
+                            Effect::Healing => old.healing,
+                            _ => effect.present(&board, piece.cell),
+                        },
+                    );
                 *visibility = if present {
                     sprite.rect = Some(animated_effect_rect(
                         effect,
@@ -463,7 +472,12 @@ fn update_effect_art(
         } else if let Some(tile) = growth {
             (
                 tile.0,
-                if board.terrain_growth_kind_at(tile.0) == Some(TerrainGrowthKind::Stone) {
+                if effects
+                    .as_ref()
+                    .and_then(|effects| effects.held(tile.0))
+                    .map_or_else(|| board.terrain_growth_kind_at(tile.0), |old| old.growth)
+                    == Some(TerrainGrowthKind::Stone)
+                {
                     Effect::StoneGrowth
                 } else {
                     Effect::VoidGrowth
@@ -725,6 +739,7 @@ mod tests {
             board.add_acid(cell);
             assert!(board.freeze_water(cell));
         }
+
         let frozen = app
             .world_mut()
             .spawn((FrozenTile(cell), Sprite::default(), Transform::default()))
@@ -770,6 +785,60 @@ mod tests {
             *world.get::<Visibility>(frozen).unwrap(),
             Visibility::Inherited
         );
+    }
+
+    #[test]
+    fn outgoing_poison_art_remains_until_incoming_water_and_poison_are_visible() {
+        let source = IVec2::new(4, 3);
+        let target = source + IVec2::X;
+        let mut board = Board::default();
+        board.make_water(source);
+        board.add_poison(source);
+        board.finish_turn([], []);
+        board.finish_turn([], []);
+        let mut app = App::new();
+        app.insert_resource(board)
+            .init_resource::<TurnState>()
+            .init_resource::<Time>()
+            .init_resource::<effects::Effects>()
+            .init_resource::<GroundSheet>()
+            .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
+            .add_systems(
+                Update,
+                (
+                    effects::advance,
+                    effects::capture,
+                    crate::update_poison_visuals,
+                    update_ground_art,
+                    update_effect_art,
+                )
+                    .chain(),
+            );
+        app.update();
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.make_water(target);
+            board.finish_turn([], []);
+            assert!(!board.is_poisoned(source));
+            assert!(board.is_poisoned(target));
+        }
+        app.update();
+        {
+            let world = app.world_mut();
+            let mut poison = world.query::<(&PoisonTile, &Visibility)>();
+            let (tile, visibility) = poison.single(world).unwrap();
+            assert_eq!(tile.0, source);
+            assert_eq!(*visibility, Visibility::Inherited);
+        }
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.0));
+        app.update();
+        let world = app.world_mut();
+        let mut poison = world.query::<(&PoisonTile, &Visibility)>();
+        let (tile, visibility) = poison.single(world).unwrap();
+        assert_eq!(tile.0, target);
+        assert_eq!(*visibility, Visibility::Inherited);
     }
 
     #[test]

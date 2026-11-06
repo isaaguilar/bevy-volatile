@@ -61,7 +61,7 @@ impl VoidGrowth {
         }
     }
 
-    pub fn advance(&mut self) -> Option<(Vec<IVec2>, Vec<IVec2>)> {
+    pub fn advance(&mut self) -> Option<Vec<IVec2>> {
         if self.fresh {
             self.fresh = false;
             return None;
@@ -110,14 +110,14 @@ impl VoidGrowth {
         None
     }
 
-    fn outcome(&self) -> (Vec<IVec2>, Vec<IVec2>) {
-        let remaining = |path: &[IVec2]| {
-            path.iter()
-                .copied()
-                .filter(|cell| !self.cleared.contains(cell))
-                .collect()
-        };
-        (remaining(&self.paths[0]), remaining(&self.paths[1]))
+    fn outcome(&self) -> Vec<IVec2> {
+        self.paths
+            .iter()
+            .flatten()
+            .copied()
+            .chain(std::iter::once(self.base))
+            .filter(|cell| !self.cleared.contains(cell))
+            .collect()
     }
 }
 
@@ -133,14 +133,27 @@ mod tests {
         let cleared = growth.paths[0][0];
         growth.clear_cell(cleared);
         assert!(!growth.cells().any(|cell| cell == cleared));
-        let (first, second) = loop {
+        let outcome = loop {
             if let Some(outcome) = growth.advance() {
                 break outcome;
             }
         };
-        assert!(!first.contains(&cleared));
-        assert!(!second.contains(&cleared));
-        assert_eq!(first.len() + second.len(), 3);
+        assert!(!outcome.contains(&cleared));
+        assert_eq!(outcome.len(), 4);
+    }
+
+    #[test]
+    fn cleared_origin_is_not_changed_when_growth_completes() {
+        let center = IVec2::new(4, 3);
+        let mut growth = VoidGrowth::new(center, 42);
+        growth.clear_cell(center);
+        let outcome = loop {
+            if let Some(outcome) = growth.advance() {
+                break outcome;
+            }
+        };
+        assert_eq!(outcome.len(), 4);
+        assert!(!outcome.contains(&center));
     }
 
     #[test]
@@ -155,12 +168,9 @@ mod tests {
                         break;
                     }
                 }
-                let (first, second) = outcome.expect("growth must finish");
-                assert_eq!(first.len(), 2);
-                assert_eq!(second.len(), 2);
-                let all: Vec<_> = std::iter::once(center)
-                    .chain(first.iter().chain(&second).copied())
-                    .collect();
+                let all = outcome.expect("growth must finish");
+                assert_eq!(all.len(), 5);
+                assert!(all.contains(&center));
                 for (index, cell) in all.iter().enumerate() {
                     assert!(in_bounds(*cell));
                     assert!(!all[..index].contains(cell));

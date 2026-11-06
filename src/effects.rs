@@ -6,14 +6,18 @@ use bevy::{
 };
 
 use crate::{
-    Board, COLUMNS, ElectricFlash, FireFlash, GRID_BLOCK_SIZE, Ground, ROWS, SteamFlash, TurnState,
-    board_cell, cell_center,
+    Board, COLUMNS, ElectricFlash, FireFlash, GRID_BLOCK_SIZE, Ground, ROWS, SteamFlash,
+    TerrainGrowthKind, TurnState, board_cell, cell_center,
 };
 
 const FRAME_SECONDS: f32 = 0.15;
 const FRAMES: usize = 6;
 const DURATION: f32 = FRAME_SECONDS * FRAMES as f32;
 const FRAME_SIZE: f32 = 48.0;
+
+fn overlap_delay(frames: usize) -> f32 {
+    frames.div_ceil(2) as f32 * FRAME_SECONDS
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Effect {
@@ -66,6 +70,10 @@ pub(crate) struct TileState {
     pub acid: bool,
     pub electric_acid: bool,
     pub fuel: bool,
+    pub wet: bool,
+    pub healing: bool,
+    pub thorns: bool,
+    pub growth: Option<TerrainGrowthKind>,
 }
 
 impl TileState {
@@ -85,6 +93,10 @@ impl TileState {
             acid: board.is_acidic(cell),
             electric_acid: board.is_electrified_acid(cell),
             fuel: board.has_oil(cell),
+            wet: board.is_wet(cell),
+            healing: board.has_life_essence(cell),
+            thorns: board.has_thorns(cell),
+            growth: board.terrain_growth_kind_at(cell),
         }
     }
 }
@@ -95,6 +107,20 @@ struct Playing {
     effect: Effect,
     elapsed: f32,
     delay: f32,
+    layer: f32,
+}
+
+#[derive(Default)]
+struct DepartingEffects {
+    frozen: bool,
+    poison: bool,
+    acid: bool,
+    electric_acid: bool,
+    fuel: bool,
+    wet: bool,
+    healing: bool,
+    thorns: bool,
+    growth: Option<TerrainGrowthKind>,
 }
 
 #[derive(Resource, Default)]
@@ -102,6 +128,7 @@ pub(crate) struct Effects {
     image: Handle<Image>,
     previous: Option<Vec<TileState>>,
     held: HashMap<IVec2, TileState>,
+    departing: HashMap<IVec2, DepartingEffects>,
     playing: Vec<Playing>,
 }
 
@@ -109,11 +136,31 @@ impl Effects {
     pub(crate) fn reset(&mut self) {
         self.previous = None;
         self.held.clear();
+        self.departing.clear();
         self.playing.clear();
     }
 
     pub(crate) fn held(&self, cell: IVec2) -> Option<TileState> {
-        self.held.get(&cell).copied()
+        let held = self.held.get(&cell).copied();
+        let Some(departing) = self.departing.get(&cell) else {
+            return held;
+        };
+        let index = cell.y as usize * COLUMNS + cell.x as usize;
+        let mut state = held.unwrap_or_else(|| {
+            self.previous
+                .as_ref()
+                .expect("departing effects require a board snapshot")[index]
+        });
+        state.frozen |= departing.frozen;
+        state.poison |= departing.poison;
+        state.acid |= departing.acid;
+        state.electric_acid |= departing.electric_acid;
+        state.fuel |= departing.fuel;
+        state.wet |= departing.wet;
+        state.healing |= departing.healing;
+        state.thorns |= departing.thorns;
+        state.growth = departing.growth.or(state.growth);
+        Some(state)
     }
 
     pub(crate) fn animating(&self, cell: IVec2, effect: Effect) -> bool {
@@ -162,104 +209,152 @@ pub(crate) fn capture(
     let Some(previous) = effects.previous.replace(current.clone()) else {
         return;
     };
-    let mut requested = HashSet::new();
+    let mut requested = HashMap::<(IVec2, Effect), usize>::new();
     for (entity, transform, fire, steam, electric) in &flashes {
         commands
             .entity(entity)
             .insert((Captured, Visibility::Hidden));
         if let Some(cell) = board_cell(transform.translation.truncate()) {
             if fire {
-                requested.insert((cell, Effect::Explosion));
+                *requested.entry((cell, Effect::Explosion)).or_default() += 1;
             }
             if steam {
-                requested.insert((cell, Effect::Steam));
+                *requested.entry((cell, Effect::Steam)).or_default() += 1;
             }
             if electric {
-                requested.insert((cell, Effect::Electric));
+                *requested.entry((cell, Effect::Electric)).or_default() += 1;
             }
         }
     }
+    let mut signaled = HashMap::<(IVec2, Effect), usize>::new();
     for (entity, signal) in &signals {
         commands.entity(entity).despawn();
-        requested.insert((signal.0, signal.1));
+        *signaled.entry((signal.0, signal.1)).or_default() += 1;
+    }
+    for (key, count) in signaled {
+        let requested_count = requested.entry(key).or_default();
+        *requested_count = (*requested_count).max(count);
     }
     for (index, cell) in cells().enumerate() {
         let old = previous[index];
         let new = current[index];
         match (old.ground, new.ground) {
             (_, Ground::Water) if old.ground != Ground::Water => {
-                requested.insert((cell, Effect::Water));
+                requested.entry((cell, Effect::Water)).or_insert(1);
             }
             (_, Ground::Ridge) if old.ground != Ground::Ridge => {
-                requested.insert((cell, Effect::RidgeDust));
+                requested.entry((cell, Effect::RidgeDust)).or_insert(1);
             }
             (_, Ground::Hole) if old.ground != Ground::Hole => {
-                requested.insert((cell, Effect::Void));
+                requested.entry((cell, Effect::Void)).or_insert(1);
             }
             (Ground::Ridge | Ground::Hole, Ground::Solid) => {
-                requested.insert((cell, Effect::RidgeDust));
+                requested.entry((cell, Effect::RidgeDust)).or_insert(1);
             }
             _ => {}
         }
         if !old.frozen && new.frozen {
-            requested.insert((cell, Effect::Freeze));
+            requested.entry((cell, Effect::Freeze)).or_insert(1);
         }
         if !old.poison && new.poison {
-            requested.insert((cell, Effect::Poison));
+            requested.entry((cell, Effect::Poison)).or_insert(1);
         }
         if !old.acid && new.acid {
-            requested.insert((cell, Effect::Acid));
+            requested.entry((cell, Effect::Acid)).or_insert(1);
         }
         if !old.electric_acid && new.electric_acid {
-            requested.insert((cell, Effect::Electric));
+            requested.entry((cell, Effect::Electric)).or_insert(1);
         }
         if !old.fuel && new.fuel {
-            requested.insert((cell, Effect::Fuel));
+            requested.entry((cell, Effect::Fuel)).or_insert(1);
         }
     }
-    for &(cell, effect) in &requested {
-        if effects
-            .playing
-            .iter()
-            .any(|playing| playing.cell == cell && playing.effect == effect)
-        {
-            continue;
+    if !requested.is_empty() || !effects.playing.is_empty() {
+        for (index, cell) in cells().enumerate() {
+            let old = previous[index];
+            let new = current[index];
+            let visible = effects.held.get(&cell).copied().unwrap_or(old);
+            if (old.frozen && visible.frozen && !new.frozen)
+                || (old.poison && visible.poison && !new.poison)
+                || (old.acid && visible.acid && !new.acid)
+                || (old.electric_acid && visible.electric_acid && !new.electric_acid)
+                || (old.fuel && visible.fuel && !new.fuel)
+                || (old.wet && visible.wet && !new.wet)
+                || (old.healing && visible.healing && !new.healing)
+                || (old.thorns && visible.thorns && !new.thorns)
+                || (old.growth.is_some() && visible.growth.is_some() && new.growth.is_none())
+            {
+                let departing = effects.departing.entry(cell).or_default();
+                departing.frozen |= old.frozen && visible.frozen && !new.frozen;
+                departing.poison |= old.poison && visible.poison && !new.poison;
+                departing.acid |= old.acid && visible.acid && !new.acid;
+                departing.electric_acid |=
+                    old.electric_acid && visible.electric_acid && !new.electric_acid;
+                departing.fuel |= old.fuel && visible.fuel && !new.fuel;
+                departing.wet |= old.wet && visible.wet && !new.wet;
+                departing.healing |= old.healing && visible.healing && !new.healing;
+                departing.thorns |= old.thorns && visible.thorns && !new.thorns;
+                if old.growth.is_some() && visible.growth.is_some() && new.growth.is_none() {
+                    departing.growth = visible.growth;
+                }
+            }
         }
+    }
+    let mut requested: Vec<_> = requested.into_iter().collect();
+    requested.sort_by_key(|((cell, effect), _)| {
+        (
+            cell.y,
+            cell.x,
+            usize::from(*effect != Effect::Explosion),
+            effect.row(),
+        )
+    });
+    for ((cell, effect), count) in requested {
         let index = cell.y as usize * COLUMNS + cell.x as usize;
         if let Some(old) = previous.get(index) {
             effects.held.entry(cell).or_insert(*old);
         }
-        let delay = if matches!(effect, Effect::RidgeDust | Effect::Void)
-            && requested.contains(&(cell, Effect::Explosion))
-        {
-            DURATION
-        } else {
-            0.0
-        };
-        let center = cell_center(cell);
-        let entity = commands
-            .spawn((
-                Sprite {
-                    image: effects.image.clone(),
-                    rect: Some(effect.rect(0)),
-                    custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE)),
-                    ..default()
-                },
-                if delay > 0.0 {
-                    Visibility::Hidden
-                } else {
-                    Visibility::Visible
-                },
-                Transform::from_xyz(center.x, center.y, 1.7 + effect.row() as f32 * 0.001),
-            ))
-            .id();
-        effects.playing.push(Playing {
-            cell,
-            entity,
-            effect,
-            elapsed: 0.0,
-            delay,
-        });
+        for _ in 0..count {
+            let predecessors = || {
+                effects.playing.iter().filter(|playing| {
+                    playing.cell == cell
+                        && (playing.effect == effect
+                            || (matches!(effect, Effect::RidgeDust | Effect::Void)
+                                && playing.effect == Effect::Explosion))
+                })
+            };
+            let delay = predecessors()
+                .map(|playing| playing.delay - playing.elapsed + overlap_delay(FRAMES))
+                .fold(0.0_f32, f32::max);
+            let layer = predecessors()
+                .map(|playing| playing.layer + 0.0001)
+                .fold(1.7 + effect.row() as f32 * 0.001, f32::max);
+            let center = cell_center(cell);
+            let entity = commands
+                .spawn((
+                    Sprite {
+                        image: effects.image.clone(),
+                        rect: Some(effect.rect(0)),
+                        custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE)),
+                        ..default()
+                    },
+                    if delay > 0.0 {
+                        Visibility::Hidden
+                    } else {
+                        Visibility::Visible
+                    },
+                    Transform::from_xyz(center.x, center.y, layer),
+                ))
+                .id();
+            effects.playing.push(Playing {
+                cell,
+                entity,
+                effect,
+                elapsed: 0.0,
+                delay,
+                layer,
+            });
+        }
     }
     turn.effects_active = !effects.playing.is_empty();
 }
@@ -296,6 +391,9 @@ pub(crate) fn advance(
     });
     let active_cells: HashSet<_> = effects.playing.iter().map(|playing| playing.cell).collect();
     effects.held.retain(|cell, _| active_cells.contains(cell));
+    if effects.playing.is_empty() {
+        effects.departing.clear();
+    }
     turn.effects_active = !effects.playing.is_empty();
 }
 
@@ -403,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn explosion_precedes_the_resulting_hole_or_ridge() {
+    fn terrain_animation_starts_halfway_through_explosion() {
         for ground in [Ground::Hole, Ground::Ridge] {
             let mut app = app();
             let cell = IVec2::new(4, 3);
@@ -425,15 +523,25 @@ mod tests {
                 .find(|playing| playing.effect == result)
                 .unwrap();
             let entity = transition.entity;
-            assert_eq!(transition.delay, DURATION);
+            assert_eq!(transition.delay, overlap_delay(FRAMES));
             assert_eq!(
                 *app.world().get::<Visibility>(entity).unwrap(),
                 Visibility::Hidden
             );
-            tick(&mut app, DURATION);
+            tick(&mut app, overlap_delay(FRAMES) - 0.01);
+            assert_eq!(
+                *app.world().get::<Visibility>(entity).unwrap(),
+                Visibility::Hidden
+            );
+            tick(&mut app, 0.02);
             assert_eq!(
                 *app.world().get::<Visibility>(entity).unwrap(),
                 Visibility::Visible
+            );
+            assert!(
+                app.world()
+                    .resource::<Effects>()
+                    .animating(cell, Effect::Explosion)
             );
             assert_eq!(
                 app.world().resource::<Effects>().held(cell).unwrap().ground,
@@ -444,5 +552,187 @@ mod tests {
             assert!(app.world().resource::<Effects>().held(cell).is_none());
             assert!(!app.world().resource::<TurnState>().animation_active());
         }
+    }
+
+    #[test]
+    fn repeated_effects_overlap_and_terrain_waits_for_the_last_explosion() {
+        let mut app = app();
+        let cell = IVec2::new(4, 3);
+        app.world_mut()
+            .resource_mut::<Board>()
+            .set(cell, Ground::Hole);
+        for _ in 0..3 {
+            app.world_mut().spawn((
+                FireFlash(Timer::from_seconds(1.0, TimerMode::Once)),
+                Transform::from_translation(cell_center(cell).extend(0.0)),
+            ));
+        }
+        app.update();
+        let effects = app.world().resource::<Effects>();
+        let explosions: Vec<_> = effects
+            .playing
+            .iter()
+            .filter(|playing| playing.effect == Effect::Explosion)
+            .collect();
+        assert_eq!(explosions.len(), 3);
+        for (index, explosion) in explosions.iter().enumerate() {
+            assert!((explosion.delay - index as f32 * overlap_delay(FRAMES)).abs() < 0.001);
+        }
+        assert!(explosions[0].layer < explosions[1].layer);
+        assert!(explosions[1].layer < explosions[2].layer);
+        let transition = effects
+            .playing
+            .iter()
+            .find(|playing| playing.effect == Effect::Void)
+            .unwrap();
+        assert!((transition.delay - 3.0 * overlap_delay(FRAMES)).abs() < 0.001);
+        assert!(transition.layer > explosions[2].layer);
+        let second = explosions[1].entity;
+        tick(&mut app, overlap_delay(FRAMES) + 0.01);
+        assert_eq!(
+            app.world().get::<Visibility>(second),
+            Some(&Visibility::Visible)
+        );
+        assert!(app.world().resource::<TurnState>().animation_active());
+        tick(&mut app, 3.0 * overlap_delay(FRAMES) + DURATION);
+        assert!(app.world().resource::<Effects>().held(cell).is_none());
+        assert!(!app.world().resource::<TurnState>().animation_active());
+    }
+
+    #[test]
+    fn repeated_signal_during_animation_waits_only_until_halfway() {
+        let mut app = app();
+        let cell = IVec2::new(4, 3);
+        app.world_mut().spawn(EffectSignal(cell, Effect::Freeze));
+        app.update();
+        tick(&mut app, FRAME_SECONDS);
+        app.world_mut().spawn(EffectSignal(cell, Effect::Freeze));
+        app.update();
+        let effects = app.world().resource::<Effects>();
+        let freezes: Vec<_> = effects
+            .playing
+            .iter()
+            .filter(|playing| playing.effect == Effect::Freeze)
+            .collect();
+        assert_eq!(freezes.len(), 2);
+        let second = freezes[1];
+        assert!((second.delay - (overlap_delay(FRAMES) - FRAME_SECONDS)).abs() < 0.001);
+        let entity = second.entity;
+        let delay = second.delay;
+        tick(&mut app, delay + 0.01);
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Visible)
+        );
+    }
+
+    #[test]
+    fn flash_and_signal_for_the_same_effect_do_not_duplicate_it() {
+        let mut app = app();
+        let cell = IVec2::new(4, 3);
+        app.world_mut().spawn(EffectSignal(cell, Effect::Electric));
+        app.world_mut().spawn((
+            ElectricFlash(Timer::from_seconds(1.0, TimerMode::Once)),
+            Transform::from_translation(cell_center(cell).extend(0.0)),
+        ));
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Effects>()
+                .playing
+                .iter()
+                .filter(|playing| playing.effect == Effect::Electric)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn outgoing_tile_effects_wait_for_incoming_animations_elsewhere() {
+        let mut app = app();
+        let source = IVec2::new(4, 3);
+        let target = IVec2::new(5, 3);
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.make_wet(source);
+            board.add_poison(source);
+            board.add_acid(source);
+            board.electrify_acid(source);
+            board.add_oil(source);
+            board.add_life_essence(source);
+            assert!(board.freeze_water(source));
+        }
+        app.update();
+        tick(&mut app, DURATION + 0.01);
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.thaw(source);
+            board.clear_poison(source);
+            board.clear_acid(source);
+            board.remove_oil(source);
+            board.dry(source);
+            board.make_water(target);
+        }
+        app.update();
+        let effects = app.world().resource::<Effects>();
+        let old = effects.held(source).unwrap();
+        assert!(old.frozen && old.poison && old.acid && old.electric_acid && old.fuel);
+        assert!(old.wet && old.healing);
+        assert_eq!(old.ground, Ground::Solid);
+        assert!(effects.animating(target, Effect::Water));
+        tick(&mut app, DURATION + 0.01);
+        assert!(app.world().resource::<Effects>().held(source).is_none());
+    }
+
+    #[test]
+    fn outgoing_effects_disappear_immediately_without_incoming_animations() {
+        let mut app = app();
+        let source = IVec2::new(4, 3);
+        app.world_mut().resource_mut::<Board>().add_poison(source);
+        app.update();
+        tick(&mut app, DURATION + 0.01);
+        app.world_mut().resource_mut::<Board>().clear_poison(source);
+        app.update();
+        assert!(app.world().resource::<Effects>().held(source).is_none());
+        assert!(!app.world().resource::<TurnState>().effects_active);
+    }
+
+    #[test]
+    fn an_effect_removed_before_reveal_is_not_made_visible() {
+        let mut app = app();
+        let source = IVec2::new(4, 3);
+        let target = IVec2::new(5, 3);
+        app.world_mut().resource_mut::<Board>().add_poison(source);
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<Effects>()
+                .held(source)
+                .unwrap()
+                .poison
+        );
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.clear_poison(source);
+            board.make_water(target);
+        }
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<Effects>()
+                .held(source)
+                .unwrap()
+                .poison
+        );
+        tick(&mut app, DURATION + 0.01);
+        assert!(!app.world().resource::<Board>().is_poisoned(source));
+        assert!(app.world().resource::<Effects>().held(source).is_none());
+    }
+
+    #[test]
+    fn odd_frame_counts_round_halfway_up() {
+        assert_eq!(overlap_delay(5), 3.0 * FRAME_SECONDS);
+        assert_eq!(overlap_delay(6), 3.0 * FRAME_SECONDS);
+        assert_eq!(overlap_delay(7), 4.0 * FRAME_SECONDS);
     }
 }

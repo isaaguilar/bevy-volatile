@@ -364,7 +364,7 @@ impl Board {
         let changed = self.tiles[index] != Ground::Hole;
         self.wet[index] = 0;
         self.oil[index] = false;
-        self.frozen[index] = false;
+        self.thaw(cell);
         self.acid[index] = None;
         self.clear_poison(cell);
         self.thorns.dissolve(&[cell]);
@@ -430,15 +430,15 @@ impl Board {
                 true
             }
         });
-        for (kind, (first, second)) in outcomes {
+        for (kind, cells) in outcomes {
             match kind {
                 TerrainGrowthKind::Void => {
-                    for cell in first.into_iter().chain(second) {
+                    for cell in cells {
                         self.make_hole(cell);
                     }
                 }
                 TerrainGrowthKind::Stone => {
-                    for cell in first.into_iter().chain(second) {
+                    for cell in cells {
                         self.make_ridge(cell);
                     }
                 }
@@ -663,6 +663,9 @@ impl Board {
 
     pub fn set(&mut self, cell: IVec2, ground: Ground) {
         let index = Self::index(cell).expect("board cell must be in bounds");
+        if matches!(ground, Ground::Hole | Ground::Ridge) {
+            self.thaw(cell);
+        }
         self.tiles[index] = ground;
         if !self.is_water(cell) {
             self.expire_life_essence(index);
@@ -697,6 +700,44 @@ mod tests {
     use super::*;
     use bevy_rand::prelude::WyRand;
     use rand::SeedableRng;
+
+    #[test]
+    fn replacing_frozen_water_with_unsafe_terrain_clears_ice() {
+        let cell = IVec2::new(1, 1);
+        for ground in [Ground::Hole, Ground::Ridge] {
+            for natural_water in [false, true] {
+                let mut board = Board::default();
+                if natural_water {
+                    board.make_water(cell);
+                } else {
+                    board.make_wet(cell);
+                }
+                assert!(board.freeze_water(cell));
+                board.set(cell, ground);
+                assert_eq!(board.ground(cell), Some(ground));
+                assert!(!board.is_frozen(cell));
+                assert!(!board.freeze_water(cell));
+            }
+        }
+    }
+
+    #[test]
+    fn terrain_limit_preserves_frozen_water_when_creation_is_blocked() {
+        let mut board = Board::default();
+        let cells: Vec<_> = (0..ROWS)
+            .flat_map(|y| (0..COLUMNS).map(move |x| IVec2::new(x as i32, y as i32)))
+            .collect();
+        for &cell in &cells[..MAX_UNSAFE_TILES] {
+            board.set(cell, Ground::Hole);
+        }
+        let cell = cells[MAX_UNSAFE_TILES];
+        board.make_water(cell);
+        assert!(board.freeze_water(cell));
+        assert!(!board.make_hole(cell));
+        assert!(!board.make_ridge(cell));
+        assert_eq!(board.ground(cell), Some(Ground::Water));
+        assert!(board.is_frozen(cell));
+    }
 
     #[test]
     fn weather_does_not_block_the_only_path_between_walkable_tiles() {
