@@ -159,8 +159,16 @@ const TITLE_ACTIONS: [(MenuAction, &str); 3] = [
     (MenuAction::Rulebook, "RULEBOOK"),
 ];
 
-pub(crate) fn detect_game_over(health: Res<PlayerHealth>, mut frontend: ResMut<Frontend>) {
-    if frontend.screen != Screen::Game {
+pub(crate) fn detect_game_over(
+    health: Res<PlayerHealth>,
+    turn: Option<Res<crate::TurnState>>,
+    mut frontend: ResMut<Frontend>,
+) {
+    if frontend.screen != Screen::Game
+        || turn
+            .as_ref()
+            .is_some_and(|turn| turn.effects_active || turn.weather_animation.is_some())
+    {
         return;
     }
     let outcome = match health.0 {
@@ -585,6 +593,29 @@ mod tests {
             assert!(frontend.take_restart_request());
             assert_eq!(frontend.outcome, None);
         }
+    }
+
+    #[test]
+    fn game_over_waits_until_reaction_animations_finish() {
+        let mut app = App::new();
+        let turn = crate::TurnState {
+            effects_active: true,
+            ..default()
+        };
+        app.insert_resource(Frontend::computer_match())
+            .insert_resource(PlayerHealth([0, 5]))
+            .insert_resource(turn)
+            .add_systems(Update, detect_game_over);
+        app.update();
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Game);
+        app.world_mut()
+            .resource_mut::<crate::TurnState>()
+            .effects_active = false;
+        app.update();
+        assert_eq!(
+            app.world().resource::<Frontend>().outcome,
+            Some(Outcome::Lose)
+        );
     }
 
     #[test]

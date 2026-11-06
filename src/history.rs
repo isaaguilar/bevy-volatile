@@ -31,7 +31,7 @@ impl ComputerHistory {
 }
 
 pub(crate) fn cell_label(cell: IVec2) -> String {
-    format!("{}{}", char::from(b'D' + cell.x as u8), cell.y + 2)
+    format!("{}{}", char::from(b'A' + cell.x as u8), cell.y + 1)
 }
 
 #[derive(Component)]
@@ -265,6 +265,12 @@ pub(crate) fn update_scrollbar<V: Component, S: Component>(
 mod tests {
     use super::*;
     use crate::{PlayerHealth, SUNSTONE_ITEM_INDEX};
+
+    #[test]
+    fn labels_use_playing_board_coordinates() {
+        assert_eq!(cell_label(IVec2::ZERO), "A1");
+        assert_eq!(cell_label(IVec2::new(9, 6)), "J7");
+    }
 
     #[test]
     fn final_action_is_rendered_before_game_over() {

@@ -9,6 +9,7 @@ use rand::{Rng, RngExt};
 mod ai;
 mod aquatic;
 mod board;
+mod effects;
 mod ground_art;
 mod help;
 mod history;
@@ -121,6 +122,8 @@ struct TurnState {
     serpents: Vec<serpent::Serpent>,
     serpent_animation: Option<SerpentAnimation>,
     aquatic_animation: Option<AquaticAnimation>,
+    effects_active: bool,
+    weather_animation: Option<WeatherAnimation>,
     aquatic_contacts: Vec<(usize, PlayerId)>,
     terrain_displacements: Vec<(PlayerId, IVec2)>,
     terrain_limit_hit: bool,
@@ -145,6 +148,35 @@ struct Weather {
     rain: u16,
     earthquake: u16,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeatherKind {
+    Rain,
+    Earthquake,
+}
+
+enum WeatherPhase {
+    Waiting,
+    Playing {
+        kind: WeatherKind,
+        elapsed: f32,
+        overlay: Option<Entity>,
+    },
+    Resolving,
+}
+
+struct WeatherAnimation {
+    pending: std::collections::VecDeque<WeatherKind>,
+    phase: WeatherPhase,
+    notices: Vec<String>,
+}
+
+#[derive(Component)]
+struct RainOverlay;
+
+const WEATHER_ANIMATION_SECONDS: f32 = 2.5;
+const EARTHQUAKE_FRAME_SECONDS: f32 = 0.15;
+const EARTHQUAKE_OFFSET: f32 = 4.0;
 
 impl Default for Weather {
     fn default() -> Self {
@@ -261,6 +293,8 @@ impl Default for TurnState {
             serpents: Vec::new(),
             serpent_animation: None,
             aquatic_animation: None,
+            effects_active: false,
+            weather_animation: None,
             aquatic_contacts: Vec::new(),
             terrain_displacements: Vec::new(),
             terrain_limit_hit: false,
@@ -284,7 +318,10 @@ impl Default for TurnState {
 
 impl TurnState {
     fn animation_active(&self) -> bool {
-        self.aquatic_animation.is_some() || self.serpent_animation.is_some()
+        self.aquatic_animation.is_some()
+            || self.serpent_animation.is_some()
+            || self.effects_active
+            || self.weather_animation.is_some()
     }
 
     fn animate_aquatic(&mut self, impacts: &[Option<aquatic::AquaticImpact>]) {
@@ -634,6 +671,14 @@ fn resolve_deferred_hit(
         &mut turn.pending_effects.frozen_players,
     );
     if hit_player {
+        commands.spawn(effects::EffectSignal(
+            hit.cell,
+            if hit.frost {
+                effects::Effect::Freeze
+            } else {
+                effects::Effect::Electric
+            },
+        ));
         commands
             .entity(hit.item.expect("deferred direct hit has a placed item"))
             .despawn();
@@ -1108,6 +1153,7 @@ fn main() {
         .init_resource::<PlayerHealth>()
         .init_resource::<Weather>()
         .init_resource::<ai::BotController>()
+        .init_resource::<effects::Effects>()
         .add_plugins(help::plugin)
         .add_plugins(ground_art::plugin)
         .add_plugins(history::plugin)
@@ -1116,6 +1162,7 @@ fn main() {
             Startup,
             (
                 setup,
+                effects::load,
                 spawn_board_grid,
                 (initialize_wind, initialize_weather).chain(),
             ),
@@ -1134,20 +1181,26 @@ fn main() {
             Update,
             (
                 (
+                    effects::advance,
                     begin_turn_frame,
+                    effects::capture,
                     ai::plan,
                     advance_serpent_animation,
                     advance_aquatic_animation,
                     rest,
+                    effects::capture,
                 )
                     .chain(),
                 update_board_cursor,
-                (undo_action, handle_actions).chain(),
+                (undo_action, handle_actions, effects::capture).chain(),
                 (
                     handle_selection,
+                    effects::capture,
                     handle_selection.run_if(pending_placement_ready),
+                    effects::capture,
                     clear_hole_items,
                     handle_selection.run_if(pending_placement_ready),
+                    effects::capture,
                     apply_terrain_changes,
                 )
                     .chain(),
@@ -1161,7 +1214,9 @@ fn main() {
                 advance_wind,
                 respawn_ingredients,
                 highlight_inventory_hover,
+                queue_weather,
                 advance_weather,
+                effects::capture,
                 (
                     update_inventory_counts,
                     update_action_slots,
@@ -1190,6 +1245,7 @@ fn main() {
                     update_aquatic_visuals,
                 )
                     .chain(),
+                shake_ground,
             )
                 .chain()
                 .in_set(menu::GameplaySystems)
@@ -1212,6 +1268,7 @@ struct MatchReset<'w, 's> {
     selection: ResMut<'w, Selection>,
     hover: ResMut<'w, InventoryHover>,
     cursor: ResMut<'w, BoardCursor>,
+    effects: Option<ResMut<'w, effects::Effects>>,
     images: Res<'w, InventoryImages>,
     rng: Single<'w, 's, &'static mut WyRand, With<GlobalRng>>,
     players: Query<'w, 's, (&'static Player, &'static mut Transform)>,
@@ -1225,6 +1282,9 @@ fn reset_match(mut commands: Commands, mut state: MatchReset) {
         return;
     }
     state.help.reset(&mut commands);
+    if let Some(effects) = &mut state.effects {
+        effects.reset();
+    }
     if let Some(SelectedAction::Item { icon, .. }) = state.selection.0.take() {
         commands.entity(icon).despawn();
     }
@@ -3556,6 +3616,7 @@ fn handle_selection(
                 let new_oil = is_oil && !board.has_oil(target.cell);
                 if water_on_solid {
                     board.make_water(target.cell);
+                    commands.spawn(effects::EffectSignal(target.cell, effects::Effect::Water));
                 }
                 if corrodes_ridge {
                     board.set(target.cell, Ground::Solid);
@@ -3630,6 +3691,7 @@ fn handle_selection(
                 }
                 if is_oil {
                     board.add_oil(target.cell);
+                    commands.spawn(effects::EffectSignal(target.cell, effects::Effect::Fuel));
                 }
                 let poison_acid_reaction = !board.is_frozen(target.cell)
                     && ((is_poison
@@ -3658,8 +3720,10 @@ fn handle_selection(
                             continue;
                         }
                         board.add_acid(cell);
+                        commands.spawn(effects::EffectSignal(cell, effects::Effect::Acid));
                         if poison_acid_reaction && !board.is_frozen(cell) {
                             board.add_poison(cell);
+                            commands.spawn(effects::EffectSignal(cell, effects::Effect::Poison));
                         }
                         acid_cells.push(cell);
                     }
@@ -3689,6 +3753,8 @@ fn handle_selection(
                         if acid_cells.contains(&shard.0) {
                             commands.entity(entity).despawn();
                             board.electrify_acid(shard.0);
+                            commands
+                                .spawn(effects::EffectSignal(shard.0, effects::Effect::Electric));
                             acid_shards += 1;
                         }
                     }
@@ -3709,6 +3775,7 @@ fn handle_selection(
                         .is_some_and(|ground| ground.walkable())
                 {
                     board.add_poison(target.cell);
+                    commands.spawn(effects::EffectSignal(target.cell, effects::Effect::Poison));
                 }
                 let electrified =
                     if is_storm || (existing_shard.is_some() && !creates_ridge && !void_reaction) {
@@ -3719,6 +3786,10 @@ fn handle_selection(
                 let storm_hits_acid = is_storm && board.is_acidic(target.cell);
                 if storm_hits_acid {
                     board.electrify_acid(target.cell);
+                    commands.spawn(effects::EffectSignal(
+                        target.cell,
+                        effects::Effect::Electric,
+                    ));
                 }
                 for &cell in &electrified {
                     board.electrify_acid(cell);
@@ -3858,6 +3929,22 @@ fn handle_selection(
                         );
                         hit_player |= direct_hit_landed;
                     }
+                }
+                if direct_hit_landed {
+                    commands.spawn(effects::EffectSignal(
+                        target.cell,
+                        if direct_frost_hit {
+                            effects::Effect::Freeze
+                        } else {
+                            effects::Effect::Electric
+                        },
+                    ));
+                }
+                if direct_storm {
+                    commands.spawn(effects::EffectSignal(
+                        target.cell,
+                        effects::Effect::Electric,
+                    ));
                 }
                 let mut thawed_player = false;
                 if is_sunstone {
@@ -4463,7 +4550,7 @@ fn advance_serpent_animation(
     mut turn: ResMut<TurnState>,
     mut health: ResMut<PlayerHealth>,
 ) {
-    if turn.aquatic_animation.is_some() {
+    if turn.aquatic_animation.is_some() || turn.effects_active {
         return;
     }
     let Some(animation) = &mut turn.serpent_animation else {
@@ -4497,6 +4584,9 @@ fn advance_aquatic_animation(
     mut turn: ResMut<TurnState>,
     items: Query<(Entity, &Collectible)>,
 ) {
+    if turn.effects_active {
+        return;
+    }
     let Some(animation) = &mut turn.aquatic_animation else {
         return;
     };
@@ -4529,14 +4619,10 @@ fn initialize_weather(mut weather: ResMut<Weather>, mut rng: Single<&mut WyRand,
     weather.earthquake = rng.random_range(EARTHQUAKE_INTERVAL);
 }
 
-fn advance_weather(
-    turn: Res<TurnState>,
+fn queue_weather(
+    mut turn: ResMut<TurnState>,
     mut weather: ResMut<Weather>,
-    mut board: ResMut<Board>,
-    players: Query<&Transform, With<Player>>,
-    collectibles: Query<&Collectible>,
     mut rng: Single<&mut WyRand, With<GlobalRng>>,
-    mut feedback: Query<&mut Text, With<DropFeedback>>,
 ) {
     if !turn.completed_turn {
         return;
@@ -4546,7 +4632,115 @@ fn advance_weather(
     if weather.rain != 0 && weather.earthquake != 0 {
         return;
     }
+    let mut pending = std::collections::VecDeque::new();
+    if weather.rain == 0 {
+        weather.rain = rng.random_range(RAIN_INTERVAL);
+        pending.push_back(WeatherKind::Rain);
+    }
+    if weather.earthquake == 0 {
+        weather.earthquake = rng.random_range(EARTHQUAKE_INTERVAL);
+        pending.push_back(WeatherKind::Earthquake);
+    }
+    turn.weather_animation = Some(WeatherAnimation {
+        pending,
+        phase: WeatherPhase::Waiting,
+        notices: Vec::new(),
+    });
+}
 
+#[derive(SystemParam)]
+struct WeatherVisuals<'w, 's> {
+    overlays: Query<'w, 's, &'static mut Sprite, With<RainOverlay>>,
+    feedback: Query<'w, 's, &'static mut Text, With<DropFeedback>>,
+}
+
+fn advance_weather(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut turn: ResMut<TurnState>,
+    mut board: ResMut<Board>,
+    actors: (Query<&Transform, With<Player>>, Query<&Collectible>),
+    visuals: WeatherVisuals,
+    mut rng: Single<&mut WyRand, With<GlobalRng>>,
+) {
+    let (players, collectibles) = actors;
+    let WeatherVisuals {
+        mut overlays,
+        mut feedback,
+    } = visuals;
+    let Some(mut animation) = turn.weather_animation.take() else {
+        return;
+    };
+    if turn.effects_active || turn.aquatic_animation.is_some() || turn.serpent_animation.is_some() {
+        turn.weather_animation = Some(animation);
+        return;
+    }
+    let kind = match &mut animation.phase {
+        WeatherPhase::Waiting => {
+            let kind = animation.pending.pop_front().expect("queued weather event");
+            let overlay = if kind == WeatherKind::Rain {
+                Some(
+                    commands
+                        .spawn((
+                            RainOverlay,
+                            Sprite {
+                                color: Color::srgba(0.1, 0.4, 1.0, 0.0),
+                                custom_size: Some(Vec2::new(
+                                    BOARD_RIGHT - BOARD_LEFT,
+                                    BOARD_TOP - BOARD_BOTTOM,
+                                )),
+                                ..default()
+                            },
+                            Transform::from_xyz(
+                                (BOARD_LEFT + BOARD_RIGHT) / 2.0,
+                                (BOARD_TOP + BOARD_BOTTOM) / 2.0,
+                                2.0,
+                            ),
+                        ))
+                        .id(),
+                )
+            } else {
+                None
+            };
+            animation.phase = WeatherPhase::Playing {
+                kind,
+                elapsed: 0.0,
+                overlay,
+            };
+            turn.weather_animation = Some(animation);
+            return;
+        }
+        WeatherPhase::Playing {
+            kind,
+            elapsed,
+            overlay,
+        } => {
+            *elapsed += time.delta_secs();
+            if let Some(entity) = *overlay
+                && let Ok(mut sprite) = overlays.get_mut(entity)
+            {
+                let progress = (*elapsed / WEATHER_ANIMATION_SECONDS).clamp(0.0, 1.0);
+                let alpha = 0.4 * (1.0 - (2.0 * progress - 1.0).abs());
+                sprite.color = Color::srgba(0.1, 0.4, 1.0, alpha);
+            }
+            if *elapsed < WEATHER_ANIMATION_SECONDS {
+                turn.weather_animation = Some(animation);
+                return;
+            }
+            if let Some(entity) = overlay.take() {
+                commands.entity(entity).despawn();
+            }
+            *kind
+        }
+        WeatherPhase::Resolving => {
+            if animation.pending.is_empty() {
+                return;
+            }
+            animation.phase = WeatherPhase::Waiting;
+            turn.weather_animation = Some(animation);
+            return;
+        }
+    };
     let mut occupied: Vec<_> = collectibles.iter().map(|item| item.cell).collect();
     occupied.extend(
         players
@@ -4587,13 +4781,7 @@ fn advance_weather(
             })
             .collect::<Vec<_>>()
     };
-    let tile_label = |cell: IVec2| {
-        let column = char::from(b'D' + u8::try_from(cell.x).expect("board column is in range"));
-        format!("{column}{}", cell.y + 2)
-    };
-    let mut notices = Vec::new();
-    if weather.rain == 0 {
-        weather.rain = rng.random_range(RAIN_INTERVAL);
+    if kind == WeatherKind::Rain {
         let water_count = (0..ROWS)
             .flat_map(|y| (0..COLUMNS).map(move |x| IVec2::new(x as i32, y as i32)))
             .filter(|cell| board.ground(*cell) == Some(Ground::Water))
@@ -4602,13 +4790,14 @@ fn advance_weather(
         if water_count * 100 < ROWS * COLUMNS * 33 && !candidates.is_empty() {
             let cell = candidates[rng.random_range(0..candidates.len())];
             board.make_water(cell);
-            notices.push(format!("Rain: water at {}", tile_label(cell)));
+            animation
+                .notices
+                .push(format!("Rain: water at {}", history::cell_label(cell)));
         } else {
-            notices.push("Rain: no new water".into());
+            animation.notices.push("Rain: no new water".into());
         }
     }
-    if weather.earthquake == 0 {
-        weather.earthquake = rng.random_range(EARTHQUAKE_INTERVAL);
+    if kind == WeatherKind::Earthquake {
         let mut changes = Vec::new();
         for _ in 0..EARTHQUAKE_TILES {
             let candidates: Vec<_> = clean_cells(&board)
@@ -4632,17 +4821,93 @@ fn advance_weather(
             } else {
                 "hole"
             };
-            changes.push(format!("{kind} {}", tile_label(cell)));
+            changes.push(format!("{kind} {}", history::cell_label(cell)));
         }
-        notices.push(if changes.is_empty() {
+        animation.notices.push(if changes.is_empty() {
             "Earthquake: no safe terrain changes".into()
         } else {
             format!("Earthquake: {}", changes.join(", "))
         });
     }
     if let Ok(mut feedback) = feedback.single_mut() {
-        feedback.0 = notices.join(" | ");
+        feedback.0 = animation.notices.join(" | ");
     }
+    animation.phase = WeatherPhase::Resolving;
+    turn.weather_animation = Some(animation);
+}
+
+type WeatherTileSprite = (
+    &'static mut Transform,
+    Option<&'static GroundTile>,
+    Option<&'static FrozenTile>,
+    Option<&'static PoisonTile>,
+    Option<&'static AcidTile>,
+    Option<&'static VoidGrowthTile>,
+    Option<&'static ThornTile>,
+    Option<&'static OilIcon>,
+    Option<&'static LifeEssenceTile>,
+);
+type WeatherTileFilter = Or<(
+    With<GroundTile>,
+    With<FrozenTile>,
+    With<PoisonTile>,
+    With<AcidTile>,
+    With<VoidGrowthTile>,
+    With<ThornTile>,
+    With<OilIcon>,
+    With<LifeEssenceTile>,
+)>;
+
+fn shake_ground(
+    turn: Res<TurnState>,
+    mut was_shaking: Local<bool>,
+    mut tiles: Query<WeatherTileSprite, WeatherTileFilter>,
+) {
+    let elapsed = turn.weather_animation.as_ref().and_then(|animation| {
+        if let WeatherPhase::Playing {
+            kind: WeatherKind::Earthquake,
+            elapsed,
+            ..
+        } = animation.phase
+        {
+            Some(elapsed)
+        } else {
+            None
+        }
+    });
+    if elapsed.is_none() && !*was_shaking {
+        return;
+    }
+    let offset = elapsed.map_or(0.0, |elapsed| {
+        if ((elapsed / EARTHQUAKE_FRAME_SECONDS) as usize).is_multiple_of(2) {
+            EARTHQUAKE_OFFSET
+        } else {
+            -EARTHQUAKE_OFFSET
+        }
+    });
+    for (mut transform, ground, frozen, poison, acid, growth, thorn, oil, life) in &mut tiles {
+        let (cell, icon_offset) = if let Some(tile) = ground {
+            (tile.0, 0.0)
+        } else if let Some(tile) = frozen {
+            (tile.0, 0.0)
+        } else if let Some(tile) = poison {
+            (tile.0, 0.0)
+        } else if let Some(tile) = acid {
+            (tile.0, 0.0)
+        } else if let Some(tile) = growth {
+            (tile.0, 0.0)
+        } else if let Some(tile) = thorn {
+            (tile.0, 0.0)
+        } else if let Some(tile) = oil {
+            (tile.0, 17.0)
+        } else if let Some(tile) = life {
+            (tile.0, -17.0)
+        } else {
+            unreachable!("weather tile query requires a tile marker");
+        };
+        transform.translation.x = cell_center(cell).x + icon_offset + offset;
+    }
+    *was_shaking = elapsed.is_some();
 }
 
 fn initialize_wind(mut turn: ResMut<TurnState>, mut rng: Single<&mut WyRand, With<GlobalRng>>) {
@@ -4665,6 +4930,18 @@ fn update_turn_progress(
             "AQUATIC CREATURE MOVING...".into()
         } else if turn.serpent_animation.is_some() {
             "COATL MOVING...".into()
+        } else if let Some(weather) = &turn.weather_animation {
+            match weather.phase {
+                WeatherPhase::Playing {
+                    kind: WeatherKind::Rain,
+                    ..
+                } => "RAIN...".into(),
+                WeatherPhase::Playing {
+                    kind: WeatherKind::Earthquake,
+                    ..
+                } => "EARTHQUAKE...".into(),
+                _ => "WEATHER APPROACHING...".into(),
+            }
         } else if turn.frozen_turns[turn.active.index()] > 0 {
             format!(
                 "FROZEN: {} TURN(S) | ACTIONS: {} AVAILABLE",
@@ -4827,21 +5104,40 @@ fn update_reaction_flashes(
     }
 }
 
+type FrostImpactSprite = (
+    Entity,
+    &'static FrostImpact,
+    &'static mut Transform,
+    &'static mut Visibility,
+);
+type FrostImpactFilter = (Without<Player>, Without<FrozenTile>);
+
 fn update_frozen_tiles(
     mut commands: Commands,
     board: Res<Board>,
     turn: Res<TurnState>,
-    tiles: Query<(Entity, &FrozenTile)>,
-    mut impacts: Query<(Entity, &FrostImpact, &mut Transform), Without<Player>>,
+    effects: Option<Res<effects::Effects>>,
+    mut tiles: Query<(Entity, &FrozenTile, &mut Visibility), Without<FrostImpact>>,
+    mut impacts: Query<FrostImpactSprite, FrostImpactFilter>,
     players: Query<(&Player, &Transform), Without<FrostImpact>>,
 ) {
-    for (entity, tile) in &tiles {
-        if !board.is_frozen(tile.0) {
+    for (entity, tile, mut visibility) in &mut tiles {
+        let visible = effects
+            .as_ref()
+            .and_then(|effects| effects.held(tile.0))
+            .map_or_else(|| board.is_frozen(tile.0), |old| old.frozen);
+        if !visible && !board.is_frozen(tile.0) {
             commands.entity(entity).despawn();
+        } else {
+            *visibility = if visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
         }
     }
     let mut displayed = [false; 2];
-    for (entity, impact, mut transform) in &mut impacts {
+    for (entity, impact, mut transform, mut visibility) in &mut impacts {
         let index = impact.0.index();
         if turn.frozen_turns[index] == 0 {
             commands.entity(entity).despawn();
@@ -4850,6 +5146,16 @@ fn update_frozen_tiles(
         {
             transform.translation.x = player_transform.translation.x;
             transform.translation.y = player_transform.translation.y;
+            *visibility =
+                if board_cell(player_transform.translation.truncate()).is_some_and(|cell| {
+                    effects
+                        .as_ref()
+                        .is_some_and(|effects| effects.animating(cell, effects::Effect::Freeze))
+                }) {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Inherited
+                };
             displayed[index] = true;
         }
     }
@@ -4862,6 +5168,15 @@ fn update_frozen_tiles(
                     color: Color::srgba(0.7, 0.94, 1.0, 0.55),
                     custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
                     ..default()
+                },
+                if board_cell(transform.translation.truncate()).is_some_and(|cell| {
+                    effects
+                        .as_ref()
+                        .is_some_and(|effects| effects.animating(cell, effects::Effect::Freeze))
+                }) {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Inherited
                 },
                 Transform::from_xyz(transform.translation.x, transform.translation.y, 0.9),
             ));
@@ -4911,10 +5226,25 @@ fn update_water_effects(
     }
 }
 
-fn update_oil_effects(mut commands: Commands, board: Res<Board>, icons: Query<(Entity, &OilIcon)>) {
-    for (entity, icon) in &icons {
-        if !board.has_oil(icon.0) {
+fn update_oil_effects(
+    mut commands: Commands,
+    board: Res<Board>,
+    effects: Option<Res<effects::Effects>>,
+    mut icons: Query<(Entity, &OilIcon, &mut Visibility)>,
+) {
+    for (entity, icon, mut visibility) in &mut icons {
+        let visible = effects
+            .as_ref()
+            .and_then(|effects| effects.held(icon.0))
+            .map_or_else(|| board.has_oil(icon.0), |old| old.fuel);
+        if !board.has_oil(icon.0) && !visible {
             commands.entity(entity).despawn();
+        } else {
+            *visibility = if visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
         }
     }
 }
@@ -4922,11 +5252,18 @@ fn update_oil_effects(mut commands: Commands, board: Res<Board>, icons: Query<(E
 fn update_poison_visuals(
     mut commands: Commands,
     board: Res<Board>,
+    effects: Option<Res<effects::Effects>>,
     tiles: Query<(Entity, &PoisonTile)>,
 ) {
+    let visible = |cell| {
+        effects
+            .as_ref()
+            .and_then(|effects| effects.held(cell))
+            .map_or_else(|| board.is_poisoned(cell), |old| old.poison)
+    };
     let mut displayed = Vec::new();
     for (entity, tile) in &tiles {
-        if board.is_poisoned(tile.0) {
+        if visible(tile.0) {
             displayed.push(tile.0);
         } else {
             commands.entity(entity).despawn();
@@ -4935,7 +5272,7 @@ fn update_poison_visuals(
     for y in 0..ROWS {
         for x in 0..COLUMNS {
             let cell = IVec2::new(x as i32, y as i32);
-            if board.is_poisoned(cell) && !displayed.contains(&cell) {
+            if visible(cell) && !displayed.contains(&cell) {
                 let center = cell_center(cell);
                 commands.spawn((
                     PoisonTile(cell),
@@ -4954,11 +5291,18 @@ fn update_poison_visuals(
 fn update_acid_visuals(
     mut commands: Commands,
     board: Res<Board>,
+    effects: Option<Res<effects::Effects>>,
     mut tiles: Query<(Entity, &AcidTile, &mut Sprite)>,
 ) {
+    let visible = |cell| {
+        effects
+            .as_ref()
+            .and_then(|effects| effects.held(cell))
+            .map_or_else(|| board.is_acidic(cell), |old| old.acid)
+    };
     let mut displayed = Vec::new();
     for (entity, tile, mut sprite) in &mut tiles {
-        if board.is_acidic(tile.0) {
+        if visible(tile.0) {
             displayed.push(tile.0);
             sprite.color = if board.is_electrified_acid(tile.0) {
                 Color::srgba(0.9, 0.9, 0.05, 0.55)
@@ -4972,7 +5316,7 @@ fn update_acid_visuals(
     for y in 0..ROWS {
         for x in 0..COLUMNS {
             let cell = IVec2::new(x as i32, y as i32);
-            if board.is_acidic(cell) && !displayed.contains(&cell) {
+            if visible(cell) && !displayed.contains(&cell) {
                 let center = cell_center(cell);
                 commands.spawn((
                     AcidTile(cell),
@@ -5649,18 +5993,29 @@ mod tests {
                 Update,
                 (
                     (
+                        effects::advance.run_if(resource_exists::<effects::Effects>),
                         begin_turn_frame,
+                        effects::capture.run_if(resource_exists::<effects::Effects>),
                         advance_serpent_animation,
                         advance_aquatic_animation,
                         rest,
+                        effects::capture.run_if(resource_exists::<effects::Effects>),
                     )
                         .chain(),
-                    (undo_action, handle_actions).chain(),
+                    (
+                        undo_action,
+                        handle_actions,
+                        effects::capture.run_if(resource_exists::<effects::Effects>),
+                    )
+                        .chain(),
                     (
                         handle_selection,
+                        effects::capture.run_if(resource_exists::<effects::Effects>),
                         handle_selection.run_if(pending_placement_ready),
+                        effects::capture.run_if(resource_exists::<effects::Effects>),
                         clear_hole_items,
                         handle_selection.run_if(pending_placement_ready),
+                        effects::capture.run_if(resource_exists::<effects::Effects>),
                         apply_terrain_changes,
                     )
                         .chain(),
@@ -5674,7 +6029,9 @@ mod tests {
                     advance_wind,
                     respawn_ingredients,
                     highlight_inventory_hover,
+                    queue_weather,
                     advance_weather,
+                    effects::capture.run_if(resource_exists::<effects::Effects>),
                     (
                         update_inventory_counts,
                         update_action_slots,
@@ -5702,6 +6059,7 @@ mod tests {
                         update_aquatic_visuals,
                     )
                         .chain(),
+                    shake_ground,
                 )
                     .chain()
                     .in_set(menu::GameplaySystems)
@@ -5780,6 +6138,45 @@ mod tests {
             .add_plugins(help::plugin);
         app.update();
         app
+    }
+
+    #[test]
+    fn queued_reactions_wait_for_the_prior_effect_animation() {
+        let mut app = interaction_app();
+        app.init_resource::<effects::Effects>();
+        app.update();
+        let target = IVec2::new(6, 3);
+        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, cell_center(target));
+        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, cell_center(target));
+        assert!(app.world().resource::<Board>().is_water(target));
+        assert!(!app.world().resource::<Board>().is_frozen(target));
+        assert!(app.world().resource::<TurnState>().effects_active);
+        assert_eq!(
+            app.world()
+                .resource::<effects::Effects>()
+                .held(target)
+                .unwrap()
+                .ground,
+            Ground::Solid
+        );
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+        tick_coatl_animation(&mut app, 1.5);
+        assert!(app.world().resource::<Board>().is_frozen(target));
+        assert!(app.world().resource::<TurnState>().effects_active);
+        assert_eq!(
+            app.world()
+                .resource::<effects::Effects>()
+                .held(target)
+                .unwrap()
+                .ground,
+            Ground::Water
+        );
+        tick_coatl_animation(&mut app, 1.5);
+        assert!(!app.world().resource::<TurnState>().effects_active);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
     }
 
     #[test]
@@ -5904,9 +6301,9 @@ mod tests {
         );
         let entries = app.world().resource::<history::ComputerHistory>().entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].text, "Computer used Tlaloc's Water at E3");
+        assert_eq!(entries[0].text, "Computer used Tlaloc's Water at B2");
         assert_eq!(entries[0].item, Some(WATER_ITEM_INDEX));
-        assert_eq!(entries[1].text, "Computer used Sunstone at E3");
+        assert_eq!(entries[1].text, "Computer used Sunstone at B2");
     }
 
     #[test]
@@ -6255,6 +6652,21 @@ mod tests {
         panic!("Aquatic animation did not finish");
     }
 
+    fn finish_weather(app: &mut App) {
+        for _ in 0..30 {
+            if app
+                .world()
+                .resource::<TurnState>()
+                .weather_animation
+                .is_none()
+            {
+                return;
+            }
+            tick_coatl_animation(app, WEATHER_ANIMATION_SECONDS);
+        }
+        panic!("Weather animation did not finish");
+    }
+
     fn item_count(app: &mut App) -> usize {
         let world = app.world_mut();
         let mut items = world.query_filtered::<Entity, With<BoardItem>>();
@@ -6285,15 +6697,266 @@ mod tests {
         assert_eq!(app.world().resource::<Weather>().rain, 1);
         assert_eq!(app.world().resource::<Weather>().earthquake, 2);
         press_key(&mut app, KeyCode::KeyR);
+        finish_weather(&mut app);
         assert_eq!(terrain_count(&app, Ground::Water), 1);
         assert!(RAIN_INTERVAL.contains(&app.world().resource::<Weather>().rain));
         assert_eq!(app.world().resource::<Weather>().earthquake, 1);
         press_key(&mut app, KeyCode::KeyR);
+        finish_weather(&mut app);
         assert!(EARTHQUAKE_INTERVAL.contains(&app.world().resource::<Weather>().earthquake));
         assert_eq!(
             terrain_count(&app, Ground::Hole) + terrain_count(&app, Ground::Ridge),
             2
         );
+    }
+
+    #[test]
+    fn earthquake_waits_for_player_effects_then_shakes_before_terrain_changes() {
+        let mut app = interaction_app();
+        app.init_resource::<effects::Effects>();
+        let tile = IVec2::new(0, 0);
+        let tile_entity = app
+            .world_mut()
+            .spawn((
+                GroundTile(tile),
+                Sprite::default(),
+                Transform::from_translation(cell_center(tile).extend(-1.5)),
+            ))
+            .id();
+        app.world_mut().resource_mut::<Board>().add_poison(tile);
+        let poison_entity = app
+            .world_mut()
+            .spawn((
+                PoisonTile(tile),
+                Sprite::default(),
+                Transform::from_translation(cell_center(tile).extend(-0.25)),
+            ))
+            .id();
+        app.world_mut().resource_mut::<Weather>().earthquake = 1;
+        app.update();
+        let target = IVec2::new(6, 3);
+        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, cell_center(target));
+        press_key(&mut app, KeyCode::KeyR);
+        assert!(app.world().resource::<TurnState>().effects_active);
+        assert!(matches!(
+            app.world()
+                .resource::<TurnState>()
+                .weather_animation
+                .as_ref()
+                .unwrap()
+                .phase,
+            WeatherPhase::Waiting
+        ));
+        assert_eq!(
+            app.world()
+                .get::<Transform>(tile_entity)
+                .unwrap()
+                .translation
+                .x,
+            cell_center(tile).x
+        );
+        tick_coatl_animation(&mut app, 1.0);
+        assert!(app.world().resource::<TurnState>().effects_active);
+        assert_eq!(
+            terrain_count(&app, Ground::Ridge) + terrain_count(&app, Ground::Hole),
+            0
+        );
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+        tick_coatl_animation(&mut app, 0.5);
+        assert!(matches!(
+            app.world()
+                .resource::<TurnState>()
+                .weather_animation
+                .as_ref()
+                .unwrap()
+                .phase,
+            WeatherPhase::Playing {
+                kind: WeatherKind::Earthquake,
+                ..
+            }
+        ));
+        assert_eq!(
+            app.world()
+                .get::<Transform>(tile_entity)
+                .unwrap()
+                .translation
+                .x,
+            cell_center(tile).x + EARTHQUAKE_OFFSET
+        );
+        tick_coatl_animation(&mut app, EARTHQUAKE_FRAME_SECONDS);
+        assert_eq!(
+            app.world()
+                .get::<Transform>(tile_entity)
+                .unwrap()
+                .translation
+                .x,
+            cell_center(tile).x - EARTHQUAKE_OFFSET
+        );
+        assert_eq!(
+            app.world()
+                .get::<Transform>(poison_entity)
+                .unwrap()
+                .translation
+                .x,
+            cell_center(tile).x - EARTHQUAKE_OFFSET
+        );
+        tick_coatl_animation(&mut app, EARTHQUAKE_FRAME_SECONDS);
+        assert_eq!(
+            app.world()
+                .get::<Transform>(tile_entity)
+                .unwrap()
+                .translation
+                .x,
+            cell_center(tile).x + EARTHQUAKE_OFFSET
+        );
+        tick_coatl_animation(&mut app, 2.19);
+        assert_eq!(
+            terrain_count(&app, Ground::Ridge) + terrain_count(&app, Ground::Hole),
+            0
+        );
+        tick_coatl_animation(&mut app, 0.02);
+        assert_eq!(
+            terrain_count(&app, Ground::Ridge) + terrain_count(&app, Ground::Hole),
+            2
+        );
+        assert_eq!(
+            app.world()
+                .get::<Transform>(tile_entity)
+                .unwrap()
+                .translation
+                .x,
+            cell_center(tile).x
+        );
+        assert_eq!(
+            app.world()
+                .get::<Transform>(poison_entity)
+                .unwrap()
+                .translation
+                .x,
+            cell_center(tile).x
+        );
+        assert!(app.world().resource::<TurnState>().effects_active);
+        let board = app.world().resource::<Board>();
+        let effects = app.world().resource::<effects::Effects>();
+        for y in 0..ROWS {
+            for x in 0..COLUMNS {
+                let cell = IVec2::new(x as i32, y as i32);
+                if matches!(board.ground(cell), Some(Ground::Ridge | Ground::Hole)) {
+                    assert_eq!(effects.held(cell).unwrap().ground, Ground::Solid);
+                }
+            }
+        }
+        finish_weather(&mut app);
+    }
+
+    #[test]
+    fn rain_fades_over_the_board_before_adding_water() {
+        let mut app = interaction_app();
+        app.init_resource::<effects::Effects>();
+        app.world_mut().resource_mut::<Weather>().rain = 1;
+        app.update();
+        press_key(&mut app, KeyCode::KeyR);
+        let overlay = {
+            let world = app.world_mut();
+            world
+                .query_filtered::<Entity, With<RainOverlay>>()
+                .single(world)
+                .unwrap()
+        };
+        let sprite = app.world().get::<Sprite>(overlay).unwrap();
+        assert_eq!(
+            sprite.custom_size,
+            Some(Vec2::new(
+                BOARD_RIGHT - BOARD_LEFT,
+                BOARD_TOP - BOARD_BOTTOM
+            ))
+        );
+        assert_eq!(sprite.color.to_srgba().alpha, 0.0);
+        tick_coatl_animation(&mut app, 0.625);
+        let first = app
+            .world()
+            .get::<Sprite>(overlay)
+            .unwrap()
+            .color
+            .to_srgba()
+            .alpha;
+        tick_coatl_animation(&mut app, 0.625);
+        let peak = app
+            .world()
+            .get::<Sprite>(overlay)
+            .unwrap()
+            .color
+            .to_srgba()
+            .alpha;
+        tick_coatl_animation(&mut app, 0.625);
+        let last = app
+            .world()
+            .get::<Sprite>(overlay)
+            .unwrap()
+            .color
+            .to_srgba()
+            .alpha;
+        assert!(first > 0.0 && peak > first && (first - last).abs() < 0.001);
+        assert_eq!(terrain_count(&app, Ground::Water), 0);
+        tick_coatl_animation(&mut app, 0.625);
+        assert!(app.world().get_entity(overlay).is_err());
+        assert_eq!(terrain_count(&app, Ground::Water), 1);
+        assert!(app.world().resource::<TurnState>().effects_active);
+        finish_weather(&mut app);
+    }
+
+    #[test]
+    fn simultaneous_rain_and_earthquake_play_in_order() {
+        let mut app = interaction_app();
+        app.init_resource::<effects::Effects>();
+        {
+            let mut weather = app.world_mut().resource_mut::<Weather>();
+            weather.rain = 1;
+            weather.earthquake = 1;
+        }
+        app.update();
+        press_key(&mut app, KeyCode::KeyR);
+        assert!(matches!(
+            app.world()
+                .resource::<TurnState>()
+                .weather_animation
+                .as_ref()
+                .unwrap()
+                .phase,
+            WeatherPhase::Playing {
+                kind: WeatherKind::Rain,
+                ..
+            }
+        ));
+        tick_coatl_animation(&mut app, WEATHER_ANIMATION_SECONDS);
+        assert_eq!(terrain_count(&app, Ground::Water), 1);
+        assert!(app.world().resource::<TurnState>().effects_active);
+        assert_eq!(
+            terrain_count(&app, Ground::Ridge) + terrain_count(&app, Ground::Hole),
+            0
+        );
+        tick_coatl_animation(&mut app, 1.5);
+        app.update();
+        assert!(matches!(
+            app.world()
+                .resource::<TurnState>()
+                .weather_animation
+                .as_ref()
+                .unwrap()
+                .phase,
+            WeatherPhase::Playing {
+                kind: WeatherKind::Earthquake,
+                ..
+            }
+        ));
+        tick_coatl_animation(&mut app, WEATHER_ANIMATION_SECONDS);
+        assert_eq!(
+            terrain_count(&app, Ground::Ridge) + terrain_count(&app, Ground::Hole),
+            2
+        );
+        finish_weather(&mut app);
     }
 
     #[test]
@@ -6311,6 +6974,7 @@ mod tests {
             }
             app.world_mut().resource_mut::<Weather>().rain = 1;
             press_key(&mut app, KeyCode::KeyR);
+            finish_weather(&mut app);
             assert_eq!(terrain_count(&app, Ground::Water), expected);
             assert!(RAIN_INTERVAL.contains(&app.world().resource::<Weather>().rain));
         }
@@ -6333,6 +6997,7 @@ mod tests {
         move_player_to(&mut app, PlayerId::Two, players[1]);
         app.world_mut().resource_mut::<Weather>().earthquake = 1;
         press_key(&mut app, KeyCode::KeyR);
+        finish_weather(&mut app);
         assert_eq!(
             terrain_count(&app, Ground::Hole) + terrain_count(&app, Ground::Ridge),
             board::MAX_UNSAFE_TILES
@@ -6347,6 +7012,7 @@ mod tests {
         assert!(board.can_create_unsafe(&[]) && !board.can_create_unsafe(&[players[0]]));
         app.world_mut().resource_mut::<Weather>().earthquake = 1;
         press_key(&mut app, KeyCode::KeyR);
+        finish_weather(&mut app);
         assert_eq!(
             terrain_count(&app, Ground::Hole) + terrain_count(&app, Ground::Ridge),
             board::MAX_UNSAFE_TILES
@@ -6376,6 +7042,7 @@ mod tests {
             }
             app.world_mut().resource_mut::<Weather>().earthquake = 1;
             press_key(&mut app, KeyCode::KeyR);
+            finish_weather(&mut app);
             seen_ridge |= terrain_count(&app, Ground::Ridge) > 0;
             seen_hole |= terrain_count(&app, Ground::Hole) > 0;
         }
@@ -6413,6 +7080,7 @@ mod tests {
                 app.world_mut().resource_mut::<Weather>().earthquake = 1;
             }
             press_key(&mut app, KeyCode::KeyR);
+            finish_weather(&mut app);
             let board = app.world().resource::<Board>();
             assert_eq!(board.ground(item_cell), Some(Ground::Solid));
             assert_eq!(board.ground(IVec2::new(2, 0)), Some(Ground::Solid));

@@ -5,8 +5,8 @@ use bevy::{
 
 use crate::{
     AcidTile, Board, ElectricFlash, FireFlash, FrozenTile, GRID_BLOCK_SIZE, Ground, GroundTile,
-    PoisonTile, SteamFlash, TerrainGrowthKind, ThornTile, TurnState, VoidGrowthTile, help, menu,
-    spawn_board_terrain, update_aquatic_visuals,
+    PoisonTile, SteamFlash, TerrainGrowthKind, ThornTile, TurnState, VoidGrowthTile, effects, help,
+    menu, spawn_board_terrain, update_aquatic_visuals,
 };
 
 const TERRAIN_SHEET: &str = "basictilesheet.png";
@@ -179,14 +179,36 @@ fn visible_ground(board: &Board, turn: &TurnState, cell: IVec2) -> Option<Ground
     )
 }
 
+fn animated_ground(
+    board: &Board,
+    turn: &TurnState,
+    effects: Option<&effects::Effects>,
+    cell: IVec2,
+) -> Option<Ground> {
+    effects
+        .and_then(|effects| effects.held(cell))
+        .map(|state| state.ground)
+        .or_else(|| visible_ground(board, turn, cell))
+}
+
 fn tile_rect(column: u32) -> Rect {
     let x = column * SOURCE_TILE;
     Rect::new(x as f32, 0.0, (x + SOURCE_TILE) as f32, SOURCE_TILE as f32)
 }
 
 fn border_rect(board: &Board, turn: &TurnState, cell: IVec2, side: Side) -> Option<Rect> {
-    let center = visible_ground(board, turn, cell)?;
-    let neighbor = visible_ground(board, turn, cell + side.offset())?;
+    animated_border_rect(board, turn, None, cell, side)
+}
+
+fn animated_border_rect(
+    board: &Board,
+    turn: &TurnState,
+    effects: Option<&effects::Effects>,
+    cell: IVec2,
+    side: Side,
+) -> Option<Rect> {
+    let center = animated_ground(board, turn, effects, cell)?;
+    let neighbor = animated_ground(board, turn, effects, cell + side.offset())?;
     let first_column = match (center, neighbor) {
         (Ground::Water, Ground::Solid) => 4,
         (Ground::Water, Ground::Ridge) => 8,
@@ -209,6 +231,15 @@ fn normalize_mask(mut mask: u8) -> u8 {
 }
 
 fn effect_rect(effect: Effect, cell: IVec2, board: &Board) -> Rect {
+    animated_effect_rect(effect, cell, board, None)
+}
+
+fn animated_effect_rect(
+    effect: Effect,
+    cell: IVec2,
+    board: &Board,
+    effects: Option<&effects::Effects>,
+) -> Rect {
     let directions = [
         (IVec2::NEG_Y, 1),
         (IVec2::X, 2),
@@ -220,11 +251,21 @@ fn effect_rect(effect: Effect, cell: IVec2, board: &Board) -> Rect {
         (IVec2::new(-1, -1), 128),
     ];
     let mask = normalize_mask(directions.into_iter().fold(0, |mask, (offset, bit)| {
-        if effect.present(board, cell + offset) {
-            mask | bit
-        } else {
-            mask
-        }
+        let neighbor = cell + offset;
+        let present = effects
+            .and_then(|effects| effects.held(neighbor))
+            .map_or_else(
+                || effect.present(board, neighbor),
+                |old| match effect {
+                    Effect::Frozen => old.frozen,
+                    Effect::Poison => old.poison,
+                    Effect::Acid => old.acid && !old.electric_acid,
+                    Effect::ElectricAcid => old.electric_acid,
+                    Effect::Ember => old.fuel,
+                    _ => effect.present(board, neighbor),
+                },
+            );
+        if present { mask | bit } else { mask }
     }));
     let column = (0..mask)
         .filter(|&value| normalize_mask(value) == value)
@@ -300,22 +341,29 @@ fn attach_ground_art(
 fn update_ground_art(
     board: Res<Board>,
     turn: Res<TurnState>,
+    effects: Option<Res<effects::Effects>>,
     mut tiles: Query<(&GroundTile, &mut Sprite), Without<GroundArt>>,
     mut art: Query<(&GroundArt, &mut Sprite, &mut Visibility), Without<GroundTile>>,
 ) {
-    if !board.is_changed() && !turn.is_changed() {
+    if !board.is_changed()
+        && !turn.is_changed()
+        && !effects.as_ref().is_some_and(|e| e.is_changed())
+    {
         return;
     }
     for (tile, mut sprite) in &mut tiles {
         sprite.rect = Some(tile_rect(ground_index(
-            visible_ground(&board, &turn, tile.0).expect("terrain tile must be in bounds"),
+            animated_ground(&board, &turn, effects.as_deref(), tile.0)
+                .expect("terrain tile must be in bounds"),
         )));
         sprite.color = Color::WHITE;
     }
     for (piece, mut sprite, mut visibility) in &mut art {
         match piece.part {
             GroundArtPart::Border(side) => {
-                *visibility = if let Some(rect) = border_rect(&board, &turn, piece.cell, side) {
+                *visibility = if let Some(rect) =
+                    animated_border_rect(&board, &turn, effects.as_deref(), piece.cell, side)
+                {
                     sprite.rect = Some(rect);
                     Visibility::Inherited
                 } else {
@@ -323,8 +371,21 @@ fn update_ground_art(
                 };
             }
             GroundArtPart::Overlay(effect) => {
-                *visibility = if effect.present(&board, piece.cell) {
-                    sprite.rect = Some(effect_rect(effect, piece.cell, &board));
+                let present = if effect == Effect::Ember {
+                    effects
+                        .as_ref()
+                        .and_then(|effects| effects.held(piece.cell))
+                        .map_or_else(|| effect.present(&board, piece.cell), |old| old.fuel)
+                } else {
+                    effect.present(&board, piece.cell)
+                };
+                *visibility = if present {
+                    sprite.rect = Some(animated_effect_rect(
+                        effect,
+                        piece.cell,
+                        &board,
+                        effects.as_deref(),
+                    ));
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
@@ -347,6 +408,7 @@ type EffectMarkers = Or<(
 
 type EffectSprite = (
     &'static mut Sprite,
+    &'static mut Visibility,
     &'static Transform,
     Option<&'static FrozenTile>,
     Option<&'static PoisonTile>,
@@ -361,10 +423,22 @@ type EffectSprite = (
 fn update_effect_art(
     sheet: Res<GroundSheet>,
     board: Res<Board>,
+    effects: Option<Res<effects::Effects>>,
     mut sprites: Query<EffectSprite, EffectMarkers>,
 ) {
-    for (mut sprite, transform, frozen, poison, acid, growth, thorn, electric, steam, fire) in
-        &mut sprites
+    for (
+        mut sprite,
+        mut visibility,
+        transform,
+        frozen,
+        poison,
+        acid,
+        growth,
+        thorn,
+        electric,
+        steam,
+        fire,
+    ) in &mut sprites
     {
         let (cell, effect) = if let Some(tile) = frozen {
             (tile.0, Effect::Frozen)
@@ -373,7 +447,14 @@ fn update_effect_art(
         } else if let Some(tile) = acid {
             (
                 tile.0,
-                if board.is_electrified_acid(tile.0) {
+                if effects
+                    .as_ref()
+                    .and_then(|effects| effects.held(tile.0))
+                    .map_or_else(
+                        || board.is_electrified_acid(tile.0),
+                        |old| old.electric_acid,
+                    )
+                {
                     Effect::ElectricAcid
                 } else {
                     Effect::Acid
@@ -408,13 +489,32 @@ fn update_effect_art(
         } else {
             continue;
         };
+        if frozen.is_some() || poison.is_some() || acid.is_some() {
+            *visibility = if effects::visible_effect(
+                effects.as_deref(),
+                cell,
+                frozen.is_some(),
+                poison.is_some(),
+                acid.is_some(),
+                true,
+            ) {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
         let alpha = if electric || steam || fire {
             sprite.color.to_srgba().alpha
         } else {
             1.0
         };
         sprite.image = sheet.effects.clone();
-        sprite.rect = Some(effect_rect(effect, cell, &board));
+        sprite.rect = Some(animated_effect_rect(
+            effect,
+            cell,
+            &board,
+            effects.as_deref(),
+        ));
         sprite.color = Color::srgba(1.0, 1.0, 1.0, alpha);
         sprite.custom_size = Some(Vec2::splat(GRID_BLOCK_SIZE));
     }
@@ -592,6 +692,84 @@ mod tests {
                 && matches!(piece.part, GroundArtPart::Border(Side::Top))
                 && *visibility == Visibility::Hidden
         }));
+    }
+
+    #[test]
+    fn terrain_and_hazards_reveal_after_their_animations() {
+        let mut app = App::new();
+        app.init_resource::<Board>()
+            .init_resource::<TurnState>()
+            .init_resource::<Time>()
+            .init_resource::<effects::Effects>()
+            .init_resource::<GroundSheet>()
+            .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
+            .add_systems(
+                Update,
+                (
+                    effects::advance,
+                    effects::capture,
+                    crate::update_frozen_tiles,
+                    crate::update_poison_visuals,
+                    crate::update_acid_visuals,
+                    update_ground_art,
+                    update_effect_art,
+                )
+                    .chain(),
+            );
+        app.update();
+        let cell = IVec2::new(4, 3);
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.make_water(cell);
+            board.add_poison(cell);
+            board.add_acid(cell);
+            assert!(board.freeze_water(cell));
+        }
+        let frozen = app
+            .world_mut()
+            .spawn((FrozenTile(cell), Sprite::default(), Transform::default()))
+            .id();
+        app.update();
+        {
+            let world = app.world_mut();
+            let mut tiles = world.query::<(&GroundTile, &Sprite)>();
+            assert_eq!(
+                tiles
+                    .iter(world)
+                    .find(|(tile, _)| tile.0 == cell)
+                    .unwrap()
+                    .1
+                    .rect,
+                Some(tile_rect(0))
+            );
+            assert_eq!(world.query::<&PoisonTile>().iter(world).count(), 0);
+            assert_eq!(world.query::<&AcidTile>().iter(world).count(), 0);
+            assert_eq!(
+                *world.get::<Visibility>(frozen).unwrap(),
+                Visibility::Hidden
+            );
+        }
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.5));
+        app.update();
+        let world = app.world_mut();
+        let mut tiles = world.query::<(&GroundTile, &Sprite)>();
+        assert_eq!(
+            tiles
+                .iter(world)
+                .find(|(tile, _)| tile.0 == cell)
+                .unwrap()
+                .1
+                .rect,
+            Some(tile_rect(1))
+        );
+        assert_eq!(world.query::<&PoisonTile>().iter(world).count(), 1);
+        assert_eq!(world.query::<&AcidTile>().iter(world).count(), 1);
+        assert_eq!(
+            *world.get::<Visibility>(frozen).unwrap(),
+            Visibility::Inherited
+        );
     }
 
     #[test]
