@@ -944,6 +944,9 @@ struct PendingAquaticCreature(IVec2);
 #[derive(Component)]
 struct SerpentPart;
 
+#[derive(Resource, Default)]
+struct SerpentSheet(Handle<Image>);
+
 #[derive(Component)]
 struct AquaticTile(IVec2);
 
@@ -1534,6 +1537,13 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
         })
         .load("players-animated-Sheet.png");
     spawn_players(&mut commands, player_sheet);
+    let serpent_sheet = asset_server
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::nearest();
+        })
+        .load("quezacuatl-Sheet.png");
+    commands.insert_resource(SerpentSheet(serpent_sheet));
 }
 
 fn spawn_players(commands: &mut Commands, sheet: Handle<Image>) {
@@ -2852,9 +2862,67 @@ fn trigger_placed_frost(
     }
 }
 
+fn serpent_sprite(visual: &serpent::SerpentVisual, image: Handle<Image>) -> (Sprite, Transform) {
+    let [head, middle, tail] = visual.cells.as_slice() else {
+        unreachable!("serpents must occupy three cells");
+    };
+    let heading = *head - *middle;
+    let tail_direction = *tail - *middle;
+    let straight = heading == -tail_direction;
+    let flipped = !straight && tail_direction != IVec2::new(-heading.y, heading.x);
+    let angle = match heading {
+        IVec2::X => 0.0,
+        IVec2::Y => -std::f32::consts::FRAC_PI_2,
+        IVec2::NEG_X => std::f32::consts::PI,
+        IVec2::NEG_Y => std::f32::consts::FRAC_PI_2,
+        _ => unreachable!("serpent cells must be cardinally adjacent"),
+    };
+    let rotation = Quat::from_rotation_z(angle);
+    // Both poses use 32-pixel grid cells, with artwork extending below the grid.
+    let (frame, width, height, grid_height) = if straight {
+        (
+            2 + usize::from(visual.venomous) * 2 + visual.straight_frame,
+            96.0,
+            40.0,
+            32.0,
+        )
+    } else {
+        (usize::from(visual.venomous), 64.0, 68.0, 64.0)
+    };
+    let scale = GRID_BLOCK_SIZE / 32.0;
+    let source_x = frame as f32 * 96.0;
+    let min = cell_center(*head)
+        .min(cell_center(*tail))
+        .min(cell_center(*middle));
+    let max = cell_center(*head)
+        .max(cell_center(*tail))
+        .max(cell_center(*middle));
+    let offset = Vec3::new(
+        0.0,
+        -(height - grid_height) * scale / 2.0 * if flipped { -1.0 } else { 1.0 },
+        0.0,
+    );
+    let center = ((min + max) / 2.0).extend(0.7) + rotation * offset;
+    (
+        Sprite {
+            image,
+            rect: Some(Rect::new(source_x, 0.0, source_x + width, height)),
+            custom_size: Some(Vec2::new(width, height) * scale),
+            flip_y: flipped,
+            ..default()
+        },
+        Transform {
+            translation: center,
+            rotation,
+            ..default()
+        },
+    )
+}
+
 fn update_serpent_visuals(
     mut commands: Commands,
     turn: Res<TurnState>,
+    sheet: Res<SerpentSheet>,
     parts: Query<Entity, With<SerpentPart>>,
     mut displayed: Local<(Vec<serpent::SerpentVisual>, Option<IVec2>)>,
 ) {
@@ -2876,40 +2944,8 @@ fn update_serpent_visuals(
         commands.entity(entity).despawn();
     }
     for visual in &current.0 {
-        for (index, cell) in visual.cells.iter().enumerate() {
-            let center = cell_center(*cell);
-            let color = if index == 0 && visual.venomous {
-                Color::srgb(0.65, 0.22, 0.75)
-            } else if index == 0 {
-                Color::srgb(0.15, 0.82, 0.65)
-            } else {
-                Color::srgb(0.05, 0.48 - 0.08 * index as f32, 0.37)
-            };
-            commands
-                .spawn((
-                    SerpentPart,
-                    Sprite {
-                        color,
-                        custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 12.0)),
-                        ..default()
-                    },
-                    Transform::from_xyz(center.x, center.y, 0.7),
-                ))
-                .with_children(|part| {
-                    if index == 0 {
-                        for x in [-9.0, 9.0] {
-                            part.spawn((
-                                Sprite {
-                                    color: Color::WHITE,
-                                    custom_size: Some(Vec2::splat(6.0)),
-                                    ..default()
-                                },
-                                Transform::from_xyz(x, 8.0, 0.1),
-                            ));
-                        }
-                    }
-                });
-        }
+        let (sprite, transform) = serpent_sprite(visual, sheet.0.clone());
+        commands.spawn((SerpentPart, sprite, transform));
     }
     if let Some(cell) = current.1 {
         let center = cell_center(cell);
@@ -5975,6 +6011,127 @@ mod tests {
     use rand::SeedableRng;
 
     #[test]
+    fn serpent_sprites_align_head_body_and_tail_for_all_orientations() {
+        let middle = IVec2::new(4, 3);
+        for heading in [IVec2::X, IVec2::Y, IVec2::NEG_X, IVec2::NEG_Y] {
+            for tail_direction in [
+                -heading,
+                IVec2::new(-heading.y, heading.x),
+                IVec2::new(heading.y, -heading.x),
+            ] {
+                for (frame, venomous) in [(0, false), (1, false), (0, true), (1, true)] {
+                    let cells = vec![middle + heading, middle, middle + tail_direction];
+                    let visual = serpent::SerpentVisual {
+                        cells: cells.clone(),
+                        venomous,
+                        straight_frame: frame,
+                    };
+                    let (sprite, transform) = serpent_sprite(&visual, Handle::default());
+                    let straight = tail_direction == -heading;
+                    let rect = sprite.rect.unwrap();
+                    assert_eq!(
+                        rect.min.x,
+                        if straight {
+                            (2 + usize::from(venomous) * 2 + frame) as f32 * 96.0
+                        } else {
+                            usize::from(venomous) as f32 * 96.0
+                        }
+                    );
+                    let pixels = if straight {
+                        [
+                            Vec2::new(80.0, 16.0),
+                            Vec2::new(48.0, 16.0),
+                            Vec2::new(16.0, 16.0),
+                        ]
+                    } else {
+                        [
+                            Vec2::new(48.0, 16.0),
+                            Vec2::new(16.0, 16.0),
+                            Vec2::new(16.0, 48.0),
+                        ]
+                    };
+                    let source_size = rect.size();
+                    for (pixel, cell) in pixels.into_iter().zip(cells) {
+                        let mut local =
+                            Vec2::new(pixel.x - source_size.x / 2.0, source_size.y / 2.0 - pixel.y)
+                                * (GRID_BLOCK_SIZE / 32.0);
+                        if sprite.flip_y {
+                            local.y = -local.y;
+                        }
+                        let world = transform.translation + transform.rotation * local.extend(0.0);
+                        assert!(
+                            world.truncate().distance(cell_center(cell)) < 0.001,
+                            "heading {heading:?}, tail {tail_direction:?}, cell {cell:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serpent_rendering_tracks_straight_and_corner_animation_steps() {
+        let mut app = interaction_app();
+        let visual = |cells, straight_frame, venomous| serpent::SerpentVisual {
+            cells,
+            venomous,
+            straight_frame,
+        };
+        let initial = visual(
+            vec![IVec2::new(4, 3), IVec2::new(3, 3), IVec2::new(2, 3)],
+            0,
+            false,
+        );
+        let frames = [
+            visual(
+                vec![IVec2::new(5, 3), IVec2::new(4, 3), IVec2::new(3, 3)],
+                1,
+                true,
+            ),
+            visual(
+                vec![IVec2::new(5, 2), IVec2::new(5, 3), IVec2::new(4, 3)],
+                1,
+                true,
+            ),
+            visual(
+                vec![IVec2::new(5, 1), IVec2::new(5, 2), IVec2::new(5, 3)],
+                0,
+                true,
+            ),
+            visual(
+                vec![IVec2::new(5, 0), IVec2::new(5, 1), IVec2::new(5, 2)],
+                1,
+                false,
+            ),
+        ];
+        app.world_mut()
+            .resource_mut::<TurnState>()
+            .serpent_animation = Some(SerpentAnimation {
+            visuals: vec![initial],
+            impact: None,
+            frames: frames
+                .into_iter()
+                .map(|visual| SerpentAnimationFrame {
+                    visuals: vec![visual],
+                    hit: None,
+                    impact: None,
+                })
+                .collect(),
+            timer: Timer::from_seconds(SERPENT_STEP_SECONDS, TimerMode::Once),
+        });
+        app.update();
+        for expected_x in [192.0, 480.0, 96.0, 384.0, 288.0] {
+            let world = app.world_mut();
+            let mut sprites = world.query_filtered::<&Sprite, With<SerpentPart>>();
+            assert_eq!(
+                sprites.single(world).unwrap().rect.unwrap().min.x,
+                expected_x
+            );
+            tick_coatl_animation(&mut app, SERPENT_STEP_SECONDS + 0.01);
+        }
+    }
+
+    #[test]
     fn players_use_their_own_frames_from_the_shared_sprite_sheet() {
         let mut app = App::new();
         app.init_resource::<Assets<Image>>();
@@ -6647,6 +6804,7 @@ mod tests {
             .init_resource::<Board>()
             .init_resource::<PlayerHealth>()
             .init_resource::<Time>()
+            .init_resource::<SerpentSheet>()
             .insert_resource(Weather {
                 rain: u16::MAX,
                 earthquake: u16::MAX,
@@ -8677,7 +8835,7 @@ mod tests {
                 );
                 assert!(!app.world().resource::<Board>().has_life_essence(target));
                 let world = app.world_mut();
-                assert_eq!(world.query::<&SerpentPart>().iter(world).count(), 3);
+                assert_eq!(world.query::<&SerpentPart>().iter(world).count(), 1);
                 assert_eq!(world.query::<&PendingCoatlEgg>().iter(world).count(), 0);
                 assert_eq!(world.query::<&PendingLifeEssence>().iter(world).count(), 0);
 
@@ -9167,7 +9325,7 @@ mod tests {
         assert_eq!(animation.visuals[0].cells[0], IVec2::new(5, 3));
         assert_eq!(animation.impact, Some(IVec2::new(5, 3)));
         let world = app.world_mut();
-        assert_eq!(world.query::<&SerpentPart>().iter(world).count(), 4);
+        assert_eq!(world.query::<&SerpentPart>().iter(world).count(), 2);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         tick_coatl_animation(&mut app, 0.4);
@@ -9290,7 +9448,20 @@ mod tests {
             .unwrap();
         assert!(animation.visuals[0].venomous);
         assert_eq!(animation.impact, Some(victim));
+        let expected = serpent_sprite(&animation.visuals[0], Handle::default())
+            .0
+            .rect;
         assert_eq!(app.world().resource::<PlayerHealth>().0, [0, 9]);
+        {
+            let world = app.world_mut();
+            let mut serpents = world.query_filtered::<(Entity, &Sprite), With<SerpentPart>>();
+            let (entity, sprite) = serpents
+                .iter(world)
+                .find(|(_, sprite)| sprite.rect.is_some())
+                .unwrap();
+            assert_eq!(sprite.rect, expected);
+            assert!(world.get::<Children>(entity).is_none());
+        }
         finish_coatl_animation(&mut app);
     }
 

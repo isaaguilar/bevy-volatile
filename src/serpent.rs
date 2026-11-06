@@ -11,12 +11,14 @@ const STEPS_PER_TURN: usize = 2;
 pub struct Serpent {
     body: Vec<IVec2>,
     poison_age: Option<u8>,
+    straight_frame: usize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SerpentVisual {
     pub cells: Vec<IVec2>,
     pub venomous: bool,
+    pub straight_frame: usize,
 }
 
 pub struct SerpentStep {
@@ -58,6 +60,7 @@ impl Serpent {
                 let snake = Self {
                     body: body.clone(),
                     poison_age: None,
+                    straight_frame: 0,
                 };
                 let routes = players.map(|cell| {
                     cell.and_then(|cell| snake.route(board, cell))
@@ -74,6 +77,7 @@ impl Serpent {
         Self {
             body,
             poison_age: None,
+            straight_frame: 0,
         }
     }
 
@@ -90,6 +94,7 @@ impl Serpent {
         SerpentVisual {
             cells: self.body.clone(),
             venomous: self.venomous(),
+            straight_frame: self.straight_frame,
         }
     }
 
@@ -151,6 +156,9 @@ impl Serpent {
             };
             self.body.insert(0, next);
             self.body.truncate(LENGTH);
+            if self.body[0] - self.body[1] == self.body[1] - self.body[2] {
+                self.straight_frame ^= 1;
+            }
             if board.ground(next) == Some(Ground::Hole) || board.is_acidic(next) {
                 steps.push(SerpentStep {
                     visual: self.visual(),
@@ -253,7 +261,50 @@ mod tests {
         Serpent {
             body: body.to_vec(),
             poison_age: None,
+            straight_frame: 0,
         }
+    }
+
+    #[test]
+    fn straight_frames_alternate_on_steps_and_persist_without_movement() {
+        let board = Board::default();
+        let mut serpent = snake(&[IVec2::new(3, 3), IVec2::new(2, 3), IVec2::new(1, 3)]);
+        let mut health = [10, 10];
+        let mut steps = Vec::new();
+        assert!(serpent.advance_animated(
+            &board,
+            [Some(IVec2::new(9, 3)), None],
+            &mut health,
+            &mut steps
+        ));
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.visual.straight_frame)
+                .collect::<Vec<_>>(),
+            [1, 0]
+        );
+        assert_eq!(serpent.visual().straight_frame, 0);
+        steps.clear();
+        assert!(serpent.advance_animated(&board, [None, None], &mut health, &mut steps));
+        assert!(steps.is_empty());
+        assert_eq!(serpent.visual().straight_frame, 0);
+    }
+
+    #[test]
+    fn turning_uses_the_corner_without_advancing_the_straight_frame() {
+        let board = Board::default();
+        let mut serpent = snake(&[IVec2::new(3, 3), IVec2::new(2, 3), IVec2::new(1, 3)]);
+        let mut steps = Vec::new();
+        serpent.advance_animated(
+            &board,
+            [Some(IVec2::new(3, 0)), None],
+            &mut [10, 10],
+            &mut steps,
+        );
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].visual.straight_frame, 0);
+        assert_eq!(steps[1].visual.straight_frame, 1);
     }
 
     #[test]
