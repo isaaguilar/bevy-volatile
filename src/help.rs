@@ -1065,4 +1065,36 @@ mod tests {
             Some(SelectedAction::Item { index: 1, .. })
         ));
     }
+
+    #[test]
+    fn escape_closes_help_before_pausing_the_match() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<BoardCursor>()
+            .init_resource::<Selection>()
+            .init_resource::<ai::BotController>()
+            .init_resource::<PlayerHealth>()
+            .insert_resource(menu::Frontend::computer_match())
+            .insert_resource(Help {
+                item: Some(1),
+                ..default()
+            })
+            .add_systems(
+                Update,
+                (menu::pause_match, input.run_if(menu::in_game)).chain(),
+            );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Escape);
+        app.update();
+        assert_eq!(app.world().resource::<Help>().item, None);
+        assert!(app.world().resource::<menu::Frontend>().computer_game());
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.release(KeyCode::Escape);
+        keys.clear();
+        keys.press(KeyCode::Escape);
+        app.update();
+        assert!(!app.world().resource::<menu::Frontend>().computer_game());
+    }
 }

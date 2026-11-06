@@ -16,6 +16,12 @@ pub(crate) fn plugin(app: &mut App) {
         .add_systems(Startup, render_screen.after(crate::setup))
         .add_systems(
             Update,
+            pause_match
+                .after(crate::reset_match)
+                .before(GameplaySystems),
+        )
+        .add_systems(
+            Update,
             (
                 detect_game_over,
                 handle_frontend,
@@ -35,6 +41,7 @@ enum Screen {
     Credits,
     Rulebook,
     Game,
+    Paused,
     GameOver,
 }
 
@@ -57,6 +64,8 @@ pub(crate) struct Frontend {
     screen: Screen,
     mode: Option<GameMode>,
     outcome: Option<Outcome>,
+    match_in_progress: bool,
+    pause_opened: bool,
     restart_requested: bool,
     timer: Timer,
     selected: usize,
@@ -72,6 +81,8 @@ impl Default for Frontend {
             screen: Screen::BevySplash,
             mode: None,
             outcome: None,
+            match_in_progress: false,
+            pause_opened: false,
             restart_requested: false,
             timer: Timer::from_seconds(SPLASH_SECONDS, TimerMode::Once),
             selected: 0,
@@ -97,8 +108,20 @@ impl Frontend {
 
     fn show(&mut self, screen: Screen) {
         self.screen = screen;
+        if matches!(screen, Screen::Title | Screen::Paused) {
+            self.selected = 0;
+        }
         self.timer.reset();
         self.dirty = true;
+    }
+
+    fn actions(&self) -> &'static [(MenuAction, &'static str)] {
+        match self.screen {
+            Screen::Title if self.match_in_progress => &ACTIVE_TITLE_ACTIONS,
+            Screen::Title => &TITLE_ACTIONS,
+            Screen::Paused => &PAUSE_ACTIONS,
+            _ => &[],
+        }
     }
 
     fn activate(&mut self, action: MenuAction) {
@@ -106,15 +129,19 @@ impl Frontend {
             MenuAction::Computer => {
                 self.mode = Some(GameMode::Computer);
                 self.outcome = None;
+                self.match_in_progress = true;
                 self.restart_requested = true;
                 self.show(Screen::Game);
             }
             MenuAction::TwoPlayer => {
                 self.mode = Some(GameMode::TwoPlayer);
                 self.outcome = None;
+                self.match_in_progress = true;
                 self.restart_requested = true;
                 self.show(Screen::Game);
             }
+            MenuAction::Resume if self.match_in_progress => self.show(Screen::Game),
+            MenuAction::Resume => {}
             MenuAction::Credits => self.show(Screen::Credits),
             MenuAction::Rulebook => {
                 self.page = 0;
@@ -144,6 +171,7 @@ struct SplashImage;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAction {
     Computer,
+    Resume,
     #[allow(dead_code)]
     TwoPlayer,
     Credits,
@@ -158,6 +186,32 @@ const TITLE_ACTIONS: [(MenuAction, &str); 3] = [
     (MenuAction::Credits, "CREDITS"),
     (MenuAction::Rulebook, "RULEBOOK"),
 ];
+
+const ACTIVE_TITLE_ACTIONS: [(MenuAction, &str); 4] = [
+    (MenuAction::Resume, "RESUME"),
+    (MenuAction::Computer, "START NEW GAME"),
+    (MenuAction::Credits, "CREDITS"),
+    (MenuAction::Rulebook, "RULEBOOK"),
+];
+
+const PAUSE_ACTIONS: [(MenuAction, &str); 2] = [
+    (MenuAction::Resume, "RESUME"),
+    (MenuAction::Back, "BACK TO MENU"),
+];
+
+pub(crate) fn pause_match(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    help: Option<Res<crate::help::Help>>,
+    mut frontend: ResMut<Frontend>,
+) {
+    if frontend.computer_game()
+        && keyboard.just_pressed(KeyCode::Escape)
+        && help.is_none_or(crate::help::closed)
+    {
+        frontend.show(Screen::Paused);
+        frontend.pause_opened = true;
+    }
+}
 
 pub(crate) fn detect_game_over(
     health: Res<PlayerHealth>,
@@ -179,6 +233,7 @@ pub(crate) fn detect_game_over(
     };
     if let Some(outcome) = outcome {
         frontend.outcome = Some(outcome);
+        frontend.match_in_progress = false;
         frontend.show(Screen::GameOver);
     }
 }
@@ -242,22 +297,31 @@ fn handle_frontend(
         return;
     }
 
-    if frontend.screen == Screen::Title {
+    if std::mem::take(&mut frontend.pause_opened) {
+        return;
+    }
+
+    if matches!(frontend.screen, Screen::Title | Screen::Paused) {
+        if frontend.screen == Screen::Paused && keyboard.just_pressed(KeyCode::Escape) {
+            frontend.activate(MenuAction::Resume);
+            return;
+        }
+        let actions = frontend.actions();
         for (hovered, action, _) in &mut buttons {
             if hovered.is_changed()
                 && hovered.0
-                && let Some(index) = TITLE_ACTIONS.iter().position(|(item, _)| item == action)
+                && let Some(index) = actions.iter().position(|(item, _)| item == action)
             {
                 frontend.selected = index;
             }
         }
         if keyboard.just_pressed(KeyCode::ArrowDown) {
-            frontend.selected = (frontend.selected + 1) % TITLE_ACTIONS.len();
+            frontend.selected = (frontend.selected + 1) % actions.len();
         } else if keyboard.just_pressed(KeyCode::ArrowUp) {
-            frontend.selected = (frontend.selected + TITLE_ACTIONS.len() - 1) % TITLE_ACTIONS.len();
+            frontend.selected = (frontend.selected + actions.len() - 1) % actions.len();
         }
         if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
-            let action = TITLE_ACTIONS[frontend.selected].0;
+            let action = actions[frontend.selected].0;
             frontend.activate(action);
             return;
         }
@@ -273,12 +337,11 @@ fn handle_frontend(
     }
 
     for (hovered, action, mut background) in &mut buttons {
-        let selected =
-            frontend.screen == Screen::Title && TITLE_ACTIONS[frontend.selected].0 == *action;
-        let highlighted = if frontend.screen == Screen::Title {
-            selected
-        } else {
+        let actions = frontend.actions();
+        let highlighted = if actions.is_empty() {
             hovered.0
+        } else {
+            actions[frontend.selected].0 == *action
         };
         background.0 = if highlighted {
             Color::srgb(0.40, 0.28, 0.14)
@@ -318,11 +381,13 @@ fn render_screen(
                 justify_content: JustifyContent::Center,
                 ..default()
             },
-            BackgroundColor(if frontend.screen == Screen::GameOver {
-                Color::srgba(0.0, 0.0, 0.0, 0.65)
-            } else {
-                Color::BLACK
-            }),
+            BackgroundColor(
+                if matches!(frontend.screen, Screen::GameOver | Screen::Paused) {
+                    Color::srgba(0.0, 0.0, 0.0, 0.65)
+                } else {
+                    Color::BLACK
+                },
+            ),
             GlobalZIndex(100),
         ))
         .id();
@@ -347,9 +412,10 @@ fn render_screen(
                     Pickable::IGNORE,
                 ));
             }
-            Screen::Title => title_screen(parent, &asset_server),
+            Screen::Title => title_screen(parent, &asset_server, frontend.actions()),
             Screen::Credits => credits_screen(parent),
             Screen::Rulebook => rulebook_screen(parent, &frontend),
+            Screen::Paused => pause_screen(parent),
             Screen::GameOver => {
                 game_over_screen(parent, frontend.outcome.expect("game has an outcome"))
             }
@@ -371,7 +437,11 @@ fn fade_splash(frontend: Res<Frontend>, mut images: Query<&mut ImageNode, With<S
     }
 }
 
-fn title_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
+fn title_screen(
+    parent: &mut ChildSpawnerCommands,
+    assets: &AssetServer,
+    actions: &[(MenuAction, &str)],
+) {
     let mut background = ImageNode::new(assets.load("backgroundboard.png"));
     background.color = Color::srgb(0.19, 0.16, 0.12);
     parent.spawn((
@@ -412,10 +482,33 @@ fn title_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
                 ..default()
             })
             .with_children(|options| {
-                for (action, label) in TITLE_ACTIONS {
+                for &(action, label) in actions {
                     button(options, action, label, 46.0);
                 }
             });
+        });
+}
+
+fn pause_screen(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn((
+            Node {
+                width: Val::Px(360.0),
+                padding: UiRect::all(Val::Px(24.0)),
+                border: UiRect::all(Val::Px(3.0)),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(24.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.08, 0.06, 0.05, 0.96)),
+            BorderColor::all(GOLD),
+        ))
+        .with_children(|content| {
+            text(content, "PAUSED", 52.0, GOLD);
+            for (action, label) in PAUSE_ACTIONS {
+                button(content, action, label, 46.0);
+            }
         });
 }
 
@@ -553,6 +646,112 @@ fn button(parent: &mut ChildSpawnerCommands, action: MenuAction, label: &str, he
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[derive(Resource, Default)]
+    struct GameTicks(u32);
+
+    fn tick_game(mut ticks: ResMut<GameTicks>) {
+        ticks.0 += 1;
+    }
+
+    fn tap(app: &mut App, key: KeyCode) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+        app.update();
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.release(key);
+        keys.clear();
+    }
+
+    #[test]
+    fn pause_and_menu_preserve_a_match_until_resume_or_new_game() {
+        let mut frontend = Frontend::computer_match();
+        assert!(frontend.take_restart_request());
+        let mut app = App::new();
+        app.insert_resource(frontend)
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(PlayerHealth([7, 4]))
+            .init_resource::<GameTicks>()
+            .add_systems(
+                Update,
+                (
+                    pause_match,
+                    tick_game.run_if(in_game),
+                    detect_game_over,
+                    handle_frontend,
+                )
+                    .chain(),
+            );
+        app.update();
+        assert_eq!(app.world().resource::<GameTicks>().0, 1);
+        tap(&mut app, KeyCode::Escape);
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Paused);
+        assert_eq!(app.world().resource::<GameTicks>().0, 1);
+        app.update();
+        assert_eq!(app.world().resource::<GameTicks>().0, 1);
+
+        tap(&mut app, KeyCode::ArrowDown);
+        tap(&mut app, KeyCode::Enter);
+        let frontend = app.world().resource::<Frontend>();
+        assert_eq!(frontend.screen, Screen::Title);
+        assert_eq!(frontend.actions(), ACTIVE_TITLE_ACTIONS);
+        assert_eq!(app.world().resource::<GameTicks>().0, 1);
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [7, 4]);
+
+        tap(&mut app, KeyCode::Enter);
+        let frontend = app.world_mut().resource_mut::<Frontend>();
+        assert_eq!(frontend.screen, Screen::Game);
+        assert!(!frontend.restart_requested);
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [7, 4]);
+        app.update();
+        assert_eq!(app.world().resource::<GameTicks>().0, 2);
+
+        tap(&mut app, KeyCode::Escape);
+        tap(&mut app, KeyCode::Escape);
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Game);
+        assert_eq!(app.world().resource::<GameTicks>().0, 2);
+        tap(&mut app, KeyCode::Escape);
+        tap(&mut app, KeyCode::ArrowDown);
+        tap(&mut app, KeyCode::Enter);
+        tap(&mut app, KeyCode::ArrowDown);
+        tap(&mut app, KeyCode::Enter);
+        let mut frontend = app.world_mut().resource_mut::<Frontend>();
+        assert_eq!(frontend.screen, Screen::Game);
+        assert!(frontend.take_restart_request());
+    }
+
+    #[test]
+    fn finished_match_restores_the_normal_title_menu() {
+        let mut app = App::new();
+        app.insert_resource(Frontend::computer_match())
+            .insert_resource(PlayerHealth([0, 5]))
+            .add_systems(Update, detect_game_over);
+        app.update();
+        let mut frontend = app.world_mut().resource_mut::<Frontend>();
+        frontend.activate(MenuAction::Back);
+        assert_eq!(frontend.screen, Screen::Title);
+        assert_eq!(frontend.actions(), TITLE_ACTIONS);
+        frontend.activate(MenuAction::Resume);
+        assert_eq!(frontend.screen, Screen::Title);
+    }
+
+    #[test]
+    fn active_match_remains_resumable_after_visiting_rulebook_and_credits() {
+        let mut frontend = Frontend::computer_match();
+        frontend.take_restart_request();
+        frontend.show(Screen::Paused);
+        frontend.activate(MenuAction::Back);
+        for action in [MenuAction::Rulebook, MenuAction::Credits] {
+            frontend.activate(action);
+            frontend.activate(MenuAction::Back);
+            assert_eq!(frontend.actions(), ACTIVE_TITLE_ACTIONS);
+        }
+        frontend.activate(MenuAction::Resume);
+        assert_eq!(frontend.screen, Screen::Game);
+        assert!(!frontend.take_restart_request());
+    }
 
     #[test]
     fn computer_game_requests_a_fresh_match() {
