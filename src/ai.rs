@@ -206,7 +206,8 @@ fn choose_action(
                 cell: enemy,
             };
         }
-        if turn.frozen_turns[PlayerId::One.index()] == 0
+        if !turn.hovering[PlayerId::One.index()]
+            && turn.frozen_turns[PlayerId::One.index()] == 0
             && (!water
                 || hovering
                 || (enemy - cell).abs().max_element() > 1

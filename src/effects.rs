@@ -10,7 +10,7 @@ use crate::{
     board_cell, cell_center,
 };
 
-const FRAME_SECONDS: f32 = 0.25;
+const FRAME_SECONDS: f32 = 0.15;
 const FRAMES: usize = 6;
 const DURATION: f32 = FRAME_SECONDS * FRAMES as f32;
 const FRAME_SIZE: f32 = 48.0;
@@ -391,12 +391,12 @@ mod tests {
             Some(Effect::Water.rect(0))
         );
         assert!(app.world().resource::<TurnState>().animation_active());
-        tick(&mut app, FRAME_SECONDS);
+        tick(&mut app, 0.15);
         assert_eq!(
             app.world().get::<Sprite>(water).unwrap().rect,
             Some(Effect::Water.rect(1))
         );
-        tick(&mut app, DURATION - FRAME_SECONDS);
+        tick(&mut app, 0.751);
         assert!(app.world().resource::<Effects>().held(cell).is_none());
         assert!(!app.world().resource::<TurnState>().animation_active());
         assert!(app.world().get_entity(water).is_err());

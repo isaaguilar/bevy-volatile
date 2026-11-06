@@ -107,7 +107,7 @@ const GUIDES: [Guide; 14] = [
         ],
     },
     Guide {
-        basics: "A direct hit freezes a player for two turns, even if they are hovering.",
+        basics: "A direct hit freezes a grounded player for two turns. Hovering prevents freezing; frozen players cannot start hovering.",
         reactions: &[
             (
                 "Water",
