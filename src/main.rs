@@ -128,6 +128,7 @@ struct TurnState {
     actions_used: u8,
     undo: Option<UndoAction>,
     free_action: bool,
+    moved_while_hovering: bool,
     pending_placement: Option<PendingPlacement>,
     next_placement: Option<PendingPlacement>,
     pending_effects: TurnEffects,
@@ -267,6 +268,7 @@ impl Default for TurnState {
             actions_used: 0,
             undo: None,
             free_action: false,
+            moved_while_hovering: false,
             pending_placement: None,
             next_placement: None,
             pending_effects: TurnEffects::default(),
@@ -527,13 +529,13 @@ impl TurnState {
                 .saturating_add(recovery)
                 .min(MAX_STRENGTH);
         }
-        if self.hovering[index] {
+        if self.hovering[index] || self.moved_while_hovering {
             let unsafe_hover = positions.iter().any(|(player, cell, _)| {
                 player.index() == index
                     && cell.is_some_and(|cell| !board.ground(cell).is_some_and(Ground::walkable))
             });
             if !unsafe_hover || self.magic[index] > 1 {
-                self.magic[index] -= 1;
+                self.magic[index] = self.magic[index].saturating_sub(1);
             }
             if self.magic[index] == 0 {
                 self.hovering[index] = false;
@@ -544,6 +546,7 @@ impl TurnState {
         self.active = self.active.other();
         self.actions_used = 0;
         self.free_action = false;
+        self.moved_while_hovering = false;
         self.partial_rest = false;
         self.acted_this_frame = true;
         self.completed_turn = true;
@@ -710,6 +713,7 @@ struct ActionSlot {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
+    Move,
     Hover,
     Pickup,
     Rest,
@@ -719,10 +723,11 @@ enum Action {
 impl Action {
     fn row(self) -> usize {
         match self {
-            Self::Hover => 0,
-            Self::Pickup => 1,
-            Self::Rest => 2,
-            Self::Undo => 3,
+            Self::Move => 0,
+            Self::Hover => 1,
+            Self::Pickup => 2,
+            Self::Rest => 3,
+            Self::Undo => 4,
         }
     }
 }
@@ -766,6 +771,7 @@ enum UndoAction {
         origin: Vec2,
         strength: u8,
         hovering: bool,
+        moved_while_hovering: bool,
     },
     Placement {
         strength: u8,
@@ -1302,7 +1308,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
             .with_children(|parent| {
                 parent.spawn((
                     DropFeedback,
-                    Text::new("Click your character or an item to select it"),
+                    Text::new("Click Move or an item to select it"),
                     TextFont {
                         font_size: FontSize::Px(18.0),
                         ..default()
@@ -1347,6 +1353,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
         &mut commands,
         hud.0,
         [
+            asset_server.load("actions/move.png"),
             asset_server.load("actions/hover.png"),
             asset_server.load("actions/pickup.png"),
             asset_server.load("actions/rest.png"),
@@ -1535,7 +1542,7 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
     });
 }
 
-fn spawn_actions(commands: &mut Commands, hud: Entity, images: [Handle<Image>; 3]) {
+fn spawn_actions(commands: &mut Commands, hud: Entity, images: [Handle<Image>; 4]) {
     commands.entity(hud).with_children(|parent| {
         for owner in [PlayerId::One, PlayerId::Two] {
             let left = match owner {
@@ -1543,6 +1550,7 @@ fn spawn_actions(commands: &mut Commands, hud: Entity, images: [Handle<Image>; 3
                 PlayerId::Two => RESOLUTION_WIDTH - 3.0 * GRID_BLOCK_SIZE,
             };
             for (row, (action, label)) in [
+                (Action::Move, "Move"),
                 (Action::Hover, "Hover"),
                 (Action::Pickup, "Pick up"),
                 (Action::Rest, "Rest"),
@@ -1660,6 +1668,7 @@ fn update_action_slots(
     turn: Res<TurnState>,
     board: Res<Board>,
     cursor: Res<BoardCursor>,
+    selection: Res<Selection>,
     players: Query<(&Player, &Transform)>,
     items: Query<&Collectible>,
     mut slots: Query<(&ActionSlot, &mut BackgroundColor, &mut BorderColor)>,
@@ -1678,6 +1687,9 @@ fn update_action_slots(
             && slot.action == Action::Undo
             && turn.undo.is_some();
         let hover_on = slot.action == Action::Hover && turn.hovering[slot.owner.index()];
+        let move_selected = is_active
+            && slot.action == Action::Move
+            && matches!(selection.0, Some(SelectedAction::Movement { .. }));
         let hovered = is_active
             && cursor
                 .0
@@ -1687,7 +1699,7 @@ fn update_action_slots(
             Color::srgba(0.15, 0.55, 0.25, 0.9)
         } else if hover_on {
             Color::srgba(0.12, 0.35, 0.5, 0.9)
-        } else if hovered {
+        } else if hovered || move_selected {
             Color::srgba(0.45, 0.34, 0.16, 0.9)
         } else {
             Color::srgba(0.06, 0.04, 0.03, 0.82)
@@ -2218,7 +2230,7 @@ fn action_cell(position: Vec2, owner: PlayerId) -> Option<usize> {
     let y = BOARD_TOP - position.y;
     if !position.is_finite()
         || !(HEALTH_PANEL_INSET..GRID_BLOCK_SIZE - HEALTH_PANEL_INSET).contains(&x)
-        || !(0.0..4.0 * GRID_BLOCK_SIZE).contains(&y)
+        || !(0.0..5.0 * GRID_BLOCK_SIZE).contains(&y)
         || !(HEALTH_PANEL_INSET..GRID_BLOCK_SIZE - HEALTH_PANEL_INSET)
             .contains(&(y % GRID_BLOCK_SIZE))
     {
@@ -2266,6 +2278,7 @@ fn undo_action(
             origin,
             strength,
             hovering,
+            moved_while_hovering,
         } => {
             let (_, mut transform) = players
                 .iter_mut()
@@ -2274,6 +2287,7 @@ fn undo_action(
             transform.translation.x = origin.x;
             transform.translation.y = origin.y;
             turn.strength[index] = strength;
+            turn.moved_while_hovering = moved_while_hovering;
             turn.aquatic_contacts.clear();
             if board_cell(origin)
                 .is_some_and(|cell| !board.ground(cell).is_some_and(Ground::walkable))
@@ -2378,7 +2392,32 @@ fn handle_actions(
     if action == Action::Undo.row() {
         return;
     }
-    if action == 0 {
+    if action == Action::Move.row() {
+        let already_selected = matches!(selection.0, Some(SelectedAction::Movement { .. }));
+        clear_selection(&mut commands, &mut selection);
+        if already_selected {
+            feedback.0 = "Selection cancelled".into();
+        } else if turn.actions_used >= 2 {
+            feedback.0 = "Both actions have been used".into();
+        } else if turn.frozen_turns[index] > 0 {
+            feedback.0 = "Frozen in place - use an item, pick up, or rest".into();
+        } else if let Some(opponent) = players.iter().find_map(|(player, transform)| {
+            (player.0 == turn.active.other()).then_some(transform.translation.truncate())
+        }) {
+            selection.0 = Some(select_movement(
+                &mut commands,
+                position,
+                opponent,
+                &board,
+                turn.strength[index],
+                turn.hovering[index],
+                turn.magic[index],
+            ));
+            feedback.0 = "Green: walk | yellow: jump (1 energy) | Esc: cancel".into();
+        }
+        return;
+    }
+    if action == Action::Hover.row() {
         if turn.hovering[index] {
             if board_cell(position)
                 .is_some_and(|cell| !board.ground(cell).is_some_and(Ground::walkable))
@@ -2881,7 +2920,7 @@ fn highlight_inventory_hover(
     {
         feedback.0 = match hovered {
             Some((_, index)) => format!("{} - click to select", INVENTORY_ITEMS[index].0),
-            None => "Click your character or an item to select it".into(),
+            None => "Click Move or an item to select it".into(),
         };
     }
     hover.hovered = hovered;
@@ -3150,34 +3189,6 @@ fn handle_selection(
                     highlight,
                 });
                 feedback.0 = format!("{} selected - click a board cell", INVENTORY_ITEMS[index].0);
-            }
-            return;
-        }
-        if human_click
-            && !resolving_pending
-            && cell.is_some()
-            && cell == board_cell(player)
-            && !matches!(&selection.0, Some(SelectedAction::Item { .. }))
-        {
-            let already_selected = matches!(selection.0, Some(SelectedAction::Movement { .. }));
-            clear_selection(&mut commands, &mut selection);
-            if already_selected {
-                feedback.0 = "Selection cancelled".into();
-            } else if turn.actions_used >= 2 {
-                feedback.0 = "Both actions have been used".into();
-            } else if turn.frozen_turns[turn.active.index()] > 0 {
-                feedback.0 = "Frozen in place - use an item, pick up, or rest".into();
-            } else {
-                selection.0 = Some(select_movement(
-                    &mut commands,
-                    player,
-                    opponent,
-                    &board,
-                    turn.strength[turn.active.index()],
-                    turn.hovering[turn.active.index()],
-                    turn.magic[turn.active.index()],
-                ));
-                feedback.0 = "Green: walk | yellow: jump (1 energy) | Esc: cancel".into();
             }
             return;
         }
@@ -4300,8 +4311,10 @@ fn handle_selection(
                             origin: player,
                             strength: turn.strength[turn.active.index()],
                             hovering: turn.hovering[turn.active.index()],
+                            moved_while_hovering: turn.moved_while_hovering,
                         });
                     }
+                    turn.moved_while_hovering |= turn.hovering[turn.active.index()];
                     let center = cell_center(target.cell);
                     transform.translation.x = center.x;
                     transform.translation.y = center.y;
@@ -4399,9 +4412,7 @@ fn handle_selection(
                         },
                         item_energy_cost(target),
                     ),
-                    (None, None) if cell.is_some() => {
-                        "Click your character to select movement".into()
-                    }
+                    (None, None) if cell.is_some() => "Click Move to select movement".into(),
                     (None, None) => {
                         "Click a board cell, or click the item again / Esc to cancel".into()
                     }
@@ -5475,7 +5486,7 @@ mod tests {
             }
             let mut actions = world.query::<(&ActionSlot, &Visibility)>();
             let actions: Vec<_> = actions.iter(world).collect();
-            assert_eq!(actions.len(), 8);
+            assert_eq!(actions.len(), 10);
             for (action, visibility) in actions {
                 assert_eq!(
                     *visibility,
@@ -5500,7 +5511,7 @@ mod tests {
             );
             commands.spawn((
                 DropFeedback,
-                Text::new("Click your character or an item to select it"),
+                Text::new("Click Move or an item to select it"),
             ));
         }
 
@@ -5537,7 +5548,7 @@ mod tests {
         let mut feedback = world.query_filtered::<&Text, With<DropFeedback>>();
         assert_eq!(
             feedback.single(world).unwrap().0,
-            "Click your character or an item to select it"
+            "Click Move or an item to select it"
         );
     }
 
@@ -6151,6 +6162,14 @@ mod tests {
         app
     }
 
+    fn select_move(app: &mut App) {
+        let x = match app.world().resource::<TurnState>().active {
+            PlayerId::One => BOARD_LEFT - GRID_BLOCK_SIZE / 2.0,
+            PlayerId::Two => BOARD_RIGHT + GRID_BLOCK_SIZE / 2.0,
+        };
+        click_part(app, Vec2::new(x, BOARD_TOP - GRID_BLOCK_SIZE / 2.0));
+    }
+
     fn click(app: &mut App, position: Vec2) {
         // Reaction tests complete the unused part with rest; use click_part to test turn sequencing.
         let started_partial = {
@@ -6257,11 +6276,10 @@ mod tests {
             rain: 2,
             earthquake: 3,
         };
-        let start = IVec2::new(5, 3);
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(IVec2::new(6, 3)));
         assert_eq!(app.world().resource::<Weather>().rain, 2);
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         assert_eq!(app.world().resource::<Weather>().earthquake, 3);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<Weather>().rain, 1);
@@ -6414,7 +6432,6 @@ mod tests {
     #[test]
     fn placement_waits_for_movement_and_explosion_uses_final_positions() {
         let mut app = interaction_app();
-        let start = IVec2::new(5, 3);
         let oil = IVec2::new(6, 3);
         let destination = IVec2::new(4, 3);
         app.world_mut().resource_mut::<Board>().add_oil(oil);
@@ -6434,7 +6451,7 @@ mod tests {
             .unwrap();
         assert_eq!(text.0, "ACTIONS: 1 AVAILABLE | REST: +2");
 
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(destination));
         assert!(!app.world().resource::<Board>().has_oil(oil));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
@@ -6453,13 +6470,12 @@ mod tests {
     #[test]
     fn queued_direct_hit_uses_the_players_final_tile() {
         let mut app = interaction_app();
-        let start = IVec2::new(5, 3);
         let target = IVec2::new(6, 3);
         click_part(&mut app, Vec2::new(-450.0, 120.0));
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert!(!app.world().resource::<Board>().is_frozen(target));
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 2);
@@ -6478,7 +6494,6 @@ mod tests {
     fn moving_then_placing_or_picking_up_completes_one_turn() {
         for pickup in [false, true] {
             let mut app = interaction_app();
-            let start = IVec2::new(5, 3);
             let destination = IVec2::new(6, 3);
             let target = IVec2::new(6, 2);
             app.world_mut().resource_mut::<TurnState>().strength[0] = 1;
@@ -6493,13 +6508,13 @@ mod tests {
                     },
                 ));
             }
-            click_part(&mut app, cell_center(start));
+            select_move(&mut app);
             click_part(&mut app, cell_center(destination));
             assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
             assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
             assert_eq!(app.world().resource::<TurnState>().strength[0], 1);
             if pickup {
-                click_part(&mut app, Vec2::new(-330.0, 120.0));
+                click_part(&mut app, Vec2::new(-330.0, 60.0));
                 assert_eq!(
                     app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
                     1
@@ -6524,7 +6539,7 @@ mod tests {
             let next = IVec2::new(6, 3);
             match first {
                 "move" => {
-                    click_part(&mut app, cell_center(start));
+                    select_move(&mut app);
                     click_part(&mut app, cell_center(next));
                 }
                 "placement" => {
@@ -6542,9 +6557,9 @@ mod tests {
                             cell: start,
                         },
                     ));
-                    click_part(&mut app, Vec2::new(-330.0, 120.0));
+                    click_part(&mut app, Vec2::new(-330.0, 60.0));
                     assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
-                    click_part(&mut app, cell_center(start));
+                    select_move(&mut app);
                     click_part(&mut app, cell_center(next));
                     assert_eq!(app.world().resource::<TurnState>().strength[0], 1);
                     assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
@@ -6567,13 +6582,12 @@ mod tests {
     #[test]
     fn queued_placement_reserves_energy_before_a_jump() {
         let mut app = interaction_app();
-        let start = IVec2::new(5, 3);
         let target = IVec2::new(8, 3);
         app.world_mut().resource_mut::<TurnState>().strength[0] = 3;
         click_part(&mut app, Vec2::new(-450.0, 180.0));
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<TurnState>().strength[0], 1);
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(IVec2::new(3, 3)));
         assert_eq!(app.world().resource::<TurnState>().strength[0], 0);
         assert!(app.world().resource::<Board>().is_water(target));
@@ -6585,14 +6599,14 @@ mod tests {
         let mut app = interaction_app();
         let start = IVec2::new(5, 3);
         app.world_mut().resource_mut::<TurnState>().strength[0] = 3;
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(IVec2::new(3, 3)));
         assert_eq!(app.world().resource::<TurnState>().strength[0], 2);
         click_part(&mut app, Vec2::new(-450.0, 180.0));
         assert!(app.world().resource::<Selection>().0.is_some());
-        click_part(&mut app, Vec2::new(330.0, 0.0));
+        click_part(&mut app, Vec2::new(330.0, -60.0));
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         let world = app.world_mut();
         let turn = world.resource::<TurnState>();
         assert_eq!(turn.active, PlayerId::One);
@@ -6641,7 +6655,7 @@ mod tests {
             .unwrap()
             .marker;
         assert_eq!(app.world().resource::<TurnState>().strength[0], 1);
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         let turn = app.world().resource::<TurnState>();
         assert_eq!(turn.actions_used, 0);
         assert_eq!(turn.strength[0], 3);
@@ -6672,11 +6686,11 @@ mod tests {
             .resource_mut::<Board>()
             .set(start, Ground::Hole);
         app.world_mut().resource_mut::<TurnState>().hovering[0] = true;
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(IVec2::new(6, 3)));
-        click_part(&mut app, Vec2::new(-330.0, 180.0));
+        click_part(&mut app, Vec2::new(-330.0, 120.0));
         assert!(!app.world().resource::<TurnState>().hovering[0]);
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         assert!(app.world().resource::<TurnState>().hovering[0]);
         let world = app.world_mut();
         let mut players = world.query::<(&Player, &Transform)>();
@@ -6715,14 +6729,14 @@ mod tests {
                 },
             ))
             .id();
-        click_part(&mut app, Vec2::new(-330.0, 120.0));
+        click_part(&mut app, Vec2::new(-330.0, 60.0));
         assert!(app.world().get::<Collectible>(frost).is_none());
         assert!(app.world().get::<Collectible>(storm).is_none());
         assert_eq!(
             app.world().get::<Visibility>(frost),
             Some(&Visibility::Hidden)
         );
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         assert_eq!(item_count(&mut app), 2);
         let world = app.world();
         assert_eq!(world.resource::<TurnState>().actions_used, 0);
@@ -6732,7 +6746,7 @@ mod tests {
         assert!(world.get::<PickedUpForUndo>(frost).is_none());
         assert_eq!(world.get::<Visibility>(frost), Some(&Visibility::Visible));
         assert!(world.get::<Visibility>(storm).is_none());
-        click_part(&mut app, Vec2::new(-330.0, 120.0));
+        click_part(&mut app, Vec2::new(-330.0, 60.0));
         press_key(&mut app, KeyCode::KeyR);
         assert!(app.world().get_entity(frost).is_err());
         assert!(app.world().get_entity(storm).is_err());
@@ -7123,13 +7137,13 @@ mod tests {
                 board.finish_aquatic_turn();
             }
             move_player_to(&mut app, PlayerId::One, start);
-            click_part(&mut app, cell_center(start));
+            select_move(&mut app);
             click_part(&mut app, cell_center(contact));
             if undo {
-                click_part(&mut app, Vec2::new(-330.0, 0.0));
+                click_part(&mut app, Vec2::new(-330.0, -60.0));
                 press_key(&mut app, KeyCode::KeyR);
             } else {
-                click_part(&mut app, cell_center(contact));
+                select_move(&mut app);
                 click_part(&mut app, cell_center(start));
             }
             assert_eq!(
@@ -7148,9 +7162,8 @@ mod tests {
             board.make_water(origin);
             board.add_life_essence(origin);
         }
-        let start = IVec2::new(5, 3);
         let destination = IVec2::new(6, 2);
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(destination));
         click_part(&mut app, Vec2::new(-390.0, -180.0));
         click_part(&mut app, cell_center(origin));
@@ -7494,15 +7507,14 @@ mod tests {
     #[test]
     fn two_moves_complete_one_turn_and_recover_at_most_one_energy() {
         let mut app = interaction_app();
-        let start = IVec2::new(5, 3);
         let middle = IVec2::new(6, 3);
         let destination = IVec2::new(7, 3);
         app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(middle));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
-        click_part(&mut app, cell_center(middle));
+        select_move(&mut app);
         click_part(&mut app, cell_center(destination));
         let turn = app.world().resource::<TurnState>();
         assert_eq!(turn.active, PlayerId::Two);
@@ -7691,7 +7703,7 @@ mod tests {
             .single(world)
             .unwrap();
         assert!(feedback.0.contains("Cannot place water"));
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
         assert!(app.world().resource::<Board>().is_water(target));
         press_key(&mut app, KeyCode::KeyR);
@@ -7860,7 +7872,7 @@ mod tests {
             app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
             2
         );
-        click_part(&mut app, Vec2::new(-330.0, 120.0));
+        click_part(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
             3
@@ -7935,7 +7947,7 @@ mod tests {
                     .is_some()
             );
             assert_eq!(app.world().resource::<TurnState>().inventory[0][index], 0);
-            click_part(&mut app, Vec2::new(-330.0, 0.0));
+            click_part(&mut app, Vec2::new(-330.0, -60.0));
             assert!(
                 app.world()
                     .resource::<TurnState>()
@@ -7982,7 +7994,7 @@ mod tests {
             click_part(&mut app, cell_center(target));
         }
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
-        click_part(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         click_part(&mut app, cell_center(IVec2::new(4, 3)));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert!(app.world().resource::<Board>().is_water(target));
@@ -8018,7 +8030,7 @@ mod tests {
                     .is_some_and(Ground::walkable)
             })
             .unwrap();
-        click_part(&mut app, cell_center(player_cell));
+        select_move(&mut app);
         click_part(&mut app, cell_center(destination));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert!(!app.world().resource::<TurnState>().hovering[0]);
@@ -8061,7 +8073,7 @@ mod tests {
             click_part(&mut app, cell_center(IVec2::new(8, 3)));
             assert_eq!(app.world().resource::<TurnState>().strength[0], 1);
             if button {
-                click_part(&mut app, Vec2::new(-330.0, 60.0));
+                click_part(&mut app, Vec2::new(-330.0, 0.0));
             } else {
                 press_key(&mut app, KeyCode::KeyR);
             }
@@ -8349,7 +8361,7 @@ mod tests {
                 cell,
             },
         ));
-        click_part(&mut app, Vec2::new(-330.0, 120.0));
+        click_part(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][SUNSTONE_ITEM_INDEX],
             259
@@ -8358,13 +8370,13 @@ mod tests {
             let world = app.world_mut();
             assert_eq!(world.query::<&Collectible>().iter(world).count(), 1);
         }
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][SUNSTONE_ITEM_INDEX],
             255
         );
         assert_eq!(item_count(&mut app), 5);
-        click(&mut app, Vec2::new(-330.0, 120.0));
+        click(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][SUNSTONE_ITEM_INDEX],
             259
@@ -8388,7 +8400,7 @@ mod tests {
                 .cell
         };
         move_player_to(&mut app, PlayerId::One, cell);
-        click_part(&mut app, Vec2::new(-330.0, 120.0));
+        click_part(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(
             app.world()
                 .resource::<TurnState>()
@@ -8398,7 +8410,7 @@ mod tests {
                 .sum::<usize>(),
             6
         );
-        click_part(&mut app, Vec2::new(-330.0, 0.0));
+        click_part(&mut app, Vec2::new(-330.0, -60.0));
         assert_eq!(item_count(&mut app), 2);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(item_count(&mut app), 2);
@@ -8423,7 +8435,7 @@ mod tests {
                 Transform::default(),
             ));
         }
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(next));
         let world = app.world_mut();
         let mut items = world.query::<(&Collectible, &Sprite, &Transform)>();
@@ -8464,7 +8476,7 @@ mod tests {
                 .id()
         })
         .collect();
-        click_part(&mut app, Vec2::new(-330.0, 120.0));
+        click_part(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(app.world().resource::<TurnState>().actions_used, 0);
         assert!(
             unlimited
@@ -8499,14 +8511,14 @@ mod tests {
     #[test]
     fn magic_changes_only_on_the_owners_completed_turn() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         assert_eq!(app.world().resource::<TurnState>().magic, [5, 5]);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert!(app.world().resource::<TurnState>().hovering[0]);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().magic, [4, 5]);
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         assert_eq!(app.world().resource::<TurnState>().magic, [4, 5]);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert!(!app.world().resource::<TurnState>().hovering[0]);
@@ -8515,14 +8527,144 @@ mod tests {
 
         press_key(&mut app, KeyCode::KeyR);
         app.world_mut().resource_mut::<TurnState>().magic[0] = 1;
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         assert_eq!(app.world().resource::<TurnState>().magic[0], 1);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().magic[0], 0);
         assert!(!app.world().resource::<TurnState>().hovering[0]);
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         assert!(!app.world().resource::<TurnState>().hovering[0]);
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<TurnState>().magic[0], 1);
+    }
+
+    #[test]
+    fn hover_move_costs_magic_after_landing_with_each_turn_completion() {
+        for player in [PlayerId::One, PlayerId::Two] {
+            for finish in ["rest", "move", "placement"] {
+                let mut app = interaction_app();
+                let start = if player == PlayerId::One {
+                    IVec2::new(5, 3)
+                } else {
+                    IVec2::new(7, 6)
+                };
+                let x = if player == PlayerId::One {
+                    -330.0
+                } else {
+                    330.0
+                };
+                let inventory_x = if player == PlayerId::One {
+                    -450.0
+                } else {
+                    390.0
+                };
+                move_player_to(&mut app, player, start);
+                {
+                    let mut turn = app.world_mut().resource_mut::<TurnState>();
+                    turn.active = player;
+                    turn.magic = [3, 3];
+                    turn.hovering[player.index()] = true;
+                }
+                select_move(&mut app);
+                click_part(&mut app, cell_center(start + IVec2::X));
+                click_part(&mut app, Vec2::new(x, 120.0));
+                assert!(!app.world().resource::<TurnState>().hovering[player.index()]);
+                match finish {
+                    "rest" => press_key(&mut app, KeyCode::KeyR),
+                    "move" => {
+                        select_move(&mut app);
+                        click_part(&mut app, cell_center(start + 2 * IVec2::X));
+                    }
+                    "placement" => {
+                        click_part(&mut app, Vec2::new(inventory_x, 180.0));
+                        click_part(&mut app, cell_center(start + IVec2::X - IVec2::Y));
+                    }
+                    _ => unreachable!(),
+                }
+                let turn = app.world().resource::<TurnState>();
+                assert_eq!(turn.active, player.other(), "{finish}");
+                assert_eq!(turn.magic[player.index()], 2, "{finish}");
+                assert_eq!(turn.magic[player.other().index()], 3, "{finish}");
+                assert!(!turn.moved_while_hovering);
+            }
+        }
+    }
+
+    #[test]
+    fn undo_hover_move_cancels_the_cost_and_failed_moves_do_not_incur_it() {
+        for undo in [false, true] {
+            let mut app = interaction_app();
+            {
+                let mut turn = app.world_mut().resource_mut::<TurnState>();
+                turn.magic[0] = 3;
+                turn.hovering[0] = true;
+            }
+            select_move(&mut app);
+            click_part(
+                &mut app,
+                cell_center(if undo {
+                    IVec2::new(6, 3)
+                } else {
+                    IVec2::new(9, 3)
+                }),
+            );
+            click_part(&mut app, Vec2::new(-330.0, 120.0));
+            if undo {
+                click_part(&mut app, Vec2::new(-330.0, -60.0));
+            }
+            assert!(
+                !app.world().resource::<TurnState>().hovering[0],
+                "undo={undo}"
+            );
+            assert!(
+                !app.world().resource::<TurnState>().moved_while_hovering,
+                "undo={undo}"
+            );
+            click_part(&mut app, Vec2::new(-330.0, 0.0));
+            let turn = app.world().resource::<TurnState>();
+            assert_eq!(
+                turn.magic[0],
+                4,
+                "undo={undo}, active={:?}",
+                turn.active.index()
+            );
+            assert!(!turn.moved_while_hovering);
+        }
+    }
+
+    #[test]
+    fn hovering_through_two_moves_costs_only_one_magic() {
+        let mut app = interaction_app();
+        app.world_mut().resource_mut::<TurnState>().hovering[0] = true;
+        select_move(&mut app);
+        click_part(&mut app, cell_center(IVec2::new(6, 3)));
+        select_move(&mut app);
+        click_part(&mut app, cell_center(IVec2::new(7, 3)));
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.magic[0], 4);
+        assert!(turn.hovering[0]);
+    }
+
+    #[test]
+    fn landing_after_a_hover_move_spends_the_last_magic_and_allows_later_recovery() {
+        let mut app = interaction_app();
+        let origin = IVec2::new(5, 3);
+        app.world_mut()
+            .resource_mut::<Board>()
+            .set(origin, Ground::Ridge);
+        {
+            let mut turn = app.world_mut().resource_mut::<TurnState>();
+            turn.hovering[0] = true;
+            turn.magic[0] = 1;
+        }
+        select_move(&mut app);
+        click_part(&mut app, cell_center(IVec2::new(6, 3)));
+        click_part(&mut app, Vec2::new(-330.0, 120.0));
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<TurnState>().magic[0], 0);
+        assert!(!app.world().resource::<TurnState>().hovering[0]);
+        press_key(&mut app, KeyCode::KeyR);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().magic[0], 1);
     }
@@ -8532,7 +8674,7 @@ mod tests {
         let mut app = interaction_app();
         click(&mut app, Vec2::new(-390.0, 180.0));
         assert!(app.world().resource::<Selection>().0.is_some());
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         assert!(app.world().resource::<Selection>().0.is_some());
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         {
@@ -8556,7 +8698,7 @@ mod tests {
         assert_eq!(app.world().resource::<TurnState>().magic[0], 4);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         let destination = cell_center(IVec2::new(6, 3));
         click(&mut app, destination);
         {
@@ -8573,7 +8715,7 @@ mod tests {
             );
         }
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert_eq!(app.world().resource::<TurnState>().magic[0], 3);
         let world = app.world_mut();
@@ -8632,18 +8774,18 @@ mod tests {
             .resource_mut::<Board>()
             .set(ridge, Ground::Ridge);
         app.world_mut().resource_mut::<TurnState>().magic[0] = 2;
-        click(&mut app, Vec2::new(-330.0, 180.0));
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        click(&mut app, Vec2::new(-330.0, 120.0));
+        select_move(&mut app);
         click(&mut app, cell_center(ridge));
         assert_eq!(app.world().resource::<TurnState>().magic[0], 1);
         press_key(&mut app, KeyCode::KeyR);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         assert!(app.world().resource::<TurnState>().hovering[0]);
         click(&mut app, Vec2::new(-390.0, 180.0));
         assert!(app.world().resource::<Selection>().0.is_none());
-        click(&mut app, cell_center(ridge));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
         assert_eq!(app.world().resource::<TurnState>().magic[0], 0);
         assert!(!app.world().resource::<TurnState>().hovering[0]);
@@ -8679,7 +8821,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(ridge, Ground::Ridge);
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         for (step, (hovering, expected)) in [(false, false), (true, true), (false, false)]
             .into_iter()
             .enumerate()
@@ -8701,7 +8843,7 @@ mod tests {
             assert_eq!(world.resource::<TurnState>().active, PlayerId::One);
             assert_eq!(world.resource::<TurnState>().magic[0], MAX_MAGIC);
             if step < 2 {
-                click(&mut app, Vec2::new(-330.0, 180.0));
+                click(&mut app, Vec2::new(-330.0, 120.0));
             }
         }
     }
@@ -8854,10 +8996,10 @@ mod tests {
             0
         );
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-330.0, 120.0));
+        click(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
             1
@@ -8889,7 +9031,7 @@ mod tests {
                 cell,
             },
         ));
-        click(&mut app, Vec2::new(-330.0, 120.0));
+        click(&mut app, Vec2::new(-330.0, 60.0));
         let world = app.world_mut();
         let turn = world.resource::<TurnState>();
         assert_eq!(turn.active, PlayerId::Two);
@@ -8976,7 +9118,7 @@ mod tests {
             assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
             move_player_to(&mut app, PlayerId::One, respawn);
             app.world_mut().resource_mut::<TurnState>().inventory[0][index] = 3;
-            click(&mut app, Vec2::new(-330.0, 120.0));
+            click(&mut app, Vec2::new(-330.0, 60.0));
             assert_eq!(app.world().resource::<TurnState>().inventory[0][index], 4);
             assert!(app.world().get_entity(entity).is_err());
         }
@@ -9401,7 +9543,7 @@ mod tests {
         } else {
             330.0
         };
-        click(&mut app, Vec2::new(action_x, 120.0));
+        click(&mut app, Vec2::new(action_x, 60.0));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[active.index()][LIFE_ESSENCE_ITEM_INDEX],
             1
@@ -9421,7 +9563,7 @@ mod tests {
         click(&mut app, cell_center(target));
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 0;
-        click_part(&mut app, cell_center(IVec2::new(7, 3)));
+        select_move(&mut app);
         click_part(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 1);
@@ -9438,7 +9580,6 @@ mod tests {
     #[test]
     fn life_essence_heals_a_player_entering_on_the_last_turn() {
         let mut app = interaction_app();
-        let start = IVec2::new(5, 3);
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<Board>().make_water(target);
         app.world_mut().resource_mut::<PlayerHealth>().0[0] = 0;
@@ -9446,7 +9587,7 @@ mod tests {
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         assert!(app.world().resource::<Board>().has_life_essence(target));
-        click_part(&mut app, cell_center(start));
+        select_move(&mut app);
         click_part(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0[0], 1);
@@ -9466,7 +9607,7 @@ mod tests {
         }
         app.world_mut().resource_mut::<PlayerHealth>().0[0] = 0;
         app.world_mut().resource_mut::<TurnState>().magic[0] = 1;
-        click(&mut app, Vec2::new(-330.0, 180.0));
+        click(&mut app, Vec2::new(-330.0, 120.0));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0[0], 0);
         assert!(!app.world().resource::<TurnState>().hovering[0]);
@@ -9486,7 +9627,7 @@ mod tests {
         click(&mut app, cell_center(target));
         move_player_to(&mut app, PlayerId::Two, target);
         assert!(app.world().resource::<Board>().has_life_essence(target));
-        click(&mut app, Vec2::new(330.0, 120.0));
+        click(&mut app, Vec2::new(330.0, 60.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert_eq!(
             app.world().resource::<TurnState>().inventory[1][LIFE_ESSENCE_ITEM_INDEX],
@@ -9507,11 +9648,11 @@ mod tests {
         click(&mut app, Vec2::new(-450.0, -180.0));
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-330.0, 180.0));
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        click(&mut app, Vec2::new(-330.0, 120.0));
+        select_move(&mut app);
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-330.0, 120.0));
+        click(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][LIFE_ESSENCE_ITEM_INDEX],
@@ -9608,7 +9749,7 @@ mod tests {
             let world = app.world_mut();
             assert_eq!(world.query::<&Collectible>().iter(world).count(), 0);
             assert!(world.resource::<Board>().has_thorns(target));
-            click(&mut app, Vec2::new(330.0, 120.0));
+            click(&mut app, Vec2::new(330.0, 60.0));
             assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         }
     }
@@ -9622,7 +9763,7 @@ mod tests {
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         move_player_to(&mut app, PlayerId::One, target);
-        click(&mut app, Vec2::new(-330.0, 120.0));
+        click(&mut app, Vec2::new(-330.0, 60.0));
         let world = app.world_mut();
         assert_eq!(
             world.resource::<TurnState>().inventory[0][THORNHEART_ITEM_INDEX],
@@ -9935,7 +10076,7 @@ mod tests {
         move_player_to(&mut app, PlayerId::Two, cell);
         app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
         app.world_mut().resource_mut::<TurnState>().inventory[1][WATER_ITEM_INDEX] = 0;
-        click(&mut app, Vec2::new(330.0, 120.0));
+        click(&mut app, Vec2::new(330.0, 60.0));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[1][WATER_ITEM_INDEX],
             0
@@ -10332,7 +10473,7 @@ mod tests {
         click(&mut app, Vec2::new(-450.0, -120.0));
         click(&mut app, cell_center(source));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
-        click(&mut app, cell_center(source));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
         assert_eq!(poison_cells(&mut app), [source]);
@@ -10448,7 +10589,7 @@ mod tests {
         assert_eq!(oil_label(&mut app, cell).as_deref(), Some("perm"));
         assert_eq!(item_count(&mut app), 1);
 
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         press_key(&mut app, KeyCode::Escape);
         assert!(app.world().resource::<Board>().has_oil(cell));
         for _ in 0..20 {
@@ -13552,7 +13693,7 @@ mod tests {
             click(&mut app, cell_center(cell));
             assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
-            click_part(&mut app, cell_center(cell));
+            select_move(&mut app);
             assert!(app.world().resource::<Selection>().0.is_none());
             press_key(&mut app, KeyCode::KeyR);
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 1);
@@ -13560,14 +13701,14 @@ mod tests {
             press_key(&mut app, KeyCode::KeyR);
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 1);
             assert_eq!(app.world().resource::<PlayerHealth>().0[1], 9);
-            click_part(&mut app, cell_center(cell));
+            select_move(&mut app);
             assert!(app.world().resource::<Selection>().0.is_none());
             press_key(&mut app, KeyCode::KeyR);
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 0);
             assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 8]);
             assert!(app.world().resource::<Board>().is_frozen(cell));
             press_key(&mut app, KeyCode::KeyR);
-            click_part(&mut app, cell_center(cell));
+            select_move(&mut app);
             assert!(matches!(
                 app.world().resource::<Selection>().0,
                 Some(SelectedAction::Movement { .. })
@@ -13582,19 +13723,18 @@ mod tests {
     fn ice_damage_depends_on_where_an_unfrozen_player_ends_the_turn() {
         for leave_ice in [false, true] {
             let mut app = interaction_app();
-            let start = IVec2::new(5, 3);
             let ice = IVec2::new(6, 3);
             {
                 let mut board = app.world_mut().resource_mut::<Board>();
                 board.make_water(ice);
                 assert!(board.freeze_water(ice));
             }
-            click_part(&mut app, cell_center(start));
+            select_move(&mut app);
             click_part(&mut app, cell_center(ice));
             assert_eq!(app.world().resource::<PlayerHealth>().0[0], 10);
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 0);
             if leave_ice {
-                click_part(&mut app, cell_center(ice));
+                select_move(&mut app);
                 click_part(&mut app, cell_center(IVec2::new(7, 3)));
             } else {
                 press_key(&mut app, KeyCode::KeyR);
@@ -13614,12 +13754,12 @@ mod tests {
         app.world_mut().resource_mut::<Board>().make_water(cell);
         click(&mut app, Vec2::new(-450.0, 120.0));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(330.0, 180.0));
+        click(&mut app, Vec2::new(330.0, 120.0));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 1);
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(330.0, 180.0));
+        click(&mut app, Vec2::new(330.0, 120.0));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 0);
@@ -13690,7 +13830,7 @@ mod tests {
                 app.world().resource::<TurnState>().inventory[1][SUNSTONE_ITEM_INDEX],
                 0
             );
-            click_part(&mut app, Vec2::new(330.0, 0.0));
+            click_part(&mut app, Vec2::new(330.0, -60.0));
             assert_eq!(
                 app.world().resource::<TurnState>().inventory[1][SUNSTONE_ITEM_INDEX],
                 1
@@ -13716,7 +13856,7 @@ mod tests {
             let world = app.world_mut();
             assert_eq!(world.query::<&FrostImpact>().iter(world).count(), 0);
             press_key(&mut app, KeyCode::KeyR);
-            click_part(&mut app, cell_center(target));
+            select_move(&mut app);
             assert!(matches!(
                 app.world().resource::<Selection>().0,
                 Some(SelectedAction::Movement { .. })
@@ -13808,7 +13948,7 @@ mod tests {
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 0);
         press_key(&mut app, KeyCode::KeyR);
-        click_part(&mut app, cell_center(target));
+        select_move(&mut app);
         assert!(matches!(
             app.world().resource::<Selection>().0,
             Some(SelectedAction::Movement { .. })
@@ -13826,7 +13966,7 @@ mod tests {
         click(&mut app, Vec2::new(-450.0, 120.0));
         click(&mut app, cell_center(cell));
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(5, 4)));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 1);
@@ -13864,7 +14004,7 @@ mod tests {
             .set(cell, Ground::Water);
         click(&mut app, Vec2::new(-450.0, 120.0));
         click(&mut app, cell_center(cell));
-        click(&mut app, cell_center(cell));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
@@ -13879,7 +14019,7 @@ mod tests {
         click(&mut app, Vec2::new(-450.0, 120.0));
         click(&mut app, cell_center(cell));
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         click(&mut app, cell_center(cell));
         click(&mut app, Vec2::new(390.0, 180.0));
         click(&mut app, cell_center(cell));
@@ -13954,14 +14094,14 @@ mod tests {
             assert_eq!(item_count(&mut app), 0);
             assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
 
-            click(&mut app, cell_center(IVec2::new(7, 6)));
+            select_move(&mut app);
             press_key(&mut app, KeyCode::Escape);
             assert!(app.world().resource::<Board>().is_frozen(cell));
             press_key(&mut app, KeyCode::KeyR);
             assert!(app.world().resource::<Board>().is_frozen(cell));
             press_key(&mut app, KeyCode::KeyR);
             assert!(app.world().resource::<Board>().is_frozen(cell));
-            click(&mut app, cell_center(IVec2::new(7, 6)));
+            select_move(&mut app);
             click(&mut app, cell_center(IVec2::new(7, 5)));
             assert!(app.world().resource::<Board>().is_frozen(cell));
             assert_eq!(frozen_sprite_count(&mut app), 1);
@@ -14733,7 +14873,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_between_item_and_character_clears_previews() {
+    fn switching_between_item_and_move_clears_previews() {
         let mut app = interaction_app();
         click(&mut app, Vec2::new(-450.0, 180.0));
         let (icon, highlight) = match &app.world().resource::<Selection>().0 {
@@ -14742,13 +14882,12 @@ mod tests {
             }) => (*icon, *highlight),
             _ => panic!("item should be selected"),
         };
-        press_key(&mut app, KeyCode::Escape);
-        click(&mut app, Vec2::new(30.0, 0.0));
+        select_move(&mut app);
         assert!(app.world().get_entity(icon).is_err());
         assert!(app.world().get_entity(highlight).is_err());
         let highlights = match &app.world().resource::<Selection>().0 {
             Some(SelectedAction::Movement { highlights }) => highlights.clone(),
-            _ => panic!("character should be selected"),
+            _ => panic!("movement should be selected"),
         };
         assert_eq!(highlights.len(), 24);
         click(&mut app, Vec2::new(-450.0, 180.0));
@@ -14762,12 +14901,63 @@ mod tests {
             Some(SelectedAction::Item { .. })
         ));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+        assert_eq!(item_count(&mut app), 0);
+    }
+
+    #[test]
+    fn clicking_the_board_without_a_selection_does_not_select_or_move() {
+        let mut app = interaction_app();
+        click_part(&mut app, cell_center(IVec2::new(5, 3)));
+        click_part(&mut app, cell_center(IVec2::new(6, 3)));
+        assert!(app.world().resource::<Selection>().0.is_none());
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.actions_used, 0);
+        assert_eq!(turn.active, PlayerId::One);
+        let world = app.world_mut();
+        let mut players = world.query::<(&Player, &Transform)>();
+        let position = players
+            .iter(world)
+            .find(|(player, _)| player.0 == PlayerId::One)
+            .unwrap()
+            .1;
+        assert_eq!(
+            position.translation.truncate(),
+            cell_center(IVec2::new(5, 3))
+        );
+    }
+
+    #[test]
+    fn action_column_hitboxes_follow_the_visible_order_for_both_players() {
+        for player in [PlayerId::One, PlayerId::Two] {
+            let x = if player == PlayerId::One {
+                -330.0
+            } else {
+                330.0
+            };
+            for (row, action) in [
+                Action::Move,
+                Action::Hover,
+                Action::Pickup,
+                Action::Rest,
+                Action::Undo,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(action.row(), row);
+                assert_eq!(
+                    action_cell(Vec2::new(x, 180.0 - 60.0 * row as f32), player),
+                    Some(row)
+                );
+            }
+            assert_eq!(action_cell(Vec2::new(x, -120.0), player), None);
+        }
     }
 
     #[test]
     fn player_selection_walks_diagonally_and_rejects_out_of_range() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(30.0, 0.0));
+        select_move(&mut app);
         assert!(matches!(
             app.world().resource::<Selection>().0,
             Some(SelectedAction::Movement { .. })
@@ -14785,9 +14975,9 @@ mod tests {
             "Too far - jump up to 2 grid steps"
         );
 
-        click(&mut app, Vec2::new(30.0, 0.0));
+        select_move(&mut app);
         assert!(app.world().resource::<Selection>().0.is_none());
-        click(&mut app, Vec2::new(30.0, 0.0));
+        select_move(&mut app);
         click(&mut app, Vec2::new(90.0, 60.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         let world = app.world_mut();
@@ -14809,12 +14999,12 @@ mod tests {
             board.set(IVec2::new(6, 3), board::Ground::Water);
             board.set(IVec2::new(7, 3), board::Ground::Ridge);
         }
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(6, 3)));
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, cell_center(IVec2::new(6, 3)));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(8, 3)));
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
@@ -14861,7 +15051,7 @@ mod tests {
             board.set(IVec2::new(6, 3), board::Ground::Ridge);
             board.set(IVec2::new(5, 2), board::Ground::Hole);
         }
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         for (cell, message) in [
             (IVec2::new(6, 3), "Cannot land on a ridge or hole"),
             (IVec2::new(5, 2), "Cannot land on a ridge or hole"),
@@ -14905,7 +15095,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(IVec2::new(6, 3), board::Ground::Hole);
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         click(&mut app, cell_center(IVec2::new(7, 4)));
@@ -14929,7 +15119,7 @@ mod tests {
             .get_mut::<Transform>(opponent)
             .unwrap()
             .translation = Vec3::new(90.0, 0.0, 0.0);
-        click(&mut app, Vec2::new(30.0, 0.0));
+        select_move(&mut app);
         click(&mut app, Vec2::new(90.0, 0.0));
         click(&mut app, Vec2::new(301.0, 0.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
@@ -14970,16 +15160,16 @@ mod tests {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().strength = [2, 3];
         app.world_mut().resource_mut::<TurnState>().magic = [3, 3];
-        click(&mut app, Vec2::new(330.0, 60.0));
+        click(&mut app, Vec2::new(330.0, 0.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         click(&mut app, Vec2::new(-450.0, 180.0));
         assert!(app.world().resource::<Selection>().0.is_some());
-        click(&mut app, Vec2::new(-330.0, 60.0));
+        click(&mut app, Vec2::new(-330.0, 0.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 3]);
         assert_eq!(app.world().resource::<TurnState>().magic, [4, 3]);
         assert!(app.world().resource::<Selection>().0.is_none());
-        click(&mut app, Vec2::new(330.0, 60.0));
+        click(&mut app, Vec2::new(330.0, 0.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
         assert_eq!(app.world().resource::<TurnState>().magic, [4, 4]);
@@ -15005,7 +15195,7 @@ mod tests {
                         } else {
                             330.0
                         };
-                        click(&mut app, Vec2::new(x, 60.0));
+                        click(&mut app, Vec2::new(x, 0.0));
                     } else {
                         press_key(&mut app, KeyCode::KeyR);
                     }
@@ -15031,7 +15221,7 @@ mod tests {
             turn.magic[0] = 1;
             turn.strength[0] = 2;
         }
-        click(&mut app, Vec2::new(-330.0, 60.0));
+        click(&mut app, Vec2::new(-330.0, 0.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert_eq!(app.world().resource::<TurnState>().strength[0], 2);
         press_key(&mut app, KeyCode::KeyR);
@@ -15137,10 +15327,10 @@ mod tests {
                 let mut app = interaction_app();
                 app.world_mut().resource_mut::<TurnState>().strength = [energy, 2];
                 if hover {
-                    click(&mut app, Vec2::new(-330.0, 180.0));
+                    click(&mut app, Vec2::new(-330.0, 120.0));
                     assert_eq!(app.world().resource::<TurnState>().strength[0], energy);
                 }
-                click(&mut app, cell_center(IVec2::new(5, 3)));
+                select_move(&mut app);
                 click(&mut app, cell_center(IVec2::new(6, 3)));
                 let turn = app.world().resource::<TurnState>();
                 assert_eq!(turn.strength, [(energy + 2).min(MAX_STRENGTH), 2]);
@@ -15155,7 +15345,7 @@ mod tests {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().strength = [0, 2];
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-330.0, 120.0));
+        click(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(app.world().resource::<TurnState>().strength, [0, 2]);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         let cell = IVec2::new(5, 3);
@@ -15167,7 +15357,7 @@ mod tests {
             },
             PendingFrost(cell),
         ));
-        click(&mut app, Vec2::new(-330.0, 120.0));
+        click(&mut app, Vec2::new(-330.0, 60.0));
         assert_eq!(app.world().resource::<TurnState>().strength, [2, 2]);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
     }
@@ -15176,7 +15366,7 @@ mod tests {
     fn rest_recovers_energy_after_jump_and_distant_placement() {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().strength = [3, 3];
-        click(&mut app, cell_center(IVec2::new(5, 3)));
+        select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
         assert_eq!(app.world().resource::<TurnState>().strength, [4, 3]);
         click(&mut app, Vec2::new(390.0, 180.0));
