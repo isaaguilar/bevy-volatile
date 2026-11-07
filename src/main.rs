@@ -94,7 +94,7 @@ const INVENTORY_ITEMS: [(&str, usize); 14] = [
     ("Poison Frog Sphere", 8),
     ("Coatl's Egg", 11),
     ("Life Essence", 13),
-    ("Aquatic Creature", 12),
+    ("Ahuizotl Totem", 12),
 ];
 const INVENTORY_ORDER: [usize; 14] = [
     WATER_ITEM_INDEX,
@@ -3508,7 +3508,7 @@ fn cell_feedback(board: &Board, cell: IVec2) -> Option<String> {
         effects.push("Healing water");
     }
     if board.aquatic_contacts(cell).next().is_some() {
-        effects.push("Aquatic creature");
+        effects.push("Ahuizotl");
     }
     if let Some(growth) = board.terrain_growth_kind_at(cell) {
         effects.push(match growth {
@@ -5008,7 +5008,7 @@ fn handle_selection(
                 } else if egg_life {
                     "Coatl awakens - next player's turn".into()
                 } else if aquatic_life {
-                    "Aquatic creature awakens - next player's turn".into()
+                    "Ahuizotl awakens - next player's turn".into()
                 } else if creates_ridge {
                     "Stone explosion creates ridges - next player's turn".into()
                 } else if void_hole {
@@ -5651,7 +5651,7 @@ fn update_turn_progress(
             if turn.actions_used > 0 { "+2" } else { "FULL" },
         );
         let event = if turn.aquatic_animation.is_some() {
-            Some("AQUATIC CREATURE MOVING...".to_owned())
+            Some("AHUIZOTL MOVING...".to_owned())
         } else if turn.serpent_animation.is_some() {
             Some("COATL MOVING...".to_owned())
         } else if let Some(weather) = &turn.weather_animation {
@@ -7146,7 +7146,7 @@ mod tests {
             "Toad Wart",
             "Thorn Heart",
             "Coatl's Egg",
-            "Aquatic Creature",
+            "Ahuizotl Totem",
             "Life Essence",
         ];
         fn setup_inventory(mut commands: Commands) {
@@ -9071,6 +9071,30 @@ mod tests {
         assert_eq!(
             app.world().get::<Text>(entity).unwrap().0,
             "ACTIONS: 2 AVAILABLE | REST: FULL | RAIN..."
+        );
+    }
+
+    #[test]
+    fn aquatic_animation_status_uses_ahuizotl_name() {
+        let mut app = App::new();
+        let turn = TurnState {
+            aquatic_animation: Some(AquaticAnimation {
+                visuals: vec![],
+                creatures: vec![],
+                frames: Default::default(),
+                swept: Default::default(),
+                unflattened: Default::default(),
+                timer: Timer::from_seconds(1.0, TimerMode::Once),
+            }),
+            ..default()
+        };
+        app.insert_resource(turn)
+            .add_systems(Update, update_turn_progress);
+        let entity = app.world_mut().spawn((TurnProgress, Text::default())).id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(entity).unwrap().0,
+            "ACTIONS: 2 AVAILABLE | REST: FULL | AHUIZOTL MOVING..."
         );
     }
 
@@ -18212,7 +18236,7 @@ mod tests {
     fn renamed_ingredients_are_used_for_hover_and_placed_items() {
         for (position, name) in [
             (p1_item(SUNSTONE_ITEM_INDEX), "Sunstone"),
-            (p1_item(AQUATIC_ITEM_INDEX), "Aquatic Creature"),
+            (p1_item(AQUATIC_ITEM_INDEX), "Ahuizotl Totem"),
         ] {
             let mut app = interaction_app();
             app.world_mut().resource_mut::<BoardCursor>().0 = Some(position);

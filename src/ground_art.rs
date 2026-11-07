@@ -5,8 +5,8 @@ use bevy::{
 
 use crate::{
     AcidTile, Board, ElectricFlash, FireFlash, FrozenTile, GRID_BLOCK_SIZE, Ground, GroundTile,
-    PoisonTile, SteamFlash, TerrainGrowthKind, ThornTile, TurnState, VoidGrowthTile, effects, help,
-    menu, spawn_board_terrain, update_aquatic_visuals,
+    InventoryImages, OIL_ITEM_INDEX, PoisonTile, SteamFlash, TerrainGrowthKind, ThornTile,
+    TurnState, VoidGrowthTile, effects, help, menu, spawn_board_terrain, update_aquatic_visuals,
 };
 
 const TERRAIN_SHEET: &str = "basictilesheet.png";
@@ -119,6 +119,7 @@ struct GroundArt {
 enum GroundArtPart {
     Border(Side),
     Overlay(Effect),
+    RidgeEmber,
 }
 
 pub(crate) fn plugin(app: &mut App) {
@@ -127,6 +128,7 @@ pub(crate) fn plugin(app: &mut App) {
             Startup,
             attach_ground_art
                 .after(spawn_board_terrain)
+                .after(crate::setup)
                 .after(load_sheet),
         )
         .add_systems(
@@ -285,6 +287,7 @@ fn attach_ground_art(
     board: Res<Board>,
     turn: Res<TurnState>,
     sheet: Res<GroundSheet>,
+    images: Res<InventoryImages>,
     mut tiles: Query<(Entity, &GroundTile, &mut Sprite)>,
 ) {
     for (entity, tile, mut sprite) in &mut tiles {
@@ -339,6 +342,21 @@ fn attach_ground_art(
                     Transform::from_xyz(0.0, 0.0, z),
                 ));
             }
+            parent.spawn((
+                GroundArt {
+                    cell: tile.0,
+                    part: GroundArtPart::RidgeEmber,
+                },
+                images.sprite(OIL_ITEM_INDEX, 24.0),
+                if visible_ground(&board, &turn, tile.0) == Some(Ground::Ridge)
+                    && board.has_oil(tile.0)
+                {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+                Transform::from_xyz(17.0, 16.0, 1.7),
+            ));
         });
     }
 }
@@ -395,6 +413,20 @@ fn update_ground_art(
                         &board,
                         effects.as_deref(),
                     ));
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
+            GroundArtPart::RidgeEmber => {
+                let fuel = effects
+                    .as_ref()
+                    .and_then(|effects| effects.held(piece.cell))
+                    .map_or_else(|| board.has_oil(piece.cell), |old| old.fuel);
+                *visibility = if fuel
+                    && animated_ground(&board, &turn, effects.as_deref(), piece.cell)
+                        == Some(Ground::Ridge)
+                {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
@@ -627,6 +659,7 @@ mod tests {
         app.insert_resource(Board::default())
             .insert_resource(TurnState::default())
             .insert_resource(GroundSheet::default())
+            .init_resource::<InventoryImages>()
             .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
             .add_systems(Update, update_ground_art);
         app.update();
@@ -635,7 +668,7 @@ mod tests {
         let north = cell + IVec2::NEG_Y;
         let world = app.world_mut();
         let mut pieces = world.query::<(&GroundArt, &Sprite, &Visibility, &Transform)>();
-        assert_eq!(pieces.iter(world).count(), COLUMNS * ROWS * 7);
+        assert_eq!(pieces.iter(world).count(), COLUMNS * ROWS * 8);
         for side in Side::ALL {
             let piece = pieces
                 .iter(world)
@@ -710,6 +743,105 @@ mod tests {
     }
 
     #[test]
+    fn ridge_ember_marker_tracks_fuel_terrain_and_effect_animation() {
+        let cell = IVec2::new(4, 3);
+        let mut board = Board::default();
+        board.set(cell, Ground::Ridge);
+        let mut app = App::new();
+        app.insert_resource(board)
+            .init_resource::<TurnState>()
+            .init_resource::<Time>()
+            .init_resource::<effects::Effects>()
+            .init_resource::<GroundSheet>()
+            .init_resource::<InventoryImages>()
+            .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
+            .add_systems(
+                Update,
+                (effects::advance, effects::capture, update_ground_art).chain(),
+            );
+        app.update();
+
+        let marker = {
+            let world = app.world_mut();
+            let mut pieces = world.query::<(Entity, &GroundArt)>();
+            pieces
+                .iter(world)
+                .find(|(_, piece)| {
+                    piece.cell == cell && matches!(piece.part, GroundArtPart::RidgeEmber)
+                })
+                .unwrap()
+                .0
+        };
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Hidden
+        );
+        assert_eq!(
+            app.world().get::<Sprite>(marker).unwrap().rect,
+            Some(InventoryImages::rect(OIL_ITEM_INDEX))
+        );
+
+        app.world_mut().resource_mut::<Board>().add_oil(cell);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Hidden
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.5));
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Inherited
+        );
+
+        app.world_mut()
+            .resource_mut::<Board>()
+            .set(cell, Ground::Solid);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Inherited
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.5));
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Hidden
+        );
+        app.world_mut()
+            .resource_mut::<Board>()
+            .set(cell, Ground::Ridge);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Hidden
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.5));
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Inherited
+        );
+
+        app.world_mut().resource_mut::<Board>().remove_oil(cell);
+        app.update();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.5));
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(marker).unwrap(),
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
     fn terrain_and_hazards_reveal_after_their_animations() {
         let mut app = App::new();
         app.init_resource::<Board>()
@@ -718,6 +850,7 @@ mod tests {
             .init_resource::<effects::Effects>()
             .init_resource::<crate::FrozenSheet>()
             .init_resource::<GroundSheet>()
+            .init_resource::<InventoryImages>()
             .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
             .add_systems(
                 Update,
@@ -804,6 +937,7 @@ mod tests {
             .init_resource::<Time>()
             .init_resource::<effects::Effects>()
             .init_resource::<GroundSheet>()
+            .init_resource::<InventoryImages>()
             .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
             .add_systems(
                 Update,

@@ -7,12 +7,11 @@ use bevy::{
 use bevy_aspect_ratio_mask::Hud;
 
 use crate::{
-    ACID_ITEM_INDEX, AQUATIC_ITEM_INDEX, BOARD_BOTTOM, BoardCursor, COATL_EGG_ITEM_INDEX,
-    FROST_CRYSTAL_ITEM_INDEX, GRID_BLOCK_SIZE, Ground, HEALTH_PANEL_INSET, INVENTORY_ITEMS,
-    InventoryImages, LIFE_ESSENCE_ITEM_INDEX, OBSIDIAN_ITEM_INDEX, OIL_ITEM_INDEX,
-    POISON_ITEM_INDEX, PlayerHealth, RESOLUTION_HEIGHT, RESOLUTION_WIDTH, STONE_DUST_ITEM_INDEX,
-    STORM_SHARD_ITEM_INDEX, SUNSTONE_ITEM_INDEX, SelectedAction, Selection, THORNHEART_ITEM_INDEX,
-    VOID_DUST_ITEM_INDEX, WATER_ITEM_INDEX, ai, history, menu,
+    AQUATIC_ITEM_INDEX, BOARD_BOTTOM, BoardCursor, COATL_EGG_ITEM_INDEX, FROST_CRYSTAL_ITEM_INDEX,
+    GRID_BLOCK_SIZE, Ground, HEALTH_PANEL_INSET, INVENTORY_ITEMS, InventoryImages,
+    LIFE_ESSENCE_ITEM_INDEX, OBSIDIAN_ITEM_INDEX, PlayerHealth, RESOLUTION_HEIGHT,
+    RESOLUTION_WIDTH, STORM_SHARD_ITEM_INDEX, SUNSTONE_ITEM_INDEX, SelectedAction, Selection,
+    SerpentSheet, THORNHEART_ITEM_INDEX, WATER_ITEM_INDEX, ai, history, menu,
 };
 
 const GOLD: Color = Color::srgb(0.86, 0.68, 0.32);
@@ -27,13 +26,15 @@ struct Guide {
 enum ReactionVisual {
     Ingredient(usize),
     Ground(Ground),
-    WetGround,
     Frozen,
     Poison,
+    PoisonWater,
     Acid,
-    Explosion,
-    Electricity,
-    Aquatic,
+    AcidRidge,
+    Ember,
+    Thorns,
+    HealingWater,
+    Coatl,
     Player,
 }
 
@@ -42,128 +43,122 @@ const GUIDES: [Guide; 14] = [
         basics: "Unlimited. Turns solid ground into permanent water. Cannot be placed on water or a hole.",
         reactions: &[
             (
+                "Solid Ground",
+                &[ReactionVisual::Ground(Ground::Solid)],
+                "Creates a permanent water tile.",
+            ),
+            (
                 "Sunstone",
                 &[ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX)],
-                "Creates steam: 1 heart on the target, half a heart nearby. Wind extends it; ridges block it.",
+                "On solid ground, creates water and steam. The center takes 1 heart and other affected tiles take half a heart; wind extends the steam.",
             ),
             (
                 "Frost Crystal",
                 &[ReactionVisual::Ingredient(FROST_CRYSTAL_ITEM_INDEX)],
-                "Freezes this tile and adjacent water. Grounded players there are frozen for two turns.",
+                "On solid ground, creates water and freezes it and adjacent water. Grounded players on affected water freeze for two turns.",
             ),
             (
                 "Storm Shard",
                 &[ReactionVisual::Ingredient(STORM_SHARD_ITEM_INDEX)],
-                "Electrifies connected water: 1 heart on water, half a heart next to it. Hovering prevents the shock.",
+                "On solid ground, creates water and an electrical pulse through connected water. Grounded players on water lose 1 heart; grounded neighbors lose half a heart.",
             ),
             (
                 "Life Essence",
                 &[ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX)],
-                "Creates healing water: grounded players recover half a heart per completed turn for three turns. With an Aquatic Creature and Life Essence, awakens the creature.",
+                "On solid ground, creates healing water. Grounded players on it recover half a heart per completed turn for three turns.",
             ),
             (
-                "Toad Wart / poison",
+                "Life Essence + Ahuizotl Totem",
                 &[
-                    ReactionVisual::Ingredient(ACID_ITEM_INDEX),
-                    ReactionVisual::Poison,
+                    ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX),
+                    ReactionVisual::Ingredient(AQUATIC_ITEM_INDEX),
                 ],
-                "Makes acid on ground permanent and lets poison spread through connected water. Water and acid on a ridge level it.",
+                "On solid ground, creates water and awakens Ahuizotl.",
             ),
             (
-                "Stone Dust",
-                &[ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX)],
-                "Dries water to solid ground. Stone Dust with Life Essence instead grows ridges.",
+                "Acidic Solid Ground",
+                &[ReactionVisual::Acid],
+                "Creates permanent acidic water.",
             ),
             (
-                "Void Dust",
-                &[ReactionVisual::Ingredient(VOID_DUST_ITEM_INDEX)],
-                "Does not react. Void Dust cannot be placed on natural water without Obsidian or Life Essence.",
+                "Acidic Ridge",
+                &[ReactionVisual::AcidRidge],
+                "Levels the ridge to solid ground; the acid remains temporary.",
+            ),
+            (
+                "Poisoned Solid Ground",
+                &[ReactionVisual::Poison],
+                "Creates water, pauses that poison's remaining duration for the action, and allows it to spread through connected water on later turns.",
+            ),
+            (
+                "Thorned Solid Ground",
+                &[ReactionVisual::Thorns],
+                "Creates water. If this is the base of an actively growing Thorn Heart, its opposite vine can grow or resume.",
             ),
         ],
     },
     Guide {
-        basics: "A limited ingredient. Place it on your own frozen player to thaw them.",
+        basics: "A limited ingredient. Sunstone can thaw a frozen player early.",
         reactions: &[
             (
-                "Water",
+                "Water Tile",
                 &[ReactionVisual::Ground(Ground::Water)],
-                "Creates steam: 1 heart on the target, half a heart nearby. Wind extends it; ridges block it.",
+                "On unfrozen water without ember, creates steam. The center takes 1 heart and other affected tiles take half a heart; wind extends the steam.",
             ),
             (
-                "Frozen water",
+                "Frozen Water Tile",
                 &[ReactionVisual::Frozen],
-                "Thaws the ice and frozen players on the tile without steam, unless another reaction occurs.",
+                "Thaws the water and any frozen player on it without steam, unless another reaction takes priority.",
             ),
             (
-                "Tlexochtli Ember",
-                &[ReactionVisual::Ingredient(OIL_ITEM_INDEX)],
+                "Frozen Player",
+                &[ReactionVisual::Player],
+                "Thaws the player early, including on solid ground.",
+            ),
+            (
+                "Ember Tile",
+                &[ReactionVisual::Ember],
                 "Ignites connected ember. Each burning tile deals 1 heart at its center and half a heart to neighbors.",
             ),
             (
                 "Obsidian",
                 &[ReactionVisual::Ingredient(OBSIDIAN_ITEM_INDEX)],
-                "Creates a cross-shaped blast up to two tiles away, dealing 1.5 hearts per affected player.",
+                "Creates a cross-shaped explosion up to two tiles away, dealing 1.5 hearts on each affected tile.",
             ),
         ],
     },
     Guide {
-        basics: "Freezes grounded players for two turns. On dry ground, a missed crystal waits until a player steps or lands on it; hovering does not trigger it.",
+        basics: "Freezes grounded players for two turns. A missed crystal on solid ground waits for a player to step or land on it; hovering does not trigger it.",
         reactions: &[
             (
-                "Water",
+                "Water Tile",
                 &[ReactionVisual::Ground(Ground::Water)],
-                "Freezes the tile and adjacent water. Grounded players on it are frozen for two turns.",
+                "Freezes the target and adjacent water, including diagonals. Grounded players on affected water freeze for two turns.",
             ),
             (
-                "Frozen tiles",
-                &[ReactionVisual::Frozen],
-                "A grounded player ending their own turn on ice loses half a heart, whether frozen or not.",
+                "Poisoned Water Tile",
+                &[ReactionVisual::PoisonWater],
+                "Freezes the water and pauses its poison until the tile thaws.",
             ),
             (
-                "Sunstone",
-                &[ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX)],
-                "Thaws a frozen player and, on frozen water, the tile without steam.",
-            ),
-            (
-                "Poison",
-                &[ReactionVisual::Poison],
-                "Ice pauses poison on the tile until it thaws. Frost does not remove acid.",
-            ),
-            (
-                "Stone Dust / explosions",
-                &[
-                    ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX),
-                    ReactionVisual::Explosion,
-                ],
-                "Stone Dust turns frozen water to ground; explosions thaw ice. A new hole or ridge frees a frozen player on it.",
+                "Grounded Player",
+                &[ReactionVisual::Player],
+                "A direct hit freezes the player for two turns.",
             ),
         ],
     },
     Guide {
-        basics: "Dormant Thorn Heart remains collectible. Active thorns deal 1 heart per completed turn, even to hovering players.",
+        basics: "A dormant Thorn Heart remains collectible. Active thorns deal 1 heart per completed turn, even to hovering players. It cannot be placed on acid.",
         reactions: &[
             (
                 "Life Essence",
                 &[ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX)],
-                "Grows a thorn vine for up to seven turns, then retracts. Water or wet ground adds an opposite vine.",
+                "Activates a vine that grows for up to seven completed turns and then retracts. A water base adds an opposite vine.",
             ),
             (
-                "Frost",
-                &[ReactionVisual::Ingredient(FROST_CRYSTAL_ITEM_INDEX)],
-                "Frozen tiles block a growing vine until they thaw.",
-            ),
-            (
-                "Toad Wart",
-                &[ReactionVisual::Ingredient(ACID_ITEM_INDEX)],
-                "Acid dissolves dormant Thorn Heart or an entire active vine; it cannot be placed on acid.",
-            ),
-            (
-                "Explosions / holes",
-                &[
-                    ReactionVisual::Explosion,
-                    ReactionVisual::Ground(Ground::Hole),
-                ],
-                "Explosions remove thorns in their footprint. A new hole touching an active vine dissolves it.",
+                "Healing Water Tile",
+                &[ReactionVisual::HealingWater],
+                "Uses the active Life Essence to grow vines, including an opposite vine on water.",
             ),
         ],
     },
@@ -171,126 +166,119 @@ const GUIDES: [Guide; 14] = [
         basics: "A direct hit deals half a heart, including to a hovering player.",
         reactions: &[
             (
-                "Water",
+                "Water Tile",
                 &[ReactionVisual::Ground(Ground::Water)],
-                "Electrifies connected water: 1 heart on water and half a heart on neighboring tiles. Hovering prevents the shock.",
+                "Electrifies connected water. Grounded players on it lose 1 heart; grounded players on neighboring tiles lose half a heart.",
+            ),
+            (
+                "Acidic Tile",
+                &[ReactionVisual::Acid],
+                "Electrifies acid for five completed turns, adding 1 heart per turn to its normal damage. Acidic water also conducts the usual water pulse.",
             ),
             (
                 "Obsidian",
                 &[ReactionVisual::Ingredient(OBSIDIAN_ITEM_INDEX)],
-                "Creates an X-shaped blast up to two tiles away, dealing 1.5 hearts per affected player.",
+                "Creates an X-shaped explosion up to two tiles away, dealing 1.5 hearts on each affected tile.",
             ),
             (
-                "Toad Wart",
-                &[ReactionVisual::Ingredient(ACID_ITEM_INDEX)],
-                "Electrifies acid for five turns, adding 1 heart per turn to its normal half-heart damage.",
-            ),
-            (
-                "Poison / frost",
-                &[ReactionVisual::Poison, ReactionVisual::Frozen],
-                "No special reaction. Electricity conducts through poisoned water and does not thaw ice.",
+                "Player",
+                &[ReactionVisual::Player],
+                "A direct hit deals half a heart, including to a hovering player.",
             ),
         ],
     },
     Guide {
-        basics: "Unlimited. On solid ground makes a hole; on a ridge makes solid ground. On natural water it needs Obsidian or Life Essence.",
+        basics: "Unlimited. On water, it can only be placed where Obsidian or Life Essence is present. Terrain limits can prevent new holes.",
         reactions: &[
+            (
+                "Solid Ground",
+                &[ReactionVisual::Ground(Ground::Solid)],
+                "Creates a hole and removes items and tile effects from that tile.",
+            ),
+            (
+                "Ridge",
+                &[ReactionVisual::Ground(Ground::Ridge)],
+                "Levels the ridge to solid ground.",
+            ),
+            (
+                "Thorned Solid Ground",
+                &[ReactionVisual::Thorns],
+                "Creates a hole and dissolves the active vine touching it.",
+            ),
             (
                 "Obsidian",
                 &[ReactionVisual::Ingredient(OBSIDIAN_ITEM_INDEX)],
-                "Explodes at the center and eight neighbors, then creates holes in a cross. The blast deals 1 heart at the center and half a heart nearby.",
+                "Creates an explosion on the center and eight neighbors, then creates holes in a cross. The blast deals 1 heart at the center and half a heart nearby.",
             ),
             (
                 "Life Essence",
                 &[ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX)],
-                "Grows two opposite arms over four turns; on the following turn their tiles become holes, while the center stays unchanged.",
+                "Starts two opposite arms of growth; after four growth turns, the arms and center become holes where the terrain limit allows.",
             ),
             (
-                "Other ingredients",
-                &[
-                    ReactionVisual::Ingredient(WATER_ITEM_INDEX),
-                    ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX),
-                    ReactionVisual::Ingredient(FROST_CRYSTAL_ITEM_INDEX),
-                ],
-                "No special reaction. Items and tile effects on newly created holes are removed.",
-            ),
-            (
-                "Terrain limit",
-                &[
-                    ReactionVisual::Ground(Ground::Ridge),
-                    ReactionVisual::Ground(Ground::Hole),
-                ],
-                "Immediate holes that exceed the combined ridge and hole limit are rejected. Delayed growth stops where the limit prevents it.",
+                "Healing Water Tile",
+                &[ReactionVisual::HealingWater],
+                "Consumes the active Life Essence and starts the hole-growing reaction.",
             ),
         ],
     },
     Guide {
-        basics: "Cannot be placed in a hole. Explosions can ignite ember and other Obsidian.",
+        basics: "Cannot be placed in a hole. Explosions can ignite ember and other Obsidian; ridges can block blasts.",
         reactions: &[
             (
                 "Sunstone",
                 &[ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX)],
-                "Creates a cross-shaped blast up to two tiles away, dealing 1.5 hearts on each affected tile.",
+                "Creates a cross-shaped explosion up to two tiles away, dealing 1.5 hearts on each affected tile.",
             ),
             (
                 "Storm Shard",
                 &[ReactionVisual::Ingredient(STORM_SHARD_ITEM_INDEX)],
-                "Creates an X-shaped blast up to two tiles away, dealing 1.5 hearts on each affected tile. Electricity reaching Obsidian through water also triggers it; the water shock adds its normal damage.",
-            ),
-            (
-                "Void Dust",
-                &[ReactionVisual::Ingredient(VOID_DUST_ITEM_INDEX)],
-                "Explodes at the center and eight neighbors, then makes holes in a cross.",
-            ),
-            (
-                "Stone Dust",
-                &[ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX)],
-                "Explodes at the center and eight neighbors, then makes ridges in a cross.",
-            ),
-            (
-                "Ridges / explosions",
-                &[
-                    ReactionVisual::Ground(Ground::Ridge),
-                    ReactionVisual::Explosion,
-                ],
-                "A blast starting off a ridge stops before ridges. An Obsidian hit by any explosion detonates in a cross.",
+                "Creates an X-shaped explosion up to two tiles away, dealing 1.5 hearts on each affected tile.",
             ),
         ],
     },
     Guide {
-        basics: "Unlimited. Cannot be placed on untainted dry ground or a ridge unless Obsidian or Life Essence is present.",
+        basics: "Unlimited. On solid ground or a ridge, it requires acid, poison, Obsidian, or Life Essence.",
         reactions: &[
             (
-                "Water / ice / holes",
-                &[
-                    ReactionVisual::Ground(Ground::Water),
-                    ReactionVisual::Frozen,
-                    ReactionVisual::Ground(Ground::Hole),
-                ],
-                "Turns water or frozen water into dry solid ground, and fills a hole with solid ground.",
+                "Water Tile",
+                &[ReactionVisual::Ground(Ground::Water)],
+                "Turns the water into solid ground, unless a higher-priority reaction such as Life Essence applies.",
             ),
             (
-                "Poison / acid",
-                &[ReactionVisual::Poison, ReactionVisual::Acid],
-                "Clears poison. Makes acid temporary; on acidic water it also creates solid ground.",
+                "Frozen Water Tile",
+                &[ReactionVisual::Frozen],
+                "Turns the water into solid ground and removes its ice.",
+            ),
+            (
+                "Hole",
+                &[ReactionVisual::Ground(Ground::Hole)],
+                "Fills the hole with solid ground.",
+            ),
+            (
+                "Poisoned Tile",
+                &[ReactionVisual::Poison],
+                "Clears poison from the targeted tile. If the tile is water, also turns it into solid ground.",
+            ),
+            (
+                "Acidic Tile",
+                &[ReactionVisual::Acid],
+                "Makes the acid temporary. If the tile is water, also turns it into solid ground.",
             ),
             (
                 "Obsidian",
                 &[ReactionVisual::Ingredient(OBSIDIAN_ITEM_INDEX)],
-                "Explodes at the center and eight neighbors, then makes ridges in a cross. The blast deals 1 heart at the center and half a heart nearby.",
+                "Creates an explosion on the center and eight neighbors, then creates ridges in a cross. The blast deals 1 heart at the center and half a heart nearby.",
             ),
             (
                 "Life Essence",
                 &[ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX)],
-                "Grows two opposite arms over four turns; on the following turn their tiles become ridges, while the center stays unchanged.",
+                "Starts two opposite arms of growth; after four growth turns, the arms and center become ridges where the terrain limit allows.",
             ),
             (
-                "Void Dust / Sunstone",
-                &[
-                    ReactionVisual::Ingredient(VOID_DUST_ITEM_INDEX),
-                    ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX),
-                ],
-                "No special reaction.",
+                "Healing Water Tile",
+                &[ReactionVisual::HealingWater],
+                "Consumes the active Life Essence and starts the ridge-growing reaction.",
             ),
         ],
     },
@@ -298,188 +286,168 @@ const GUIDES: [Guide; 14] = [
         basics: "Unlimited. Creates a permanent ember layer on any tile except a hole.",
         reactions: &[
             (
-                "Sunstone / explosions",
-                &[
-                    ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX),
-                    ReactionVisual::Explosion,
-                ],
-                "Ignites and consumes connected ember. Each burning tile deals 1 heart at its center and half a heart to neighbors; overlapping blasts add.",
+                "Solid Ground",
+                &[ReactionVisual::Ground(Ground::Solid)],
+                "Leaves an ember layer until it is ignited or the tile becomes a hole.",
             ),
             (
-                "Water",
+                "Water Tile",
                 &[ReactionVisual::Ground(Ground::Water)],
-                "An ember explosion centered on unfrozen water dries it to solid ground. The explosion does not produce steam.",
+                "Leaves an ember layer on the water. An explosion centered on unfrozen water dries it without making steam.",
             ),
             (
-                "Frost / electricity",
-                &[ReactionVisual::Frozen, ReactionVisual::Electricity],
-                "Ember does not change freezing or electricity and remains until ignited or its tile becomes a hole.",
+                "Ridge",
+                &[ReactionVisual::Ground(Ground::Ridge)],
+                "Leaves an ember layer until it is ignited or the tile becomes a hole.",
+            ),
+            (
+                "Sunstone",
+                &[ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX)],
+                "Ignites connected ember. Each burning tile deals 1 heart at its center and half a heart to neighbors.",
             ),
         ],
     },
     Guide {
-        basics: "Releases acid: half a heart per completed turn to grounded players. Acid lasts five turns on ground or a ridge and is permanent on water.",
+        basics: "Acid damages grounded players and lasts five turns on solid ground or a ridge; it is permanent on water.",
         reactions: &[
             (
-                "Water",
+                "Solid Ground",
+                &[ReactionVisual::Ground(Ground::Solid)],
+                "Releases acid for five completed turns. Grounded players on it lose half a heart per turn.",
+            ),
+            (
+                "Ridge",
+                &[ReactionVisual::Ground(Ground::Ridge)],
+                "Releases acid for five completed turns. Grounded players on it lose half a heart per turn.",
+            ),
+            (
+                "Water Tile",
                 &[ReactionVisual::Ground(Ground::Water)],
-                "Makes acid on ground permanent. Water and acid on a ridge level it to solid ground.",
+                "Releases permanent acid. Grounded players on it lose half a heart per turn.",
             ),
             (
-                "Storm Shard",
-                &[ReactionVisual::Ingredient(STORM_SHARD_ITEM_INDEX)],
-                "Electrifies acid for five turns, adding 1 heart per turn to its normal damage.",
-            ),
-            (
-                "Poison Frog Sphere",
-                &[ReactionVisual::Ingredient(POISON_ITEM_INDEX)],
-                "Spreads acid and poison in an X on the center and diagonal neighbors, excluding holes; frozen tiles receive no poison.",
-            ),
-            (
-                "Life Essence",
-                &[ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX)],
-                "Removes acid and electrification from the tile.",
-            ),
-            (
-                "Stone Dust",
-                &[ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX)],
-                "Makes acid temporary; on acidic water it also creates solid ground.",
-            ),
-            (
-                "Thorn Heart",
-                &[ReactionVisual::Ingredient(THORNHEART_ITEM_INDEX)],
-                "Dissolves dormant Thorn Heart or an entire active vine.",
-            ),
-        ],
-    },
-    Guide {
-        basics: "Releases poison for two completed turns. Grounded players on active poison lose half a heart per turn.",
-        reactions: &[
-            (
-                "Water / wet ground",
-                &[
-                    ReactionVisual::Ground(Ground::Water),
-                    ReactionVisual::WetGround,
-                ],
-                "Poison spreads one tile per completed turn through connected unfrozen wet tiles, including diagonals.",
-            ),
-            (
-                "Toad Wart",
-                &[ReactionVisual::Ingredient(ACID_ITEM_INDEX)],
-                "Spreads acid and poison in an X on the center and diagonal neighbors, excluding holes; frozen tiles receive no poison.",
-            ),
-            (
-                "Frost",
-                &[ReactionVisual::Ingredient(FROST_CRYSTAL_ITEM_INDEX)],
-                "Poison on ice pauses without damage or spreading until thawed. Poison cannot be placed on a frozen tile.",
-            ),
-            (
-                "Stone Dust",
-                &[ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX)],
-                "Clears poison from the targeted tile.",
-            ),
-            (
-                "Coatl's Egg",
-                &[ReactionVisual::Ingredient(COATL_EGG_ITEM_INDEX)],
-                "A summoned Coatl that touched active poison on its hit turn or the previous turn reduces its target to zero hearts.",
-            ),
-            (
-                "Storm Shard",
-                &[ReactionVisual::Ingredient(STORM_SHARD_ITEM_INDEX)],
-                "No special reaction; electricity still conducts through poisoned water.",
-            ),
-        ],
-    },
-    Guide {
-        basics: "The egg remains collectible until it reacts.",
-        reactions: &[
-            (
-                "Life Essence",
-                &[ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX)],
-                "Summons a three-cell Coatl. It moves after each completed turn toward the player with the most health.",
-            ),
-            (
-                "Poison",
+                "Poisoned Tile",
                 &[ReactionVisual::Poison],
-                "If the Coatl touched active poison on its hit turn or the previous turn, its hit reduces the target to zero hearts.",
+                "On a non-frozen tile, spreads acid and poison to the center and diagonal neighbors; holes are excluded and frozen tiles receive no poison.",
             ),
             (
-                "Acid / holes",
-                &[ReactionVisual::Acid, ReactionVisual::Ground(Ground::Hole)],
-                "A Coatl dies on contact with acid or a hole.",
-            ),
-            (
-                "Normal hit",
-                &[ReactionVisual::Player],
-                "Deals 1.5 hearts, but cannot reduce a living player below half a heart. A Coatl disappears after hitting.",
-            ),
-        ],
-    },
-    Guide {
-        basics: "On dry ground or a ridge, Life Essence remains collectible until activated.",
-        reactions: &[
-            (
-                "Water",
-                &[ReactionVisual::Ground(Ground::Water)],
-                "Heals grounded players on the tile by half a heart per completed turn for three turns.",
-            ),
-            (
-                "Toad Wart",
-                &[ReactionVisual::Ingredient(ACID_ITEM_INDEX)],
-                "Removes acid and electrification, then behaves normally on the remaining terrain.",
+                "Storm Shard",
+                &[ReactionVisual::Ingredient(STORM_SHARD_ITEM_INDEX)],
+                "Consumes the placed shard and electrifies the acid for five completed turns.",
             ),
             (
                 "Thorn Heart",
                 &[ReactionVisual::Ingredient(THORNHEART_ITEM_INDEX)],
-                "Grows thorns for up to seven turns; water or wet ground adds an opposite vine.",
+                "Dissolves the dormant Thorn Heart.",
             ),
             (
-                "Void Dust",
-                &[ReactionVisual::Ingredient(VOID_DUST_ITEM_INDEX)],
-                "Grows two opposite arms that become holes along with the center after four growth turns.",
+                "Thorned Tile",
+                &[ReactionVisual::Thorns],
+                "Dissolves the entire active vine touching the acid.",
             ),
             (
-                "Stone Dust",
-                &[ReactionVisual::Ingredient(STONE_DUST_ITEM_INDEX)],
-                "Grows two opposite arms that become ridges along with the center after four growth turns.",
+                "Tlaloc's Water on a Ridge",
+                &[
+                    ReactionVisual::Ingredient(WATER_ITEM_INDEX),
+                    ReactionVisual::Ground(Ground::Ridge),
+                ],
+                "Acid and the water already on the ridge turn it into solid ground.",
             ),
             (
-                "Coatl's Egg",
-                &[ReactionVisual::Ingredient(COATL_EGG_ITEM_INDEX)],
-                "Summons a three-cell Coatl.",
-            ),
-            (
-                "Aquatic Creature",
-                &[ReactionVisual::Ingredient(AQUATIC_ITEM_INDEX)],
-                "Together on water, awakens an aquatic creature. Adding water to both on dry ground also awakens it.",
+                "Coatl",
+                &[ReactionVisual::Coatl],
+                "Acid on any part of the summoned Coatl kills it during turn resolution.",
             ),
         ],
     },
     Guide {
-        basics: "A dormant Aquatic Creature remains collectible until activated.",
+        basics: "Poison lasts two completed turns. Grounded players on active poison lose half a heart per turn. Poison cannot be placed on frozen tiles.",
         reactions: &[
             (
-                "Life Essence + water",
+                "Solid Ground",
+                &[ReactionVisual::Ground(Ground::Solid)],
+                "Releases poison for two completed turns. Grounded players on active poison lose half a heart per turn.",
+            ),
+            (
+                "Water Tile",
+                &[ReactionVisual::Ground(Ground::Water)],
+                "Releases poison that spreads through connected unfrozen water on later completed turns.",
+            ),
+            (
+                "Acidic Tile",
+                &[ReactionVisual::Acid],
+                "On a non-frozen solid or water tile, spreads acid and poison to the center and diagonal neighbors; holes are excluded and frozen tiles receive no poison.",
+            ),
+            (
+                "Coatl",
+                &[ReactionVisual::Coatl],
+                "Poison on the Coatl's tile can make its hit lethal if touched during the hit turn or the preceding completed turn.",
+            ),
+        ],
+    },
+    Guide {
+        basics: "The egg remains collectible until activated. Coatl dies on acid or holes. Its normal hit deals 1.5 hearts but cannot reduce a living player below half a heart.",
+        reactions: &[
+            (
+                "Life Essence",
+                &[ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX)],
+                "Summons a three-cell Coatl. It moves up to two cells after each completed turn toward a player.",
+            ),
+            (
+                "Healing Water Tile",
+                &[ReactionVisual::HealingWater],
+                "Consumes the active Life Essence and summons a three-cell Coatl.",
+            ),
+        ],
+    },
+    Guide {
+        basics: "On solid ground or a ridge, Life Essence remains collectible until activated.",
+        reactions: &[
+            (
+                "Water Tile",
+                &[ReactionVisual::Ground(Ground::Water)],
+                "Creates healing water. Grounded players on the tile recover half a heart per completed turn for three turns.",
+            ),
+            (
+                "Acidic Tile",
+                &[ReactionVisual::Acid],
+                "Removes the acid and its electrification, then behaves normally on the remaining terrain.",
+            ),
+            (
+                "Thorn Heart",
+                &[ReactionVisual::Ingredient(THORNHEART_ITEM_INDEX)],
+                "Activates a thorn vine for up to seven turns; a water base adds an opposite vine.",
+            ),
+            (
+                "Coatl's Egg",
+                &[ReactionVisual::Ingredient(COATL_EGG_ITEM_INDEX)],
+                "Summons Coatl.",
+            ),
+            (
+                "Ahuizotl Totem on Water",
+                &[
+                    ReactionVisual::Ingredient(AQUATIC_ITEM_INDEX),
+                    ReactionVisual::Ground(Ground::Water),
+                ],
+                "Awakens Ahuizotl.",
+            ),
+        ],
+    },
+    Guide {
+        basics: "The dormant totem remains collectible. On water, it awakens with Life Essence. Ahuizotl hits hovering players too: 1 heart during growth, 1.5 during its sweep, at most once per turn.",
+        reactions: &[
+            (
+                "Life Essence on Water",
                 &[
                     ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX),
                     ReactionVisual::Ground(Ground::Water),
                 ],
-                "Awakens the creature. Water can be added after both ingredients are on dry ground.",
+                "Awakens Ahuizotl. Four arms grow for three turns, then sweep to an X and retract.",
             ),
             (
-                "Growth",
-                &[ReactionVisual::Aquatic],
-                "Four arms grow in a cross for three turns. Ridges stop an arm during growth.",
-            ),
-            (
-                "Rotation",
-                &[ReactionVisual::Aquatic],
-                "The arms sweep clockwise for two turns, leveling ridges and removing collectibles in their path.",
-            ),
-            (
-                "Player contact",
-                &[ReactionVisual::Player],
-                "Deals 1 heart per growth turn or 1.5 hearts per rotation turn, even to hovering players. Each creature hits a player at most once per turn.",
+                "Healing Water Tile",
+                &[ReactionVisual::HealingWater],
+                "Consumes the active Life Essence and awakens Ahuizotl.",
             ),
         ],
     },
@@ -642,6 +610,7 @@ fn render(
     mut commands: Commands,
     hud: Res<Hud>,
     images: Res<InventoryImages>,
+    serpent: Res<SerpentSheet>,
     mut help: ResMut<Help>,
 ) {
     if !help.dirty {
@@ -780,7 +749,9 @@ fn render(
                                                 ))
                                                 .with_children(|icons| {
                                                     for &visual in visuals {
-                                                        spawn_visual(icons, visual, &images);
+                                                        spawn_visual(
+                                                            icons, visual, &images, &serpent,
+                                                        );
                                                     }
                                                 });
                                                 text(cell, name, 12.0, GOLD);
@@ -791,12 +762,23 @@ fn render(
                                                     flex_grow: 1.0,
                                                     min_width: Val::Px(0.0),
                                                     padding: UiRect::all(Val::Px(8.0)),
-                                                    align_items: AlignItems::Center,
+                                                    flex_direction: FlexDirection::Column,
+                                                    justify_content: JustifyContent::Center,
+                                                    row_gap: Val::Px(4.0),
                                                     ..default()
                                                 },
                                                 Pickable::IGNORE,
                                             ))
                                             .with_children(|cell| {
+                                                text(
+                                                    cell,
+                                                    &format!(
+                                                        "{} + {name}",
+                                                        INVENTORY_ITEMS[index].0
+                                                    ),
+                                                    15.0,
+                                                    GOLD,
+                                                );
                                                 text(cell, description, 14.0, TEXT);
                                             });
                                     });
@@ -856,6 +838,7 @@ fn spawn_visual(
     parent: &mut ChildSpawnerCommands,
     visual: ReactionVisual,
     images: &InventoryImages,
+    serpent: &SerpentSheet,
 ) {
     let node = Node {
         width: Val::Px(30.0),
@@ -869,10 +852,22 @@ fn spawn_visual(
         parent.spawn((ReactionIcon, images.icon(index), node, Pickable::IGNORE));
         return;
     }
+    if visual == ReactionVisual::Coatl {
+        parent.spawn((
+            ReactionIcon,
+            ImageNode {
+                image: serpent.0.clone(),
+                rect: Some(Rect::new(0.0, 0.0, 96.0, 68.0)),
+                ..default()
+            },
+            node,
+            Pickable::IGNORE,
+        ));
+        return;
+    }
 
     let (ground, overlay) = match visual {
         ReactionVisual::Ground(ground) => (ground.color(), None),
-        ReactionVisual::WetGround => (Ground::Solid.color(), None),
         ReactionVisual::Frozen => (
             Ground::Water.color(),
             Some(Color::srgba(0.7, 0.94, 1.0, 0.8)),
@@ -881,24 +876,32 @@ fn spawn_visual(
             Ground::Solid.color(),
             Some(Color::srgba(0.65, 0.1, 0.75, 0.55)),
         ),
+        ReactionVisual::PoisonWater => (
+            Ground::Water.color(),
+            Some(Color::srgba(0.65, 0.1, 0.75, 0.55)),
+        ),
         ReactionVisual::Acid => (
             Ground::Solid.color(),
             Some(Color::srgba(0.25, 0.8, 0.1, 0.55)),
         ),
-        ReactionVisual::Explosion => (
+        ReactionVisual::AcidRidge => (
+            Ground::Ridge.color(),
+            Some(Color::srgba(0.25, 0.8, 0.1, 0.55)),
+        ),
+        ReactionVisual::Ember => (
             Ground::Solid.color(),
             Some(Color::srgba(1.0, 0.35, 0.0, 0.65)),
         ),
-        ReactionVisual::Electricity => (
+        ReactionVisual::HealingWater => (
             Ground::Water.color(),
-            Some(Color::srgba(1.0, 0.9, 0.1, 0.65)),
+            Some(Color::srgba(0.25, 0.9, 0.55, 0.65)),
         ),
-        ReactionVisual::Aquatic => (
-            Ground::Water.color(),
-            Some(Color::srgba(0.08, 0.63, 0.75, 0.85)),
+        ReactionVisual::Thorns => (
+            Ground::Solid.color(),
+            Some(Color::srgba(0.2, 0.55, 0.15, 0.85)),
         ),
         ReactionVisual::Player => (Ground::Solid.color(), Some(Color::srgb(0.15, 0.45, 0.9))),
-        ReactionVisual::Ingredient(_) => unreachable!(),
+        ReactionVisual::Ingredient(_) | ReactionVisual::Coatl => unreachable!(),
     };
     parent
         .spawn((
@@ -915,8 +918,6 @@ fn spawn_visual(
             };
             if let Some(color) = overlay {
                 tile.spawn((inset, BackgroundColor(color), Pickable::IGNORE));
-            } else if visual == ReactionVisual::WetGround {
-                tile.spawn((inset, images.icon(WATER_ITEM_INDEX), Pickable::IGNORE));
             }
         });
 }
@@ -941,14 +942,24 @@ fn text(parent: &mut ChildSpawnerCommands, value: &str, size: f32, color: Color)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ACID_ITEM_INDEX, POISON_ITEM_INDEX, STONE_DUST_ITEM_INDEX, VOID_DUST_ITEM_INDEX};
 
     #[test]
-    fn every_reaction_has_valid_visuals_and_compound_reactions_show_each_part() {
-        for guide in &GUIDES {
-            for &(name, visuals, _) in guide.reactions {
+    fn guides_list_directional_placements_with_valid_visuals() {
+        assert_eq!(
+            GUIDES
+                .iter()
+                .map(|guide| guide.reactions.len())
+                .sum::<usize>(),
+            66
+        );
+        for (index, guide) in GUIDES.iter().enumerate() {
+            for &(name, visuals, description) in guide.reactions {
+                assert!(!name.is_empty() && !description.is_empty());
+                assert!(!name.starts_with(INVENTORY_ITEMS[index].0));
                 assert!(!visuals.is_empty(), "{name} has no visual");
                 assert!(
-                    visuals.len() <= 3,
+                    visuals.len() <= 2,
                     "{name} has too many visuals for its cell"
                 );
                 for visual in visuals {
@@ -959,28 +970,58 @@ mod tests {
             }
         }
 
+        let targets = |index: usize| {
+            GUIDES[index]
+                .reactions
+                .iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>()
+        };
+        assert!(targets(STONE_DUST_ITEM_INDEX).contains(&"Poisoned Tile"));
+        assert!(targets(STONE_DUST_ITEM_INDEX).contains(&"Acidic Tile"));
+        assert!(!targets(STONE_DUST_ITEM_INDEX).contains(&"Poison Frog Sphere"));
+        assert!(!targets(LIFE_ESSENCE_ITEM_INDEX).contains(&"Void Dust"));
+        assert!(!targets(OBSIDIAN_ITEM_INDEX).contains(&"Void Dust"));
+        assert!(targets(VOID_DUST_ITEM_INDEX).contains(&"Thorned Solid Ground"));
+        assert!(targets(ACID_ITEM_INDEX).contains(&"Thorned Tile"));
         assert_eq!(
-            GUIDES[7].reactions[0].1,
-            &[
-                ReactionVisual::Ground(Ground::Water),
-                ReactionVisual::Frozen,
-                ReactionVisual::Ground(Ground::Hole),
-            ]
+            GUIDES[POISON_ITEM_INDEX]
+                .reactions
+                .iter()
+                .find(|row| row.0 == "Coatl")
+                .unwrap()
+                .1,
+            &[ReactionVisual::Coatl]
         );
-        assert_eq!(
-            GUIDES[0].reactions[4].1,
-            &[
-                ReactionVisual::Ingredient(ACID_ITEM_INDEX),
-                ReactionVisual::Poison,
-            ]
-        );
-        assert_eq!(
-            GUIDES[13].reactions[0].1,
-            &[
-                ReactionVisual::Ingredient(LIFE_ESSENCE_ITEM_INDEX),
-                ReactionVisual::Ground(Ground::Water),
-            ]
-        );
+        assert_eq!(INVENTORY_ITEMS[AQUATIC_ITEM_INDEX].0, "Ahuizotl Totem");
+        assert!(targets(LIFE_ESSENCE_ITEM_INDEX).contains(&"Ahuizotl Totem on Water"));
+    }
+
+    #[test]
+    fn rendering_shows_full_equations_and_descriptions_for_every_guide() {
+        let mut app = App::new();
+        let hud = app.world_mut().spawn_empty().id();
+        app.insert_resource(Hud(hud))
+            .init_resource::<InventoryImages>()
+            .init_resource::<SerpentSheet>()
+            .init_resource::<Help>()
+            .add_systems(Update, render);
+        for (index, guide) in GUIDES.iter().enumerate() {
+            let mut help = app.world_mut().resource_mut::<Help>();
+            help.item = Some(index);
+            help.dirty = true;
+            app.update();
+
+            let world = app.world_mut();
+            let mut labels = world.query::<&Text>();
+            let labels: Vec<_> = labels.iter(world).map(|text| text.0.as_str()).collect();
+            for &(target, _, description) in guide.reactions {
+                assert!(
+                    labels.contains(&format!("{} + {target}", INVENTORY_ITEMS[index].0).as_str())
+                );
+                assert!(labels.contains(&description));
+            }
+        }
     }
 
     #[test]
@@ -989,6 +1030,7 @@ mod tests {
         let hud = app.world_mut().spawn_empty().id();
         app.insert_resource(Hud(hud))
             .init_resource::<InventoryImages>()
+            .init_resource::<SerpentSheet>()
             .insert_resource(Help {
                 item: Some(STONE_DUST_ITEM_INDEX),
                 dirty: true,
