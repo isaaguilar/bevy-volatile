@@ -196,7 +196,7 @@ fn render(
                 .with_children(|row| {
                     if let Some(index) = entry.item {
                         row.spawn((
-                            ImageNode::new(images.0[index].clone()),
+                            images.icon(index),
                             Node {
                                 width: Val::Px(20.0),
                                 height: Val::Px(20.0),
@@ -286,7 +286,7 @@ mod tests {
         app.insert_resource(menu::Frontend::computer_match())
             .init_resource::<ComputerHistory>()
             .init_resource::<PlayerHealth>()
-            .insert_resource(InventoryImages(std::array::from_fn(|_| Handle::default())))
+            .init_resource::<InventoryImages>()
             .add_systems(Update, finish_match.in_set(menu::GameplaySystems))
             .add_systems(
                 Update,
@@ -304,7 +304,10 @@ mod tests {
                 .any(|text| text.0 == "Computer used Sunstone at E5")
         );
         let mut images = world.query::<&ImageNode>();
-        assert_eq!(images.iter(world).count(), 1);
+        assert_eq!(
+            images.single(world).unwrap().rect,
+            Some(InventoryImages::rect(SUNSTONE_ITEM_INDEX))
+        );
     }
 
     #[test]

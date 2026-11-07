@@ -75,21 +75,37 @@ const COATL_EGG_ITEM_INDEX: usize = 11;
 const LIFE_ESSENCE_ITEM_INDEX: usize = 12;
 const AQUATIC_ITEM_INDEX: usize = 13;
 const INGREDIENT_WEIGHTS: [u32; 14] = [0, 4, 4, 2, 4, 0, 4, 0, 0, 4, 4, 1, 4, 2];
-const INVENTORY_ITEMS: [(&str, &str); 14] = [
-    ("Tlaloc's Water", "items/water.png"),
-    ("Sunstone", "items/charcoal.png"),
-    ("Frost Crystal", "items/salt.png"),
-    ("Thorn Heart", "items/maize.png"),
-    ("Storm Shard", "items/copper.png"),
-    ("Void Dust", "items/cacao.png"),
-    ("Obsidian", "items/obsidian.png"),
-    ("Stone Dust", "items/limestone.png"),
-    ("Tlexochtli Ember", "items/honey.png"),
-    ("Toad Wart", "items/clay.png"),
-    ("Poison Frog Sphere", "items/chile.png"),
-    ("Coatl's Egg", "items/annatto.png"),
-    ("Life Essence", "items/copal.png"),
-    ("Aquatic Creature", "items/vanilla.png"),
+const INVENTORY_ITEMS: [(&str, usize); 14] = [
+    ("Tlaloc's Water", 0),
+    ("Sunstone", 4),
+    ("Frost Crystal", 6),
+    ("Thorn Heart", 10),
+    ("Storm Shard", 7),
+    ("Void Dust", 2),
+    ("Obsidian", 5),
+    ("Stone Dust", 3),
+    ("Tlexochtli Ember", 1),
+    ("Toad Wart", 9),
+    ("Poison Frog Sphere", 8),
+    ("Coatl's Egg", 11),
+    ("Life Essence", 13),
+    ("Aquatic Creature", 12),
+];
+const INVENTORY_ORDER: [usize; 14] = [
+    WATER_ITEM_INDEX,
+    OIL_ITEM_INDEX,
+    VOID_DUST_ITEM_INDEX,
+    STONE_DUST_ITEM_INDEX,
+    SUNSTONE_ITEM_INDEX,
+    OBSIDIAN_ITEM_INDEX,
+    FROST_CRYSTAL_ITEM_INDEX,
+    STORM_SHARD_ITEM_INDEX,
+    POISON_ITEM_INDEX,
+    ACID_ITEM_INDEX,
+    THORNHEART_ITEM_INDEX,
+    COATL_EGG_ITEM_INDEX,
+    AQUATIC_ITEM_INDEX,
+    LIFE_ESSENCE_ITEM_INDEX,
 ];
 
 #[derive(Component)]
@@ -783,8 +799,6 @@ struct HealthPanel;
 struct Heart {
     owner: PlayerId,
     index: usize,
-    full_image: Handle<Image>,
-    half_image: Handle<Image>,
 }
 
 #[derive(Component)]
@@ -835,6 +849,18 @@ impl Action {
             Self::Rest => 3,
             Self::Undo => 4,
         }
+    }
+
+    fn icon_rect(self) -> Option<Rect> {
+        let frame = match self {
+            Self::Move => 0,
+            Self::Hover => 1,
+            Self::Pickup => 2,
+            Self::Rest => 3,
+            Self::Undo => return None,
+        };
+        let y = frame as f32 * 32.0;
+        Some(Rect::new(0.0, y, 32.0, y + 32.0))
     }
 }
 
@@ -1039,8 +1065,34 @@ struct InventoryHover {
     selected: Option<(PlayerId, usize)>,
 }
 
-#[derive(Resource)]
-struct InventoryImages([Handle<Image>; 14]);
+#[derive(Resource, Default)]
+struct InventoryImages(Handle<Image>);
+
+impl InventoryImages {
+    fn rect(index: usize) -> Rect {
+        let frame = INVENTORY_ITEMS[index].1;
+        let x = (frame % 2) as f32 * 32.0;
+        let y = (frame / 2) as f32 * 32.0;
+        Rect::new(x, y, x + 32.0, y + 32.0)
+    }
+
+    fn icon(&self, index: usize) -> ImageNode {
+        ImageNode {
+            image: self.0.clone(),
+            rect: Some(Self::rect(index)),
+            ..default()
+        }
+    }
+
+    fn sprite(&self, index: usize, size: f32) -> Sprite {
+        Sprite {
+            image: self.0.clone(),
+            rect: Some(Self::rect(index)),
+            custom_size: Some(Vec2::splat(size)),
+            ..default()
+        }
+    }
+}
 
 enum SelectedAction {
     Item {
@@ -1530,25 +1582,35 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
             });
     });
 
-    spawn_health_displays(
+    let heart_sheet = asset_server
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::nearest();
+        })
+        .load("hearts-Sheet.png");
+    spawn_health_displays(&mut commands, hud.0, heart_sheet);
+    let item_images = InventoryImages(
+        asset_server
+            .load_builder()
+            .with_settings(|settings: &mut ImageLoaderSettings| {
+                settings.sampler = ImageSampler::nearest();
+            })
+            .load("inventory-Sheet.png"),
+    );
+    spawn_inventories(
         &mut commands,
         hud.0,
-        asset_server.load("heart.png"),
-        asset_server.load("half-heart.png"),
+        &item_images,
+        asset_server.load("infinity.png"),
     );
-    let item_images = INVENTORY_ITEMS.map(|(_, path)| asset_server.load(path));
-    spawn_inventories(&mut commands, hud.0, &item_images);
-    spawn_actions(
-        &mut commands,
-        hud.0,
-        [
-            asset_server.load("actions/move.png"),
-            asset_server.load("actions/hover.png"),
-            asset_server.load("actions/pickup.png"),
-            asset_server.load("actions/rest.png"),
-        ],
-    );
-    commands.insert_resource(InventoryImages(item_images));
+    let action_sheet = asset_server
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::nearest();
+        })
+        .load("actions-Sheet.png");
+    spawn_actions(&mut commands, hud.0, action_sheet);
+    commands.insert_resource(item_images);
 
     commands.spawn((
         PersistentWorld,
@@ -1629,7 +1691,12 @@ fn animate_players(
     }
 }
 
-fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Image>; 14]) {
+fn spawn_inventories(
+    commands: &mut Commands,
+    hud: Entity,
+    images: &InventoryImages,
+    infinity: Handle<Image>,
+) {
     commands.entity(hud).with_children(|parent| {
         for is_left in [true, false] {
             let mut node = Node {
@@ -1679,11 +1746,10 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
                         BorderColor::all(Color::srgb(0.86, 0.68, 0.32)),
                         Pickable::IGNORE,
                     ));
-                    for (index, ((label, _), image)) in
-                        INVENTORY_ITEMS.iter().zip(images.iter()).enumerate()
-                    {
-                        let column = index % 2;
-                        let row = index / 2;
+                    for (position, &index) in INVENTORY_ORDER.iter().enumerate() {
+                        let (label, _) = INVENTORY_ITEMS[index];
+                        let column = position % 2;
+                        let row = position / 2;
                         let left_inset = if column == 0 { HEALTH_PANEL_INSET } else { 0.0 };
                         let top_inset = if row == 0 { HEALTH_PANEL_INSET } else { 0.0 };
                         let bottom_inset = if row == BOARD_ROWS as usize - 1 {
@@ -1693,7 +1759,7 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
                         };
                         inventory
                             .spawn((
-                                Name::new(*label),
+                                Name::new(label),
                                 InventorySlot {
                                     index,
                                     owner: if is_left {
@@ -1720,7 +1786,7 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
                             ))
                             .with_children(|slot| {
                                 slot.spawn((
-                                    ImageNode::new(image.clone()),
+                                    images.icon(index),
                                     Node {
                                         width: Val::Px(25.0),
                                         height: Val::Px(25.0),
@@ -1730,7 +1796,7 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
                                     Pickable::IGNORE,
                                 ));
                                 slot.spawn((
-                                    Text::new(*label),
+                                    Text::new(label),
                                     TextFont {
                                         font_size: FontSize::Px(9.0),
                                         ..default()
@@ -1743,27 +1809,42 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
                                     TextColor(Color::srgb(1.0, 0.94, 0.78)),
                                     Pickable::IGNORE,
                                 ));
-                                slot.spawn((
-                                    InventoryCount {
-                                        owner: if is_left {
-                                            PlayerId::One
-                                        } else {
-                                            PlayerId::Two
-                                        },
-                                        index,
-                                    },
-                                    Text::new(if is_unlimited(index) {
-                                        "unlimited"
+                                let count = InventoryCount {
+                                    owner: if is_left {
+                                        PlayerId::One
                                     } else {
-                                        "1"
-                                    }),
-                                    TextFont {
-                                        font_size: FontSize::Px(9.0),
-                                        ..default()
+                                        PlayerId::Two
                                     },
-                                    TextColor(Color::WHITE),
-                                    Pickable::IGNORE,
-                                ));
+                                    index,
+                                };
+                                let mut node = Node {
+                                    position_type: PositionType::Absolute,
+                                    top: Val::Px(2.0),
+                                    right: Val::Px(3.0),
+                                    ..default()
+                                };
+                                if is_unlimited(index) {
+                                    node.width = Val::Px(12.0);
+                                    node.height = Val::Px(6.0);
+                                    slot.spawn((
+                                        count,
+                                        node,
+                                        ImageNode::new(infinity.clone()),
+                                        Pickable::IGNORE,
+                                    ));
+                                } else {
+                                    slot.spawn((
+                                        count,
+                                        Text::new("0"),
+                                        TextFont {
+                                            font_size: FontSize::Px(11.0),
+                                            ..default()
+                                        },
+                                        node,
+                                        TextColor(Color::WHITE),
+                                        Pickable::IGNORE,
+                                    ));
+                                }
                             });
                     }
                 });
@@ -1771,7 +1852,7 @@ fn spawn_inventories(commands: &mut Commands, hud: Entity, images: &[Handle<Imag
     });
 }
 
-fn spawn_actions(commands: &mut Commands, hud: Entity, images: [Handle<Image>; 4]) {
+fn spawn_actions(commands: &mut Commands, hud: Entity, sheet: Handle<Image>) {
     commands.entity(hud).with_children(|parent| {
         for owner in [PlayerId::One, PlayerId::Two] {
             let left = match owner {
@@ -1813,9 +1894,13 @@ fn spawn_actions(commands: &mut Commands, hud: Entity, images: [Handle<Image>; 4
                         Pickable::IGNORE,
                     ))
                     .with_children(|slot| {
-                        if let Some(image) = images.get(row) {
+                        if let Some(rect) = action.icon_rect() {
                             slot.spawn((
-                                ImageNode::new(image.clone()),
+                                ImageNode {
+                                    image: sheet.clone(),
+                                    rect: Some(rect),
+                                    ..default()
+                                },
                                 Node {
                                     width: Val::Px(26.0),
                                     height: Val::Px(26.0),
@@ -1868,11 +1953,7 @@ fn update_private_panels(
 
 fn update_inventory_counts(turn: Res<TurnState>, mut counts: Query<(&InventoryCount, &mut Text)>) {
     for (count, mut text) in &mut counts {
-        text.0 = if is_unlimited(count.index) {
-            "unlimited".into()
-        } else {
-            turn.inventory[count.owner.index()][count.index].to_string()
-        };
+        text.0 = turn.inventory[count.owner.index()][count.index].to_string();
     }
 }
 
@@ -1941,12 +2022,7 @@ fn update_action_slots(
     }
 }
 
-fn spawn_health_displays(
-    commands: &mut Commands,
-    hud: Entity,
-    heart: Handle<Image>,
-    half_heart: Handle<Image>,
-) {
+fn spawn_health_displays(commands: &mut Commands, hud: Entity, heart: Handle<Image>) {
     commands.entity(hud).with_children(|parent| {
         for is_left in [true, false] {
             let mut node = Node {
@@ -2001,10 +2077,12 @@ fn spawn_health_displays(
                                             PlayerId::Two
                                         },
                                         index,
-                                        full_image: heart.clone(),
-                                        half_image: half_heart.clone(),
                                     },
-                                    ImageNode::new(heart.clone()),
+                                    ImageNode {
+                                        image: heart.clone(),
+                                        rect: Some(Rect::new(0.0, 0.0, 32.0, 32.0)),
+                                        ..default()
+                                    },
                                     Node {
                                         width: Val::Px(24.0),
                                         height: Val::Px(24.0),
@@ -2447,7 +2525,7 @@ fn inventory_item(position: Vec2, owner: PlayerId) -> Option<usize> {
     }
     let column = (x / GRID_BLOCK_SIZE).floor() as usize;
     let row = (y / GRID_BLOCK_SIZE).floor() as usize;
-    Some(row * 2 + column)
+    Some(INVENTORY_ORDER[row * 2 + column])
 }
 
 fn action_cell(position: Vec2, owner: PlayerId) -> Option<usize> {
@@ -3193,11 +3271,7 @@ fn spawn_collectible(commands: &mut Commands, images: &InventoryImages, index: u
         Name::new(INVENTORY_ITEMS[index].0),
         BoardItem,
         Collectible { index, cell },
-        Sprite {
-            image: images.0[index].clone(),
-            custom_size: Some(Vec2::splat(44.0)),
-            ..default()
-        },
+        images.sprite(index, 44.0),
         Transform::from_xyz(center.x, center.y, 0.1),
     ));
     match index {
@@ -3679,7 +3753,7 @@ fn handle_selection(
                     .id();
                 let icon = commands
                     .spawn((
-                        ImageNode::new(images.0[index].clone()),
+                        images.icon(index),
                         preview_node(Vec2::ZERO),
                         Visibility::Hidden,
                         Pickable::IGNORE,
@@ -3740,10 +3814,8 @@ fn handle_selection(
                     let marker = commands
                         .spawn((
                             Sprite {
-                                image: images.0[*index].clone(),
                                 color: Color::srgba(1.0, 1.0, 1.0, 0.6),
-                                custom_size: Some(Vec2::splat(44.0)),
-                                ..default()
+                                ..images.sprite(*index, 44.0)
                             },
                             Transform::from_xyz(
                                 cell_center(target.cell).x,
@@ -4041,11 +4113,7 @@ fn handle_selection(
                         commands.entity(pending.marker).insert(Visibility::Hidden);
                         let entity = commands
                             .spawn((
-                                Sprite {
-                                    image: images.0[*index].clone(),
-                                    custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE / 2.0)),
-                                    ..default()
-                                },
+                                images.sprite(*index, GRID_BLOCK_SIZE / 2.0),
                                 Transform::from_xyz(player.x, player.y, 1.8),
                             ))
                             .id();
@@ -4077,10 +4145,8 @@ fn handle_selection(
                     let marker = commands
                         .spawn((
                             Sprite {
-                                image: images.0[*index].clone(),
                                 color: Color::srgba(1.0, 1.0, 1.0, 0.6),
-                                custom_size: Some(Vec2::splat(44.0)),
-                                ..default()
+                                ..images.sprite(*index, 44.0)
                             },
                             Transform::from_xyz(center.x, center.y, 0.8),
                         ))
@@ -4649,11 +4715,7 @@ fn handle_selection(
                         Name::new(INVENTORY_ITEMS[*index].0),
                         BoardItem,
                         PlacedItem,
-                        Sprite {
-                            image: images.0[*index].clone(),
-                            custom_size: Some(Vec2::splat(24.0)),
-                            ..default()
-                        },
+                        images.sprite(*index, 24.0),
                         Transform::from_xyz(
                             center.x + ITEM_CORNER_OFFSET,
                             center.y + ITEM_CORNER_OFFSET,
@@ -5582,11 +5644,11 @@ fn update_hearts(
         } else {
             Visibility::Inherited
         };
-        image.image = if remaining == 1 {
-            heart.half_image.clone()
+        image.rect = Some(if remaining == 1 {
+            Rect::new(32.0, 0.0, 64.0, 32.0)
         } else {
-            heart.full_image.clone()
-        };
+            Rect::new(0.0, 0.0, 32.0, 32.0)
+        });
     }
 }
 
@@ -5898,11 +5960,7 @@ fn update_life_essence_visuals(
                 let center = cell_center(cell);
                 commands.spawn((
                     LifeEssenceTile(cell),
-                    Sprite {
-                        image: images.0[LIFE_ESSENCE_ITEM_INDEX].clone(),
-                        custom_size: Some(Vec2::splat(24.0)),
-                        ..default()
-                    },
+                    images.sprite(LIFE_ESSENCE_ITEM_INDEX, 24.0),
                     Transform::from_xyz(center.x - 17.0, center.y + 16.0, 0.2),
                 ));
             }
@@ -6135,6 +6193,63 @@ fn finish_rest(
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    fn inventory_position(owner: PlayerId, item: usize) -> Vec2 {
+        let slot = INVENTORY_ORDER
+            .iter()
+            .position(|&index| index == item)
+            .unwrap();
+        let left = match owner {
+            PlayerId::One => -RESOLUTION_WIDTH / 2.0,
+            PlayerId::Two => RESOLUTION_WIDTH / 2.0 - 2.0 * GRID_BLOCK_SIZE,
+        };
+        Vec2::new(
+            left + (slot % 2) as f32 * GRID_BLOCK_SIZE + GRID_BLOCK_SIZE / 2.0,
+            BOARD_TOP - (slot / 2) as f32 * GRID_BLOCK_SIZE - GRID_BLOCK_SIZE / 2.0,
+        )
+    }
+
+    fn p1_item(item: usize) -> Vec2 {
+        inventory_position(PlayerId::One, item)
+    }
+
+    fn p2_item(item: usize) -> Vec2 {
+        inventory_position(PlayerId::Two, item)
+    }
+
+    #[test]
+    fn inventory_slots_select_the_requested_item_for_both_players() {
+        let expected = [
+            WATER_ITEM_INDEX,
+            OIL_ITEM_INDEX,
+            VOID_DUST_ITEM_INDEX,
+            STONE_DUST_ITEM_INDEX,
+            SUNSTONE_ITEM_INDEX,
+            OBSIDIAN_ITEM_INDEX,
+            FROST_CRYSTAL_ITEM_INDEX,
+            STORM_SHARD_ITEM_INDEX,
+            POISON_ITEM_INDEX,
+            ACID_ITEM_INDEX,
+            THORNHEART_ITEM_INDEX,
+            COATL_EGG_ITEM_INDEX,
+            AQUATIC_ITEM_INDEX,
+            LIFE_ESSENCE_ITEM_INDEX,
+        ];
+        for owner in [PlayerId::One, PlayerId::Two] {
+            for (slot, item) in expected.into_iter().enumerate() {
+                let x = if owner == PlayerId::One {
+                    -450.0
+                } else {
+                    390.0
+                };
+                let position = Vec2::new(
+                    x + (slot % 2) as f32 * GRID_BLOCK_SIZE,
+                    180.0 - (slot / 2) as f32 * GRID_BLOCK_SIZE,
+                );
+                assert_eq!(inventory_item(position, owner), Some(item));
+            }
+        }
+    }
 
     #[test]
     fn aquatic_sprites_rotate_and_clip_to_board_without_shifting_the_origin() {
@@ -6494,7 +6609,7 @@ mod tests {
             .init_resource::<Selection>()
             .init_resource::<InventoryHover>()
             .init_resource::<BoardCursor>()
-            .insert_resource(InventoryImages(std::array::from_fn(|_| Handle::default())))
+            .init_resource::<InventoryImages>()
             .add_systems(Update, reset_match);
         let world = app.world_mut();
         world.resource_mut::<PlayerHealth>().0 = [0, 3];
@@ -6633,7 +6748,7 @@ mod tests {
     fn health_displays_have_five_hearts_and_fit_the_side_columns() {
         fn setup_health(mut commands: Commands) {
             let hud = commands.spawn(Node::default()).id();
-            spawn_health_displays(&mut commands, hud, Handle::default(), Handle::default());
+            spawn_health_displays(&mut commands, hud, Handle::default());
         }
 
         let mut app = App::new();
@@ -6653,7 +6768,10 @@ mod tests {
             let hearts = world.get::<Children>(children[0]).unwrap();
             assert_eq!(hearts.len(), 5);
             for child in hearts.iter() {
-                assert!(world.get::<ImageNode>(child).is_some());
+                assert_eq!(
+                    world.get::<ImageNode>(child).unwrap().rect,
+                    Some(Rect::new(0.0, 0.0, 32.0, 32.0))
+                );
             }
             assert_eq!(node.align_items, AlignItems::Center);
             assert_eq!(
@@ -6674,29 +6792,45 @@ mod tests {
     }
 
     #[test]
+    fn heart_sheet_frames_follow_damage_and_healing_for_both_players() {
+        let mut app = interaction_app();
+        for health in [[10, 10], [9, 1], [0, 0], [1, 9], [10, 10]] {
+            app.world_mut().resource_mut::<PlayerHealth>().0 = health;
+            app.update();
+            for owner in [PlayerId::One, PlayerId::Two] {
+                for index in 0..HEART_COUNT {
+                    let remaining = health[owner.index()].saturating_sub((index * 2) as u8);
+                    assert_heart(&mut app, owner, index, remaining == 1, remaining > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn inventories_fill_rows_two_through_eight_on_both_sides() {
         let expected_names = [
             "Tlaloc's Water",
-            "Sunstone",
-            "Frost Crystal",
-            "Thorn Heart",
-            "Storm Shard",
-            "Void Dust",
-            "Obsidian",
-            "Stone Dust",
             "Tlexochtli Ember",
-            "Toad Wart",
+            "Void Dust",
+            "Stone Dust",
+            "Sunstone",
+            "Obsidian",
+            "Frost Crystal",
+            "Storm Shard",
             "Poison Frog Sphere",
+            "Toad Wart",
+            "Thorn Heart",
             "Coatl's Egg",
-            "Life Essence",
             "Aquatic Creature",
+            "Life Essence",
         ];
         fn setup_inventory(mut commands: Commands) {
             let hud = commands.spawn(Node::default()).id();
             spawn_inventories(
                 &mut commands,
                 hud,
-                &std::array::from_fn(|_| Handle::default()),
+                &InventoryImages::default(),
+                Handle::default(),
             );
         }
 
@@ -6735,7 +6869,58 @@ mod tests {
                 assert_eq!(slot.top, Val::Px(expected_y));
                 assert_eq!(name.as_str(), *expected);
                 assert_eq!(world.get::<Text>(children[1]).unwrap().0, *expected);
+                assert_eq!(
+                    world.get::<ImageNode>(children[0]).unwrap().rect,
+                    Some(Rect::new(
+                        (index % 2) as f32 * 32.0,
+                        (index / 2) as f32 * 32.0,
+                        (index % 2 + 1) as f32 * 32.0,
+                        (index / 2 + 1) as f32 * 32.0,
+                    ))
+                );
+                let count = world.get::<InventoryCount>(children[2]).unwrap();
+                let count_node = world.get::<Node>(children[2]).unwrap();
+                assert_eq!(count.index, INVENTORY_ORDER[index]);
+                assert_eq!(count_node.position_type, PositionType::Absolute);
+                assert_eq!(count_node.top, Val::Px(2.0));
+                assert_eq!(count_node.right, Val::Px(3.0));
+                if index < 4 {
+                    assert!(world.get::<ImageNode>(children[2]).is_some());
+                    assert!(world.get::<Text>(children[2]).is_none());
+                } else {
+                    assert_eq!(world.get::<Text>(children[2]).unwrap().0, "0");
+                }
             }
+        }
+    }
+
+    #[test]
+    fn action_icons_use_the_sheet_for_both_players() {
+        fn setup_actions(mut commands: Commands) {
+            let hud = commands.spawn(Node::default()).id();
+            spawn_actions(&mut commands, hud, Handle::default());
+        }
+
+        let mut app = App::new();
+        app.add_systems(Startup, setup_actions);
+        app.update();
+        let world = app.world_mut();
+        let mut slots = world.query::<(&ActionSlot, &Children)>();
+        let slots: Vec<_> = slots.iter(world).collect();
+        assert_eq!(slots.len(), 10);
+        for (slot, children) in slots {
+            let expected = match slot.action {
+                Action::Move => Some(Rect::new(0.0, 0.0, 32.0, 32.0)),
+                Action::Hover => Some(Rect::new(0.0, 32.0, 32.0, 64.0)),
+                Action::Pickup => Some(Rect::new(0.0, 64.0, 32.0, 96.0)),
+                Action::Rest => Some(Rect::new(0.0, 96.0, 32.0, 128.0)),
+                Action::Undo => None,
+            };
+            let image = children
+                .iter()
+                .find_map(|child| world.get::<ImageNode>(child));
+            assert_eq!(image.and_then(|image| image.rect), expected);
+            assert_eq!(image.is_some(), expected.is_some());
         }
     }
 
@@ -6746,13 +6931,10 @@ mod tests {
             spawn_inventories(
                 &mut commands,
                 hud,
-                &std::array::from_fn(|_| Handle::default()),
+                &InventoryImages::default(),
+                Handle::default(),
             );
-            spawn_actions(
-                &mut commands,
-                hud,
-                std::array::from_fn(|_| Handle::default()),
-            );
+            spawn_actions(&mut commands, hud, Handle::default());
         }
 
         let mut app = App::new();
@@ -6799,7 +6981,8 @@ mod tests {
             spawn_inventories(
                 &mut commands,
                 hud,
-                &std::array::from_fn(|_| Handle::default()),
+                &InventoryImages::default(),
+                Handle::default(),
             );
             commands.spawn((
                 DropFeedback,
@@ -6814,7 +6997,7 @@ mod tests {
             .init_resource::<TurnState>()
             .add_systems(Startup, setup_inventory)
             .add_systems(Update, highlight_inventory_hover);
-        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(-450.0, 180.0));
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(p1_item(WATER_ITEM_INDEX));
         app.update();
         let world = app.world_mut();
         let mut slots = world.query::<(&InventorySlot, &BackgroundColor, &Node)>();
@@ -6832,7 +7015,7 @@ mod tests {
             "Tlaloc's Water - click to select"
         );
 
-        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(450.0, 180.0));
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(p2_item(SUNSTONE_ITEM_INDEX));
         app.update();
         let world = app.world_mut();
         let mut slots = world.query::<(&InventorySlot, &BackgroundColor)>();
@@ -6997,10 +7180,7 @@ mod tests {
                         }
                     }
                 }
-                let inventory = Vec2::new(
-                    -450.0 + (ingredient % 2) as f32 * GRID_BLOCK_SIZE,
-                    180.0 - (ingredient / 2) as f32 * GRID_BLOCK_SIZE,
-                );
+                let inventory = p1_item(ingredient);
                 let target = cell_center(IVec2::new(distance, 3));
                 let cost = distance - 1;
                 click(&mut app, inventory);
@@ -7045,8 +7225,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(EntropyPlugin::<WyRand>::default());
         let mut heart_images = Assets::<Image>::default();
-        let full_heart = heart_images.add(Image::default());
-        let half_heart = heart_images.add(Image::default());
+        let heart_sheet = heart_images.add(Image::default());
         app.insert_resource(heart_images);
         app.init_resource::<ButtonInput<MouseButton>>()
             .init_resource::<ButtonInput<KeyCode>>()
@@ -7063,7 +7242,7 @@ mod tests {
                 rain: u16::MAX,
                 earthquake: u16::MAX,
             })
-            .insert_resource(InventoryImages(std::array::from_fn(|_| Handle::default())))
+            .init_resource::<InventoryImages>()
             .add_systems(
                 Update,
                 (
@@ -7151,14 +7330,11 @@ mod tests {
             spawn_inventories(
                 &mut commands,
                 hud.0,
-                &std::array::from_fn(|_| Handle::default()),
+                &InventoryImages::default(),
+                Handle::default(),
             );
-            spawn_actions(
-                &mut commands,
-                hud.0,
-                std::array::from_fn(|_| Handle::default()),
-            );
-            spawn_health_displays(&mut commands, hud.0, full_heart.clone(), half_heart.clone());
+            spawn_actions(&mut commands, hud.0, Handle::default());
+            spawn_health_displays(&mut commands, hud.0, heart_sheet.clone());
         });
         app.world_mut().spawn((
             Player(PlayerId::One),
@@ -7217,9 +7393,9 @@ mod tests {
         app.init_resource::<effects::Effects>();
         app.update();
         let target = IVec2::new(6, 3);
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert!(app.world().resource::<Board>().is_water(target));
         assert!(!app.world().resource::<Board>().is_frozen(target));
@@ -7268,7 +7444,7 @@ mod tests {
         }
         app.init_resource::<effects::Effects>();
         app.update();
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert!(!app.world().resource::<Board>().is_poisoned(source));
         assert!(app.world().resource::<Board>().is_poisoned(target));
@@ -7364,8 +7540,27 @@ mod tests {
         app.init_resource::<effects::Effects>();
         app.update();
         let target = IVec2::new(6, 3);
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
+        let selection = &app.world().resource::<Selection>().0;
+        let Some(SelectedAction::Item { icon, .. }) = selection else {
+            panic!("water must be selected");
+        };
+        assert_eq!(
+            app.world().get::<ImageNode>(*icon).unwrap().rect,
+            Some(Rect::new(0.0, 0.0, 32.0, 32.0))
+        );
         click_part(&mut app, cell_center(target));
+        let marker = app
+            .world()
+            .resource::<TurnState>()
+            .pending_placement
+            .as_ref()
+            .unwrap()
+            .marker;
+        assert_eq!(
+            app.world().get::<Sprite>(marker).unwrap().rect,
+            Some(Rect::new(0.0, 0.0, 32.0, 32.0))
+        );
         assert_eq!(
             app.world().resource::<Board>().ground(target),
             Some(Ground::Solid)
@@ -7392,6 +7587,10 @@ mod tests {
         assert_eq!(
             app.world().get::<Sprite>(entity).unwrap().custom_size,
             Some(Vec2::splat(GRID_BLOCK_SIZE / 2.0))
+        );
+        assert_eq!(
+            app.world().get::<Sprite>(entity).unwrap().rect,
+            Some(Rect::new(0.0, 0.0, 32.0, 32.0))
         );
         assert_eq!(
             app.world().resource::<Board>().ground(target),
@@ -7442,7 +7641,7 @@ mod tests {
     fn inert_placed_item_lands_and_remains_in_the_corner() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click_part(&mut app, Vec2::new(-390.0, 180.0));
+        click_part(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -7476,6 +7675,7 @@ mod tests {
             cell_center(target) + Vec2::splat(ITEM_CORNER_OFFSET)
         );
         assert_eq!(sprite.custom_size, Some(Vec2::splat(24.0)));
+        assert_eq!(sprite.rect, Some(Rect::new(0.0, 64.0, 32.0, 96.0)));
     }
 
     #[test]
@@ -7486,9 +7686,9 @@ mod tests {
         let target = IVec2::new(6, 3);
         let other = IVec2::new(4, 3);
         move_player_to(&mut app, PlayerId::Two, target);
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(-450.0, -60.0));
+        click_part(&mut app, p1_item(OIL_ITEM_INDEX));
         click_part(&mut app, cell_center(other));
         let turn = app.world().resource::<TurnState>();
         assert_eq!(turn.pending_effects.frozen_players[1], 2);
@@ -7506,10 +7706,10 @@ mod tests {
     fn ingredient_help_preserves_pending_action_and_pauses_controls() {
         let mut app = ingredient_help_app();
         let target = cell_center(IVec2::new(6, 3));
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         click_part(&mut app, target);
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
-        click_part(&mut app, Vec2::new(-390.0, 180.0));
+        click_part(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         let before = {
             let turn = app.world().resource::<TurnState>();
             (
@@ -7564,10 +7764,7 @@ mod tests {
     fn every_selected_ingredient_opens_its_own_guide() {
         let mut app = ingredient_help_app();
         for (index, (name, _)) in INVENTORY_ITEMS.iter().enumerate() {
-            let position = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let position = p1_item(index);
             click_part(&mut app, position);
             click_part(&mut app, Vec2::new(-330.0, -240.0));
             assert_eq!(app.world().resource::<help::Help>().item(), Some(index));
@@ -8078,7 +8275,7 @@ mod tests {
         app.world_mut().resource_mut::<Weather>().earthquake = 1;
         app.update();
         let target = IVec2::new(6, 3);
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         assert!(app.world().resource::<TurnState>().effects_active);
@@ -8449,7 +8646,7 @@ mod tests {
         app.world_mut().resource_mut::<TurnState>().strength[0] = 2;
         app.update();
 
-        click_part(&mut app, Vec2::new(-390.0, 180.0));
+        click_part(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click_part(&mut app, cell_center(oil));
         assert!(app.world().resource::<Board>().has_oil(oil));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
@@ -8527,7 +8724,7 @@ mod tests {
     fn queued_direct_hit_uses_the_players_final_tile() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert!(!app.world().resource::<Board>().is_frozen(target));
@@ -8552,9 +8749,9 @@ mod tests {
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, target);
         app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(-390.0, 120.0));
+        click_part(&mut app, p1_item(THORNHEART_ITEM_INDEX));
         click_part(&mut app, cell_center(IVec2::new(4, 3)));
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 0);
         assert!(app.world().resource::<TurnState>().hovering[1]);
@@ -8582,7 +8779,7 @@ mod tests {
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, cell);
         app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(cell));
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -8640,7 +8837,7 @@ mod tests {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         select_move(&mut app);
         click_part(&mut app, cell_center(cell));
@@ -8686,7 +8883,7 @@ mod tests {
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, cell);
         app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         app.world_mut().resource_mut::<TurnState>().magic[1] = 1;
         press_key(&mut app, KeyCode::KeyR);
@@ -8822,7 +9019,7 @@ mod tests {
                     1
                 );
             } else {
-                click_part(&mut app, Vec2::new(-450.0, 180.0));
+                click_part(&mut app, p1_item(WATER_ITEM_INDEX));
                 click_part(&mut app, cell_center(target));
                 assert!(app.world().resource::<Board>().is_water(target));
             }
@@ -8845,7 +9042,7 @@ mod tests {
                     click_part(&mut app, cell_center(next));
                 }
                 "placement" => {
-                    click_part(&mut app, Vec2::new(-450.0, 180.0));
+                    click_part(&mut app, p1_item(WATER_ITEM_INDEX));
                     click_part(&mut app, cell_center(next));
                     assert!(!app.world().resource::<Board>().is_water(next));
                 }
@@ -8886,7 +9083,7 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(8, 3);
         app.world_mut().resource_mut::<TurnState>().strength[0] = 3;
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<TurnState>().strength[0], 1);
         select_move(&mut app);
@@ -8904,7 +9101,7 @@ mod tests {
         select_move(&mut app);
         click_part(&mut app, cell_center(IVec2::new(3, 3)));
         assert_eq!(app.world().resource::<TurnState>().strength[0], 2);
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_some());
         click_part(&mut app, Vec2::new(330.0, -60.0));
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
@@ -8932,7 +9129,7 @@ mod tests {
         let target = IVec2::new(8, 3);
         app.world_mut().resource_mut::<TurnState>().strength[0] = 3;
         app.world_mut().resource_mut::<TurnState>().inventory[0][SUNSTONE_ITEM_INDEX] = 1;
-        click_part(&mut app, Vec2::new(-390.0, 180.0));
+        click_part(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][SUNSTONE_ITEM_INDEX],
@@ -8976,7 +9173,7 @@ mod tests {
                 .unwrap();
             assert_eq!(text.0, "1");
         }
-        click_part(&mut app, Vec2::new(-390.0, 180.0));
+        click_part(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_some());
     }
 
@@ -9065,8 +9262,8 @@ mod tests {
                 if water {
                     app.world_mut().resource_mut::<Board>().make_water(target);
                 }
-                let egg = Vec2::new(-390.0, -120.0);
-                let life = Vec2::new(-450.0, -180.0);
+                let egg = p1_item(COATL_EGG_ITEM_INDEX);
+                let life = p1_item(LIFE_ESSENCE_ITEM_INDEX);
                 for position in if egg_first { [egg, life] } else { [life, egg] } {
                     click_part(&mut app, position);
                     click_part(&mut app, cell_center(target));
@@ -9111,8 +9308,8 @@ mod tests {
             let origin = IVec2::new(4, 3);
             app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
             app.world_mut().resource_mut::<Board>().make_water(origin);
-            let aquatic = Vec2::new(-390.0, -180.0);
-            let life = Vec2::new(-450.0, -180.0);
+            let aquatic = p1_item(AQUATIC_ITEM_INDEX);
+            let life = p1_item(LIFE_ESSENCE_ITEM_INDEX);
             for icon in if aquatic_first {
                 [aquatic, life]
             } else {
@@ -9166,7 +9363,7 @@ mod tests {
             board.make_water(origin);
             board.add_life_essence(origin);
         }
-        click(&mut app, Vec2::new(-390.0, -180.0));
+        click(&mut app, p1_item(AQUATIC_ITEM_INDEX));
         click(&mut app, cell_center(origin));
         let board = app.world().resource::<Board>();
         assert_eq!(board.aquatic_cells().count(), 5);
@@ -9179,7 +9376,10 @@ mod tests {
         );
 
         let mut dry = interaction_app();
-        for icon in [Vec2::new(-390.0, -180.0), Vec2::new(-450.0, -180.0)] {
+        for icon in [
+            p1_item(AQUATIC_ITEM_INDEX),
+            p1_item(LIFE_ESSENCE_ITEM_INDEX),
+        ] {
             click_part(&mut dry, icon);
             click_part(&mut dry, cell_center(origin));
         }
@@ -9190,7 +9390,7 @@ mod tests {
             1
         );
         assert_eq!(world.query::<&PendingLifeEssence>().iter(world).count(), 1);
-        click(&mut dry, Vec2::new(390.0, 180.0));
+        click(&mut dry, p2_item(WATER_ITEM_INDEX));
         click(&mut dry, cell_center(origin));
         assert_eq!(dry.world().resource::<Board>().aquatic_cells().count(), 5);
     }
@@ -9319,7 +9519,7 @@ mod tests {
         );
         assert!(app.world().get_entity(base_item).is_ok());
         press_key(&mut app, KeyCode::KeyR);
-        click_part(&mut app, Vec2::new(390.0, 180.0));
+        click_part(&mut app, p2_item(WATER_ITEM_INDEX));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert!(app.world().resource::<Selection>().0.is_none());
 
@@ -9565,7 +9765,7 @@ mod tests {
         let destination = IVec2::new(6, 2);
         select_move(&mut app);
         click_part(&mut app, cell_center(destination));
-        click_part(&mut app, Vec2::new(-390.0, -180.0));
+        click_part(&mut app, p1_item(AQUATIC_ITEM_INDEX));
         click_part(&mut app, cell_center(origin));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(app.world().resource::<Board>().aquatic_cells().count(), 5);
@@ -9582,7 +9782,7 @@ mod tests {
             board.make_water(target);
             board.add_life_essence(target);
         }
-        click(&mut app, Vec2::new(-390.0, -120.0));
+        click(&mut app, p1_item(COATL_EGG_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<TurnState>().serpents.len(), 1);
         assert!(!app.world().resource::<Board>().has_life_essence(target));
@@ -9602,7 +9802,10 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<PlayerHealth>().0 = [9, 10];
-        for item in [Vec2::new(-390.0, -120.0), Vec2::new(-450.0, -180.0)] {
+        for item in [
+            p1_item(COATL_EGG_ITEM_INDEX),
+            p1_item(LIFE_ESSENCE_ITEM_INDEX),
+        ] {
             click_part(&mut app, item);
             click_part(&mut app, cell_center(target));
         }
@@ -9615,7 +9818,7 @@ mod tests {
         assert_eq!(animation.visuals[0].cells[0], target);
         assert_eq!(animation.frames.len(), 2);
         press_key(&mut app, KeyCode::KeyR);
-        click_part(&mut app, Vec2::new(390.0, 180.0));
+        click_part(&mut app, p2_item(WATER_ITEM_INDEX));
         let turn = app.world().resource::<TurnState>();
         assert_eq!(turn.active, PlayerId::Two);
         assert_eq!(turn.actions_used, 0);
@@ -9650,7 +9853,10 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<PlayerHealth>().0 = [10, 9];
-        for item in [Vec2::new(-390.0, -120.0), Vec2::new(-450.0, -180.0)] {
+        for item in [
+            p1_item(COATL_EGG_ITEM_INDEX),
+            p1_item(LIFE_ESSENCE_ITEM_INDEX),
+        ] {
             click_part(&mut app, item);
             click_part(&mut app, cell_center(target));
         }
@@ -9876,10 +10082,10 @@ mod tests {
     fn two_items_combine_in_one_turn() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         let initial_spawned = app.world().resource::<TurnState>().spawned_ingredients;
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_some());
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert_eq!(
@@ -9913,9 +10119,9 @@ mod tests {
         let target = IVec2::new(6, 3);
         assert!(app.world_mut().resource_mut::<Board>().make_hole(target));
         app.world_mut().resource_mut::<Board>().take_new_holes();
-        click_part(&mut app, Vec2::new(-390.0, 0.0));
+        click_part(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert!(app.world().resource::<Board>().is_water(target));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
@@ -9956,8 +10162,8 @@ mod tests {
             let mut app = interaction_app();
             let target = IVec2::new(6, 3);
             move_player_to(&mut app, PlayerId::Two, target);
-            let oil = Vec2::new(-450.0, -60.0);
-            let sun = Vec2::new(-390.0, 180.0);
+            let oil = p1_item(OIL_ITEM_INDEX);
+            let sun = p1_item(SUNSTONE_ITEM_INDEX);
             for item in if oil_first { [oil, sun] } else { [sun, oil] } {
                 click_part(&mut app, item);
                 click_part(&mut app, cell_center(target));
@@ -9980,10 +10186,10 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, target);
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
-        click_part(&mut app, Vec2::new(-450.0, 60.0));
+        click_part(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
@@ -9999,8 +10205,8 @@ mod tests {
     #[test]
     fn queued_direct_hits_consume_each_item_once_but_misses_remain_collectible() {
         for (index, icon) in [
-            (FROST_CRYSTAL_ITEM_INDEX, Vec2::new(-450.0, 120.0)),
-            (STORM_SHARD_ITEM_INDEX, Vec2::new(-450.0, 60.0)),
+            (FROST_CRYSTAL_ITEM_INDEX, p1_item(FROST_CRYSTAL_ITEM_INDEX)),
+            (STORM_SHARD_ITEM_INDEX, p1_item(STORM_SHARD_ITEM_INDEX)),
         ] {
             for hit in [false, true] {
                 let mut app = interaction_app();
@@ -10060,14 +10266,14 @@ mod tests {
                 let target = IVec2::new(6, 3);
                 move_player_to(&mut app, PlayerId::Two, target);
                 let hit = if frost {
-                    Vec2::new(-450.0, 120.0)
+                    p1_item(FROST_CRYSTAL_ITEM_INDEX)
                 } else {
-                    Vec2::new(-450.0, 60.0)
+                    p1_item(STORM_SHARD_ITEM_INDEX)
                 };
                 let other = if frost {
-                    Vec2::new(-450.0, 180.0)
+                    p1_item(WATER_ITEM_INDEX)
                 } else {
-                    Vec2::new(-450.0, 0.0)
+                    p1_item(OBSIDIAN_ITEM_INDEX)
                 };
                 for item in if hit_first {
                     [hit, other]
@@ -10106,7 +10312,7 @@ mod tests {
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory[0][WATER_ITEM_INDEX] = 2;
         for _ in 0..2 {
-            click_part(&mut app, Vec2::new(-450.0, 180.0));
+            click_part(&mut app, p1_item(WATER_ITEM_INDEX));
             click_part(&mut app, cell_center(target));
         }
         let turn = app.world().resource::<TurnState>();
@@ -10138,13 +10344,13 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX] = 1;
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
             0
         );
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_none());
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
         assert!(!app.world().resource::<Board>().is_water(target));
@@ -10160,7 +10366,7 @@ mod tests {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX] = 2;
         for target in [IVec2::new(6, 3), IVec2::new(7, 3)] {
-            click_part(&mut app, Vec2::new(-450.0, 120.0));
+            click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
             click_part(&mut app, cell_center(target));
         }
         let turn = app.world().resource::<TurnState>();
@@ -10209,7 +10415,7 @@ mod tests {
         }
         app.world_mut().resource_mut::<TurnState>().inventory[0][STONE_DUST_ITEM_INDEX] = 2;
         for cell in targets {
-            click_part(&mut app, Vec2::new(-390.0, 0.0));
+            click_part(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
             click_part(&mut app, cell_center(cell));
         }
         let turn = app.world().resource::<TurnState>();
@@ -10248,7 +10454,10 @@ mod tests {
             }
         }
         app.world_mut().resource_mut::<TurnState>().inventory[0][VOID_DUST_ITEM_INDEX] = 1;
-        for icon in [Vec2::new(-450.0, 120.0), Vec2::new(-390.0, 60.0)] {
+        for icon in [
+            p1_item(FROST_CRYSTAL_ITEM_INDEX),
+            p1_item(VOID_DUST_ITEM_INDEX),
+        ] {
             click_part(&mut app, icon);
             click_part(&mut app, cell_center(target));
         }
@@ -10283,7 +10492,7 @@ mod tests {
                 cell: IVec2::new(5, 3),
             },
         ));
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(IVec2::new(6, 3)));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
@@ -10302,7 +10511,7 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory[0][SUNSTONE_ITEM_INDEX] = 1;
-        click_part(&mut app, Vec2::new(-390.0, 180.0));
+        click_part(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][SUNSTONE_ITEM_INDEX],
@@ -10335,19 +10544,16 @@ mod tests {
             app.update();
             {
                 let world = app.world_mut();
-                let mut counts = world.query::<(&InventoryCount, &Text)>();
+                let mut counts = world.query::<(&InventoryCount, &ImageNode)>();
                 for player in [PlayerId::One, PlayerId::Two] {
-                    let (_, text) = counts
-                        .iter(world)
-                        .find(|(count, _)| count.owner == player && count.index == index)
-                        .unwrap();
-                    assert_eq!(text.0, "unlimited");
+                    assert!(
+                        counts
+                            .iter(world)
+                            .any(|(count, _)| count.owner == player && count.index == index)
+                    );
                 }
             }
-            let inventory = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p1_item(index);
             let first = IVec2::new(6, 3);
             let second = IVec2::new(6, 4);
             if index == STONE_DUST_ITEM_INDEX {
@@ -10407,7 +10613,7 @@ mod tests {
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory[0][WATER_ITEM_INDEX] = 2;
         for _ in 0..2 {
-            click_part(&mut app, Vec2::new(-450.0, 180.0));
+            click_part(&mut app, p1_item(WATER_ITEM_INDEX));
             click_part(&mut app, cell_center(target));
         }
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
@@ -10427,9 +10633,9 @@ mod tests {
             turn.hovering[0] = true;
             turn.magic[0] = 1;
         }
-        click_part(&mut app, Vec2::new(-390.0, 60.0));
+        click_part(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(-450.0, -60.0));
+        click_part(&mut app, p1_item(OIL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
 
         assert_eq!(
@@ -10457,9 +10663,9 @@ mod tests {
     fn second_item_on_a_new_hole_is_rejected_and_its_energy_is_refunded() {
         let mut app = interaction_app();
         let target = IVec2::new(8, 3);
-        click_part(&mut app, Vec2::new(-390.0, 60.0));
+        click_part(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(-450.0, -60.0));
+        click_part(&mut app, p1_item(OIL_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         let turn = app.world().resource::<TurnState>();
         assert_eq!(turn.active, PlayerId::One);
@@ -10486,7 +10692,7 @@ mod tests {
         for button in [false, true] {
             let mut app = interaction_app();
             app.world_mut().resource_mut::<TurnState>().strength[0] = 3;
-            click_part(&mut app, Vec2::new(-450.0, 180.0));
+            click_part(&mut app, p1_item(WATER_ITEM_INDEX));
             click_part(&mut app, cell_center(IVec2::new(8, 3)));
             assert_eq!(app.world().resource::<TurnState>().strength[0], 1);
             if button {
@@ -10506,10 +10712,10 @@ mod tests {
         *app.world_mut().resource_mut::<TurnState>() = TurnState::default();
         app.update();
         let unavailable = [
-            (FROST_CRYSTAL_ITEM_INDEX, Vec2::new(-450.0, 120.0)),
-            (STORM_SHARD_ITEM_INDEX, Vec2::new(-450.0, 60.0)),
-            (ACID_ITEM_INDEX, Vec2::new(-390.0, -60.0)),
-            (POISON_ITEM_INDEX, Vec2::new(-450.0, -120.0)),
+            (FROST_CRYSTAL_ITEM_INDEX, p1_item(FROST_CRYSTAL_ITEM_INDEX)),
+            (STORM_SHARD_ITEM_INDEX, p1_item(STORM_SHARD_ITEM_INDEX)),
+            (ACID_ITEM_INDEX, p1_item(ACID_ITEM_INDEX)),
+            (POISON_ITEM_INDEX, p1_item(POISON_ITEM_INDEX)),
         ];
         for player in 0..2 {
             for index in 0..INVENTORY_ITEMS.len() {
@@ -10532,7 +10738,10 @@ mod tests {
                     assert_eq!(text.0, "1");
                 }
             }
-            for position in [Vec2::new(-390.0, 180.0), Vec2::new(-450.0, -180.0)] {
+            for position in [
+                p1_item(SUNSTONE_ITEM_INDEX),
+                p1_item(LIFE_ESSENCE_ITEM_INDEX),
+            ] {
                 click(&mut app, position + Vec2::new(840.0 * player as f32, 0.0));
                 assert!(app.world().resource::<Selection>().0.is_some());
                 press_key(&mut app, KeyCode::Escape);
@@ -11089,7 +11298,7 @@ mod tests {
     #[test]
     fn hover_toggle_preserves_item_selection_and_updates_magic_bar_and_sprite() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_some());
         click(&mut app, Vec2::new(-330.0, 120.0));
         assert!(app.world().resource::<Selection>().0.is_some());
@@ -11194,7 +11403,7 @@ mod tests {
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         click(&mut app, Vec2::new(-330.0, 120.0));
         assert!(app.world().resource::<TurnState>().hovering[0]);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_none());
         select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
@@ -11271,7 +11480,7 @@ mod tests {
                 }
             }
             app.world_mut().resource_mut::<TurnState>().hovering[hovering_player.index()] = true;
-            click(&mut app, Vec2::new(-450.0, 60.0));
+            click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
             click(&mut app, cell_center(IVec2::new(6, 3)));
             let expected = if hovering_player == PlayerId::One {
                 [10, 8]
@@ -11292,7 +11501,7 @@ mod tests {
                 .resource_mut::<Board>()
                 .set(target, Ground::Water);
             app.world_mut().resource_mut::<TurnState>().hovering[1] = hovering;
-            click(&mut app, Vec2::new(-450.0, 120.0));
+            click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(app.world().resource::<PlayerHealth>().0[1], 10);
             assert_eq!(
@@ -11320,7 +11529,7 @@ mod tests {
             turn.hovering[1] = true;
             turn.magic[1] = 1;
         }
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 10);
@@ -11367,7 +11576,7 @@ mod tests {
                 }
             }
             app.world_mut().resource_mut::<TurnState>().hovering = [true, true];
-            click(&mut app, Vec2::new(-390.0, 180.0));
+            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
             click(&mut app, cell_center(target));
             if fire {
                 assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 8]);
@@ -11390,7 +11599,7 @@ mod tests {
         }
         app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 1;
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 0);
     }
@@ -11400,7 +11609,7 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(
             app.world().resource::<TurnState>().inventory[0][FROST_CRYSTAL_ITEM_INDEX],
@@ -11458,7 +11667,7 @@ mod tests {
     fn empty_inventory_allows_only_unlimited_ingredients() {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().inventory = [[0; 14]; 2];
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_none());
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         for index in [
@@ -11467,19 +11676,16 @@ mod tests {
             STONE_DUST_ITEM_INDEX,
             OIL_ITEM_INDEX,
         ] {
-            let position = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let position = p1_item(index);
             click(&mut app, position);
             assert!(app.world().resource::<Selection>().0.is_some());
             press_key(&mut app, KeyCode::Escape);
         }
-        for item in [Vec2::new(-390.0, -60.0), Vec2::new(-450.0, -120.0)] {
+        for item in [p1_item(ACID_ITEM_INDEX), p1_item(POISON_ITEM_INDEX)] {
             click(&mut app, item);
             assert!(app.world().resource::<Selection>().0.is_none());
         }
-        click(&mut app, Vec2::new(-450.0, -60.0));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(IVec2::new(6, 3)));
         assert!(app.world().resource::<Board>().has_oil(IVec2::new(6, 3)));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
@@ -11488,8 +11694,8 @@ mod tests {
     #[test]
     fn toad_wart_and_poison_frog_sphere_are_consumed_and_respawn() {
         for (index, inventory_position) in [
-            (ACID_ITEM_INDEX, Vec2::new(-390.0, -60.0)),
-            (POISON_ITEM_INDEX, Vec2::new(-450.0, -120.0)),
+            (ACID_ITEM_INDEX, p1_item(ACID_ITEM_INDEX)),
+            (POISON_ITEM_INDEX, p1_item(POISON_ITEM_INDEX)),
         ] {
             let mut app = interaction_app();
             let cell = IVec2::new(6, 3);
@@ -11541,9 +11747,9 @@ mod tests {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-390.0, -60.0));
+        click(&mut app, p1_item(ACID_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, -120.0));
+        click(&mut app, p2_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let turn = app.world().resource::<TurnState>();
         assert_eq!(turn.inventory[0][ACID_ITEM_INDEX], 0);
@@ -11572,7 +11778,7 @@ mod tests {
             let mut app = interaction_app();
             let cell = IVec2::new(6, 3);
             app.world_mut().resource_mut::<Board>().set(cell, ground);
-            click(&mut app, Vec2::new(-390.0, -60.0));
+            click(&mut app, p1_item(ACID_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert!(app.world().resource::<Board>().is_acidic(cell));
             {
@@ -11593,9 +11799,9 @@ mod tests {
         {
             let mut app = interaction_app();
             let cell = IVec2::new(6, 3);
-            click(&mut app, Vec2::new(-390.0, -60.0));
+            click(&mut app, p1_item(ACID_ITEM_INDEX));
             click(&mut app, cell_center(cell));
-            click(&mut app, Vec2::new(450.0, 0.0));
+            click(&mut app, p2_item(STONE_DUST_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
             assert!(world.resource::<Board>().is_acidic(cell));
@@ -11616,9 +11822,9 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Water);
-        click(&mut app, Vec2::new(-390.0, -60.0));
+        click(&mut app, p1_item(ACID_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(450.0, 0.0));
+        click(&mut app, p2_item(STONE_DUST_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(
             app.world().resource::<Board>().ground(cell),
@@ -11645,14 +11851,14 @@ mod tests {
             }
             move_player_to(&mut app, PlayerId::Two, cell);
             let first = if acid_first {
-                Vec2::new(-390.0, -60.0)
+                p1_item(ACID_ITEM_INDEX)
             } else {
-                Vec2::new(-450.0, -120.0)
+                p1_item(POISON_ITEM_INDEX)
             };
             let second = if acid_first {
-                Vec2::new(390.0, -120.0)
+                p2_item(POISON_ITEM_INDEX)
             } else {
-                Vec2::new(450.0, -60.0)
+                p2_item(ACID_ITEM_INDEX)
             };
             click(&mut app, first);
             click(&mut app, cell_center(cell));
@@ -11693,14 +11899,14 @@ mod tests {
                 .spawn((BoardItem, PendingObsidian(cell)))
                 .id();
             let first = if shard_first {
-                Vec2::new(-450.0, 60.0)
+                p1_item(STORM_SHARD_ITEM_INDEX)
             } else {
-                Vec2::new(-390.0, -60.0)
+                p1_item(ACID_ITEM_INDEX)
             };
             let second = if shard_first {
-                Vec2::new(450.0, -60.0)
+                p2_item(ACID_ITEM_INDEX)
             } else {
-                Vec2::new(390.0, 60.0)
+                p2_item(STORM_SHARD_ITEM_INDEX)
             };
             // Obsidian reacts to a shard, so introduce it after the first placement.
             if shard_first {
@@ -11755,7 +11961,7 @@ mod tests {
                 cell,
             },
         ));
-        click(&mut app, Vec2::new(-390.0, -60.0));
+        click(&mut app, p1_item(ACID_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(!app.world().resource::<Board>().has_thorns(cell));
         assert_eq!(
@@ -11802,9 +12008,9 @@ mod tests {
     fn water_stone_makes_existing_acid_permanent() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-390.0, -60.0));
+        click(&mut app, p1_item(ACID_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         for _ in 0..6 {
             press_key(&mut app, KeyCode::KeyR);
@@ -11827,7 +12033,7 @@ mod tests {
                 board.set(cell, ground);
                 board.add_acid(cell);
             }
-            click(&mut app, Vec2::new(-390.0, 120.0));
+            click(&mut app, p1_item(THORNHEART_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
             assert!(world.resource::<Board>().is_acidic(cell));
@@ -11867,7 +12073,7 @@ mod tests {
                 board.add_poison(cell);
                 board.add_acid(neighbor);
             }
-            click(&mut app, Vec2::new(-450.0, -180.0));
+            click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
             let board = world.resource::<Board>();
@@ -11901,7 +12107,7 @@ mod tests {
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
         app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
         app.world_mut().resource_mut::<Board>().add_acid(cell);
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().is_acidic(cell));
         let turn = app.world().resource::<TurnState>();
@@ -11919,7 +12125,7 @@ mod tests {
             .set(target, Ground::Water);
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 0;
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 1);
         press_key(&mut app, KeyCode::KeyR);
@@ -11971,7 +12177,7 @@ mod tests {
             .resource_mut::<Board>()
             .set(target, Ground::Water);
         app.world_mut().resource_mut::<PlayerHealth>().0[0] = 0;
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 0;
@@ -11995,7 +12201,7 @@ mod tests {
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<Board>().make_water(target);
         app.world_mut().resource_mut::<PlayerHealth>().0[0] = 0;
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         assert!(app.world().resource::<Board>().has_life_essence(target));
@@ -12035,7 +12241,7 @@ mod tests {
             .resource_mut::<Board>()
             .set(target, Ground::Water);
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         move_player_to(&mut app, PlayerId::Two, target);
         assert!(app.world().resource::<Board>().has_life_essence(target));
@@ -12057,7 +12263,7 @@ mod tests {
             .resource_mut::<Board>()
             .set(target, Ground::Ridge);
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         click(&mut app, Vec2::new(-330.0, 120.0));
@@ -12081,14 +12287,14 @@ mod tests {
                 let target = IVec2::new(6, 3);
                 app.world_mut().resource_mut::<Board>().set(target, ground);
                 let first = if life_first {
-                    Vec2::new(-450.0, -180.0)
+                    p1_item(LIFE_ESSENCE_ITEM_INDEX)
                 } else {
-                    Vec2::new(-390.0, 120.0)
+                    p1_item(THORNHEART_ITEM_INDEX)
                 };
                 let second = if life_first {
-                    Vec2::new(450.0, 120.0)
+                    p2_item(THORNHEART_ITEM_INDEX)
                 } else {
-                    Vec2::new(390.0, -180.0)
+                    p2_item(LIFE_ESSENCE_ITEM_INDEX)
                 };
                 click(&mut app, first);
                 click(&mut app, cell_center(target));
@@ -12114,7 +12320,7 @@ mod tests {
     fn active_thornheart_has_a_distinct_green_vine_visual() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-390.0, 120.0));
+        click(&mut app, p1_item(THORNHEART_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let dormant = {
             let world = app.world_mut();
@@ -12124,7 +12330,7 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        click(&mut app, Vec2::new(390.0, -180.0));
+        click(&mut app, p2_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let world = app.world_mut();
         let vine = world
@@ -12152,7 +12358,7 @@ mod tests {
             }
             app.world_mut().resource_mut::<TurnState>().hovering[1] = hovering;
             app.world_mut().resource_mut::<PlayerHealth>().0[1] = 9;
-            click(&mut app, Vec2::new(-390.0, 120.0));
+            click(&mut app, p1_item(THORNHEART_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(
                 app.world().resource::<PlayerHealth>().0[1],
@@ -12171,7 +12377,7 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-390.0, 120.0));
+        click(&mut app, p1_item(THORNHEART_ITEM_INDEX));
         click(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         move_player_to(&mut app, PlayerId::One, target);
@@ -12194,7 +12400,7 @@ mod tests {
             board.add_life_essence(target);
             board.finish_life_turn();
         }
-        click(&mut app, Vec2::new(-390.0, 120.0));
+        click(&mut app, p1_item(THORNHEART_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert!(app.world().resource::<Board>().has_thorns(target));
         assert!(app.world().resource::<Board>().has_life_essence(target));
@@ -12211,9 +12417,9 @@ mod tests {
     fn used_thornheart_and_dry_life_essence_respawn_as_collectibles() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-390.0, 120.0));
+        click(&mut app, p1_item(THORNHEART_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(390.0, -180.0));
+        click(&mut app, p2_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         for _ in 0..19 {
             press_key(&mut app, KeyCode::KeyR);
@@ -12236,7 +12442,7 @@ mod tests {
             board.finish_thorn_turn();
             board.add_oil(oil);
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(oil));
         assert!(!app.world().resource::<Board>().has_thorns(thorn));
         assert!(
@@ -12262,12 +12468,12 @@ mod tests {
     fn water_activates_all_dormant_life_essences_on_the_tile() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(390.0, -180.0));
+        click(&mut app, p2_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(item_count(&mut app), 2);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert!(app.world().resource::<Board>().has_life_essence(target));
         {
@@ -12328,7 +12534,7 @@ mod tests {
             board.make_wet(cell);
             board.add_life_essence(cell);
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let turn = app.world().resource::<TurnState>();
         assert_eq!(
@@ -12354,9 +12560,9 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, -180.0));
+        click(&mut app, p2_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().has_life_essence(cell));
         press_key(&mut app, KeyCode::KeyR);
@@ -12372,7 +12578,7 @@ mod tests {
     #[test]
     fn item_requires_two_clicks_and_previews_after_release() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         assert!(matches!(
             app.world().resource::<Selection>().0,
             Some(SelectedAction::Item { index: 0, .. })
@@ -12405,7 +12611,7 @@ mod tests {
         app.add_systems(Startup, spawn_board_terrain);
         let cell = IVec2::new(6, 3);
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(
             app.world().resource::<Board>().ground(cell),
@@ -12449,7 +12655,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Ridge);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(
             app.world().resource::<Board>().ground(cell),
@@ -12513,14 +12719,14 @@ mod tests {
                 .resource_mut::<Board>()
                 .set(cell, Ground::Ridge);
             let first = if water_first {
-                Vec2::new(-450.0, 180.0)
+                p1_item(WATER_ITEM_INDEX)
             } else {
-                Vec2::new(-390.0, -60.0)
+                p1_item(ACID_ITEM_INDEX)
             };
             let second = if water_first {
-                Vec2::new(450.0, -60.0)
+                p2_item(ACID_ITEM_INDEX)
             } else {
-                Vec2::new(390.0, 180.0)
+                p2_item(WATER_ITEM_INDEX)
             };
             click(&mut app, first);
             click(&mut app, cell_center(cell));
@@ -12580,11 +12786,11 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(ridge, Ground::Ridge);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(ridge));
-        click(&mut app, Vec2::new(390.0, -120.0));
+        click(&mut app, p2_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(source));
-        click(&mut app, Vec2::new(-390.0, -60.0));
+        click(&mut app, p1_item(ACID_ITEM_INDEX));
         click(&mut app, cell_center(source));
         let world = app.world_mut();
         assert_eq!(world.resource::<Board>().ground(ridge), Some(Ground::Solid));
@@ -12606,13 +12812,13 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Ridge);
-        click(&mut app, Vec2::new(-390.0, -60.0));
+        click(&mut app, p1_item(ACID_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         for _ in 0..5 {
             press_key(&mut app, KeyCode::KeyR);
         }
         assert!(!app.world().resource::<Board>().is_acidic(cell));
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let world = app.world_mut();
         assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Ridge));
@@ -12661,7 +12867,7 @@ mod tests {
             board.set(IVec2::new(5, 3), Ground::Water);
         }
         app.world_mut().resource_mut::<PlayerHealth>().0 = [6, 4];
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(life_essence_cells(&mut app), [target]);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [6, 5]);
@@ -12680,7 +12886,7 @@ mod tests {
         move_player_to(&mut app, PlayerId::Two, target);
         app.world_mut().resource_mut::<Board>().make_water(target);
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 9;
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 10);
         press_key(&mut app, KeyCode::KeyR);
@@ -12697,7 +12903,7 @@ mod tests {
             .set(target, Ground::Water);
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 0;
         for _ in 0..2 {
-            click_part(&mut app, Vec2::new(-450.0, -180.0));
+            click_part(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
             click_part(&mut app, cell_center(target));
         }
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 1);
@@ -12711,7 +12917,7 @@ mod tests {
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 3);
         assert!(life_essence_cells(&mut app).is_empty());
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 4);
         assert_eq!(life_essence_cells(&mut app), [target]);
@@ -12722,11 +12928,11 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         move_player_to(&mut app, PlayerId::One, target);
         app.world_mut().resource_mut::<PlayerHealth>().0[0] = 0;
-        click(&mut app, Vec2::new(390.0, -180.0));
+        click(&mut app, p2_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[0], 1);
         assert_eq!(life_essence_cells(&mut app), [target]);
@@ -12750,13 +12956,13 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-450.0, -180.0));
+        click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(item_count(&mut app), 1);
         assert!(life_essence_cells(&mut app).is_empty());
         move_player_to(&mut app, PlayerId::One, target);
         app.world_mut().resource_mut::<PlayerHealth>().0[0] = 0;
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[0], 1);
         assert_eq!(life_essence_cells(&mut app), [target]);
@@ -12781,7 +12987,7 @@ mod tests {
                 board.add_oil(explosion);
             }
             app.world_mut().resource_mut::<PlayerHealth>().0[1] = starting_health;
-            click(&mut app, Vec2::new(-390.0, 180.0));
+            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
             click(&mut app, cell_center(explosion));
             assert_eq!(
                 app.world().resource::<PlayerHealth>().0,
@@ -12805,7 +13011,7 @@ mod tests {
                 }
             }
             app.world_mut().resource_mut::<PlayerHealth>().0[1] = starting_health;
-            click(&mut app, Vec2::new(-450.0, 60.0));
+            click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(app.world().resource::<PlayerHealth>().0, [9, expected]);
             assert_eq!(life_essence_cells(&mut app), [target]);
@@ -12827,7 +13033,7 @@ mod tests {
             board.add_life_essence(target);
         }
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 1;
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 2);
         assert!(app.world().resource::<Board>().is_frozen(target));
@@ -12846,7 +13052,7 @@ mod tests {
             board.set(source, Ground::Water);
             board.set(adjacent, Ground::Water);
         }
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert_eq!(poison_cells(&mut app), [source]);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
@@ -12871,7 +13077,7 @@ mod tests {
         let mut app = interaction_app();
         let source = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, source);
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
         select_move(&mut app);
@@ -12890,11 +13096,11 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(neighbor, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(source));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(poison_cells(&mut app), [source]);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert_eq!(poison_cells(&mut app), [source]);
         assert_eq!(
@@ -12920,13 +13126,13 @@ mod tests {
                 board.set(cell, Ground::Water);
             }
         }
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(source));
-        click(&mut app, Vec2::new(390.0, 120.0));
+        click(&mut app, p2_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert!(app.world().resource::<Board>().is_frozen(source));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [7, 7]);
         assert_eq!(poison_cells(&mut app), [source]);
@@ -12940,10 +13146,10 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(source, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(source));
         move_player_to(&mut app, PlayerId::One, source);
-        click(&mut app, Vec2::new(390.0, 120.0));
+        click(&mut app, p2_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(poison_cells(&mut app), [source]);
@@ -12968,7 +13174,7 @@ mod tests {
             board.set(source, Ground::Water);
             assert!(board.freeze_water(source));
         }
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert!(poison_cells(&mut app).is_empty());
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
@@ -12978,9 +13184,9 @@ mod tests {
     fn oil_persists_when_water_is_removed() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, -60.0));
+        click(&mut app, p2_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().has_oil(cell));
         assert_eq!(
@@ -13012,7 +13218,7 @@ mod tests {
             let cell = IVec2::new(6, 3);
             move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
             app.world_mut().resource_mut::<Board>().set(cell, ground);
-            click(&mut app, Vec2::new(-450.0, -60.0));
+            click(&mut app, p1_item(OIL_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert!(app.world().resource::<Board>().has_oil(cell));
             assert_eq!(item_count(&mut app), 0);
@@ -13022,7 +13228,7 @@ mod tests {
                 assert!(app.world().resource::<Board>().has_oil(cell));
             }
             press_key(&mut app, KeyCode::KeyR);
-            click(&mut app, Vec2::new(-450.0, -60.0));
+            click(&mut app, p1_item(OIL_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert!(app.world().resource::<Board>().has_oil(cell));
             assert_eq!(item_count(&mut app), 0);
@@ -13035,9 +13241,9 @@ mod tests {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-450.0, -60.0));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().has_oil(cell));
         assert_eq!(
@@ -13052,7 +13258,7 @@ mod tests {
     fn oil_survives_water_transitions_and_fire_still_consumes_it() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, -60.0));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         for _ in 0..3 {
             press_key(&mut app, KeyCode::KeyR);
@@ -13070,7 +13276,7 @@ mod tests {
             press_key(&mut app, KeyCode::KeyR);
             assert!(app.world().resource::<Board>().has_oil(cell));
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(!app.world().resource::<Board>().has_oil(cell));
         assert_eq!(
@@ -13205,7 +13411,7 @@ mod tests {
     fn poison_obeys_throw_energy_and_rejects_unaffordable_targets() {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(IVec2::new(8, 3)));
         assert!(poison_cells(&mut app).is_empty());
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
@@ -13244,7 +13450,7 @@ mod tests {
             *rng.single_mut(world).unwrap() = WyRand::seed_from_u64(42);
             world.resource_mut::<TurnState>().wind = WindDirection::West;
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         press_key(&mut app, KeyCode::Escape);
         assert_eq!(
             app.world().resource::<TurnState>().wind,
@@ -13280,7 +13486,7 @@ mod tests {
                     board.make_wet(target);
                 }
             }
-            click(&mut app, Vec2::new(-390.0, 180.0));
+            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(steam_positions(&mut app), west_steam_positions());
             assert_eq!(app.world().resource::<Board>().water_percentage(target), 0);
@@ -13307,11 +13513,11 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(item_count(&mut app), 1);
         app.world_mut().resource_mut::<TurnState>().wind = WindDirection::West;
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(steam_positions(&mut app), west_steam_positions());
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
@@ -13345,7 +13551,7 @@ mod tests {
                 app.world_mut().resource_mut::<TurnState>().hovering[1] = hovering;
                 app.world_mut().resource_mut::<TurnState>().wind = WindDirection::West;
                 app.world_mut().resource_mut::<Board>().make_water(target);
-                click(&mut app, Vec2::new(-390.0, 180.0));
+                click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
                 click(&mut app, cell_center(target));
                 let expected = if cell == target {
                     8
@@ -13369,9 +13575,9 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(390.0, -60.0));
+        click(&mut app, p2_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
         assert!(!app.world().resource::<Board>().has_oil(target));
@@ -13386,10 +13592,10 @@ mod tests {
     fn placed_sunstone_reacts_only_to_a_valid_matching_tile() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         app.world_mut().resource_mut::<TurnState>().strength[1] = 0;
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(item_count(&mut app), 1);
         assert!(steam_positions(&mut app).is_empty());
@@ -13412,14 +13618,14 @@ mod tests {
             board.set(IVec2::new(5, 3), Ground::Water);
             board.set(IVec2::new(7, 3), Ground::Water);
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(390.0, 120.0));
+        click(&mut app, p2_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(item_count(&mut app), 3);
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 7]);
         assert!(app.world().resource::<Board>().is_frozen(target));
@@ -13437,12 +13643,12 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-450.0, -120.0));
+        click(&mut app, p1_item(POISON_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(450.0, 180.0));
+        click(&mut app, p2_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(poison_cells(&mut app), [target]);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(poison_cells(&mut app), [target]);
         assert_eq!(
@@ -13466,7 +13672,7 @@ mod tests {
                 }
                 assert!(board.freeze_water(target));
             }
-            click(&mut app, Vec2::new(-390.0, 180.0));
+            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert!(!app.world().resource::<Board>().is_frozen(target));
             assert!(app.world().resource::<Board>().is_water(target));
@@ -13490,15 +13696,15 @@ mod tests {
             let mut app = interaction_app();
             let target = IVec2::new(6, 3);
             move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-            click(&mut app, Vec2::new(-450.0, 180.0));
+            click(&mut app, p1_item(WATER_ITEM_INDEX));
             click(&mut app, cell_center(target));
             if freeze_first {
-                click(&mut app, Vec2::new(390.0, 120.0));
+                click(&mut app, p2_item(FROST_CRYSTAL_ITEM_INDEX));
                 click(&mut app, cell_center(target));
                 assert_eq!(frozen_sprite_count(&mut app), 1);
-                click(&mut app, Vec2::new(-390.0, 180.0));
+                click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
             } else {
-                click(&mut app, Vec2::new(450.0, 180.0));
+                click(&mut app, p2_item(SUNSTONE_ITEM_INDEX));
             }
             click(&mut app, cell_center(target));
             assert_eq!(frozen_sprite_count(&mut app), 0);
@@ -13523,10 +13729,10 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 4));
-        click(&mut app, Vec2::new(-450.0, -60.0));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         move_player_to(&mut app, PlayerId::One, target);
-        click(&mut app, Vec2::new(450.0, 180.0));
+        click(&mut app, p2_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 9]);
         assert!(!app.world().resource::<Board>().has_oil(target));
@@ -13563,18 +13769,18 @@ mod tests {
                     },
                 );
                 let first = if obsidian_first {
-                    Vec2::new(-450.0, 0.0)
+                    p1_item(OBSIDIAN_ITEM_INDEX)
                 } else if storm {
-                    Vec2::new(-450.0, 60.0)
+                    p1_item(STORM_SHARD_ITEM_INDEX)
                 } else {
-                    Vec2::new(-390.0, 180.0)
+                    p1_item(SUNSTONE_ITEM_INDEX)
                 };
                 let second = if obsidian_first && storm {
-                    Vec2::new(390.0, 60.0)
+                    p2_item(STORM_SHARD_ITEM_INDEX)
                 } else if obsidian_first {
-                    Vec2::new(450.0, 180.0)
+                    p2_item(SUNSTONE_ITEM_INDEX)
                 } else {
-                    Vec2::new(390.0, 0.0)
+                    p2_item(OBSIDIAN_ITEM_INDEX)
                 };
                 click(&mut app, first);
                 click(&mut app, cell_center(target));
@@ -13627,21 +13833,21 @@ mod tests {
             let target = IVec2::new(6, 3);
             move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
             let first = if sunstone_first {
-                Vec2::new(-390.0, 180.0)
+                p1_item(SUNSTONE_ITEM_INDEX)
             } else {
-                Vec2::new(-450.0, 60.0)
+                p1_item(STORM_SHARD_ITEM_INDEX)
             };
             let second = if sunstone_first {
-                Vec2::new(390.0, 60.0)
+                p2_item(STORM_SHARD_ITEM_INDEX)
             } else {
-                Vec2::new(450.0, 180.0)
+                p2_item(SUNSTONE_ITEM_INDEX)
             };
             click(&mut app, first);
             click(&mut app, cell_center(target));
             click(&mut app, second);
             click(&mut app, cell_center(target));
             move_player_to(&mut app, PlayerId::Two, target);
-            click(&mut app, Vec2::new(-450.0, 0.0));
+            click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
             click(&mut app, cell_center(target));
             let world = app.world_mut();
             assert_eq!(world.resource::<PlayerHealth>().0, [7, 4]);
@@ -13698,7 +13904,7 @@ mod tests {
         app.world_mut()
             .spawn((BoardItem, PendingStormShard(target)));
         app.world_mut().spawn((BoardItem, PendingSunstone(target)));
-        click(&mut app, Vec2::new(-450.0, 0.0));
+        click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 2);
         let world = app.world_mut();
@@ -13723,7 +13929,7 @@ mod tests {
             .resource_mut::<Board>()
             .set(target, Ground::Hole);
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
-        click(&mut app, Vec2::new(-450.0, 0.0));
+        click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let world = app.world_mut();
         assert_eq!(world.resource::<TurnState>().active, PlayerId::One);
@@ -13816,7 +14022,7 @@ mod tests {
             board.activate_thornheart(behind, 1, true);
             board.finish_thorn_turn();
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(source));
         let world = app.world_mut();
         assert_eq!(world.resource::<PlayerHealth>().0[1], 10);
@@ -13862,9 +14068,9 @@ mod tests {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
         let target = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(450.0, 0.0));
+        click(&mut app, p2_item(STONE_DUST_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let world = app.world_mut();
         assert_eq!(
@@ -13890,13 +14096,10 @@ mod tests {
         ] {
             let mut app = interaction_app();
             let cell = IVec2::new(6, 3);
-            let first = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let first = p1_item(index);
             click(&mut app, first);
             click(&mut app, cell_center(cell));
-            click(&mut app, Vec2::new(450.0, 60.0));
+            click(&mut app, p2_item(VOID_DUST_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
             let board = world.resource::<Board>();
@@ -13928,7 +14131,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Ridge);
-        click(&mut app, Vec2::new(-390.0, 60.0));
+        click(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let world = app.world_mut();
         assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Solid));
@@ -13946,7 +14149,7 @@ mod tests {
             board.add_acid(target);
             board.add_poison(target);
         }
-        click(&mut app, Vec2::new(-390.0, 60.0));
+        click(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let board = app.world().resource::<Board>();
         assert_eq!(board.ground(target), Some(Ground::Hole));
@@ -13969,7 +14172,7 @@ mod tests {
                 }
             }
         }
-        click_part(&mut app, Vec2::new(-390.0, 60.0));
+        click_part(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(
             app.world().resource::<Board>().ground(target),
@@ -13987,7 +14190,7 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         app.world_mut().resource_mut::<Board>().make_wet(target);
-        click(&mut app, Vec2::new(-390.0, 60.0));
+        click(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let board = app.world().resource::<Board>();
         assert_eq!(board.ground(target), Some(Ground::Hole));
@@ -14008,7 +14211,7 @@ mod tests {
             } else {
                 item.insert(PendingFrost(cell));
             }
-            click_part(&mut app, Vec2::new(-390.0, 60.0));
+            click_part(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
             click_part(&mut app, cell_center(cell));
             let world = app.world_mut();
             assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Water));
@@ -14035,9 +14238,9 @@ mod tests {
                     }
                 }
             }
-            click(&mut app, Vec2::new(-450.0, 0.0));
+            click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
             click(&mut app, cell_center(cell));
-            click(&mut app, Vec2::new(450.0, 60.0));
+            click(&mut app, p2_item(VOID_DUST_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
             for x in -1..=1 {
@@ -14088,7 +14291,7 @@ mod tests {
                 cell: adjacent,
             },
         ));
-        click(&mut app, Vec2::new(-390.0, 60.0));
+        click(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click(&mut app, cell_center(center));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 9]);
         let world = app.world_mut();
@@ -14134,7 +14337,7 @@ mod tests {
                 cell: center,
             },
         ));
-        click(&mut app, Vec2::new(-390.0, 0.0));
+        click(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
         click(&mut app, cell_center(center));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 9]);
         let world = app.world_mut();
@@ -14177,7 +14380,7 @@ mod tests {
                 },
             ));
         }
-        click(&mut app, Vec2::new(-390.0, 0.0));
+        click(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
         click(&mut app, cell_center(center));
         let world = app.world_mut();
         assert_eq!(world.resource::<PlayerHealth>().0, [8, 6]);
@@ -14218,7 +14421,7 @@ mod tests {
                 cell: center,
             },
         ));
-        click(&mut app, Vec2::new(-450.0, 0.0));
+        click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
         click(&mut app, cell_center(center));
         let world = app.world_mut();
         assert_eq!(world.resource::<PlayerHealth>().0, [8, 9]);
@@ -14251,10 +14454,7 @@ mod tests {
                 },
             ));
             move_player_to(&mut app, PlayerId::One, IVec2::new(1, 0));
-            let inventory = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p1_item(index);
             click(&mut app, inventory);
             click(&mut app, cell_center(center));
             let board = app.world().resource::<Board>();
@@ -14272,9 +14472,9 @@ mod tests {
             let center = IVec2::new(6, 3);
             app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
             app.world_mut().resource_mut::<Board>().set(center, ground);
-            click(&mut app, Vec2::new(-450.0, -180.0));
+            click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
             click(&mut app, cell_center(center));
-            click(&mut app, Vec2::new(450.0, 60.0));
+            click(&mut app, p2_item(VOID_DUST_ITEM_INDEX));
             click(&mut app, cell_center(center));
             for expected in [1, 2, 3, 4, 5] {
                 let world = app.world_mut();
@@ -14319,7 +14519,7 @@ mod tests {
             board.make_water(cell);
             board.add_life_essence(cell);
         }
-        click(&mut app, Vec2::new(-390.0, 60.0));
+        click(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let world = app.world_mut();
         assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Water));
@@ -14362,7 +14562,7 @@ mod tests {
             },
             PendingObsidian(cell),
         ));
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let world = app.world_mut();
         assert_eq!(world.query::<&FireFlash>().iter(world).count(), 9);
@@ -14412,10 +14612,7 @@ mod tests {
                 },
                 PendingVoidDust(cell),
             ));
-            let inventory = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p1_item(index);
             click(&mut app, inventory);
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
@@ -14435,7 +14632,7 @@ mod tests {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         app.world_mut().resource_mut::<Board>().make_water(cell);
-        click(&mut app, Vec2::new(-390.0, 60.0));
+        click(&mut app, p1_item(VOID_DUST_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let world = app.world_mut();
         assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Water));
@@ -14454,10 +14651,7 @@ mod tests {
             let mut app = interaction_app();
             let cell = IVec2::new(8, 3);
             app.world_mut().resource_mut::<Board>().set(cell, ground);
-            let inventory = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p1_item(index);
             click_part(&mut app, inventory);
             click_part(&mut app, cell_center(cell));
             let world = app.world_mut();
@@ -14497,7 +14691,7 @@ mod tests {
                     assert!(board.freeze_water(cell));
                 }
             }
-            click(&mut app, Vec2::new(-390.0, 0.0));
+            click(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
             let board = world.resource::<Board>();
@@ -14535,10 +14729,7 @@ mod tests {
             let cell = IVec2::new(6, 3);
             app.world_mut().resource_mut::<Board>().set(cell, ground);
             for index in [first, dust] {
-                let inventory = Vec2::new(
-                    -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                    180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-                );
+                let inventory = p1_item(index);
                 click_part(&mut app, inventory);
                 click_part(&mut app, cell_center(cell));
             }
@@ -14576,7 +14767,7 @@ mod tests {
             board.make_water(cell);
             board.add_oil(cell);
         }
-        for position in [Vec2::new(-390.0, 180.0), Vec2::new(-390.0, 0.0)] {
+        for position in [p1_item(SUNSTONE_ITEM_INDEX), p1_item(STONE_DUST_ITEM_INDEX)] {
             click_part(&mut app, position);
             click_part(&mut app, cell_center(cell));
         }
@@ -14604,10 +14795,7 @@ mod tests {
             app.world_mut()
                 .resource_mut::<Board>()
                 .set(cell, Ground::Hole);
-            let inventory = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p1_item(index);
             click(&mut app, inventory);
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
@@ -14641,9 +14829,9 @@ mod tests {
             let center = IVec2::new(6, 3);
             app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
             app.world_mut().resource_mut::<Board>().set(center, ground);
-            click(&mut app, Vec2::new(-450.0, -180.0));
+            click(&mut app, p1_item(LIFE_ESSENCE_ITEM_INDEX));
             click(&mut app, cell_center(center));
-            click(&mut app, Vec2::new(450.0, 0.0));
+            click(&mut app, p2_item(STONE_DUST_ITEM_INDEX));
             click(&mut app, cell_center(center));
             {
                 let world = app.world_mut();
@@ -14707,7 +14895,7 @@ mod tests {
             board.make_water(cell);
             board.add_life_essence(cell);
         }
-        click(&mut app, Vec2::new(-390.0, 0.0));
+        click(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let world = app.world_mut();
         assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Water));
@@ -14819,7 +15007,7 @@ mod tests {
                 let mut app = interaction_app();
                 let cell = IVec2::new(6, 3);
                 move_player_to(&mut app, PlayerId::Two, cell);
-                click(&mut app, Vec2::new(-450.0, 120.0));
+                click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
                 click(&mut app, cell_center(cell));
                 assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
                 assert!(!app.world().resource::<Board>().is_frozen(cell));
@@ -14841,10 +15029,7 @@ mod tests {
                         },
                     ));
                 }
-                let inventory = Vec2::new(
-                    390.0 + (item % 2) as f32 * GRID_BLOCK_SIZE,
-                    180.0 - (item / 2) as f32 * GRID_BLOCK_SIZE,
-                );
+                let inventory = p2_item(item);
                 click(&mut app, inventory);
                 click(&mut app, cell_center(cell));
 
@@ -14888,7 +15073,7 @@ mod tests {
         app.update();
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, cell);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<TurnState>().effects_active);
         tick_coatl_animation(&mut app, 1.0);
@@ -14901,7 +15086,7 @@ mod tests {
             1
         );
         app.world_mut().resource_mut::<TurnState>().magic[1] = 0;
-        click(&mut app, Vec2::new(450.0, 60.0));
+        click(&mut app, p2_item(VOID_DUST_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<TurnState>().effects_active);
         tick_coatl_animation(&mut app, 1.0);
@@ -14940,17 +15125,14 @@ mod tests {
             ));
             app.update();
             tick_coatl_animation(&mut app, 1.0);
-            click(&mut app, Vec2::new(-450.0, 120.0));
+            click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             tick_coatl_animation(&mut app, 1.0);
             assert!(app.world().resource::<Board>().is_frozen(cell));
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
             assert_eq!(frozen_sprite_count(&mut app), 1);
             app.world_mut().resource_mut::<TurnState>().magic[1] = 0;
-            let inventory = Vec2::new(
-                390.0 + (item % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (item / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p2_item(item);
             click(&mut app, inventory);
             click(&mut app, cell_center(cell));
             assert!(app.world().resource::<TurnState>().effects_active);
@@ -15140,10 +15322,7 @@ mod tests {
                     cell,
                 },
             ));
-            let inventory = Vec2::new(
-                -450.0 + (item % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (item / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p1_item(item);
             click(&mut app, inventory);
             click(&mut app, cell_center(cell));
             let world = app.world_mut();
@@ -15620,10 +15799,7 @@ mod tests {
                 ));
             }
             let index = OBSIDIAN_ITEM_INDEX;
-            let inventory = Vec2::new(
-                -450.0 + (index % 2) as f32 * GRID_BLOCK_SIZE,
-                180.0 - (index / 2) as f32 * GRID_BLOCK_SIZE,
-            );
+            let inventory = p1_item(index);
             click(&mut app, inventory);
             click(&mut app, cell_center(target));
             let world = app.world_mut();
@@ -15662,7 +15838,7 @@ mod tests {
                     assert!(board.freeze_water(target));
                 }
             }
-            click(&mut app, Vec2::new(-390.0, 0.0));
+            click(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
             click(&mut app, cell_center(target));
             let world = app.world_mut();
             let board = world.resource::<Board>();
@@ -15701,7 +15877,7 @@ mod tests {
                 cell: target,
             },
         ));
-        click(&mut app, Vec2::new(-390.0, 0.0));
+        click(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let world = app.world_mut();
         assert_eq!(
@@ -15717,9 +15893,9 @@ mod tests {
     fn stone_dust_does_not_react_to_sunstone_or_wind() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(450.0, 0.0));
+        click_part(&mut app, p2_item(STONE_DUST_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         let world = app.world_mut();
         assert_eq!(world.query::<&PendingStoneDust>().iter(world).count(), 0);
@@ -15744,9 +15920,9 @@ mod tests {
             },
         ));
         move_player_to(&mut app, PlayerId::One, target);
-        click_part(&mut app, Vec2::new(-450.0, 180.0));
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
-        click_part(&mut app, Vec2::new(-390.0, 0.0));
+        click_part(&mut app, p1_item(STONE_DUST_ITEM_INDEX));
         click_part(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[0], 8);
         assert!(!app.world().resource::<Board>().is_water(target));
@@ -15767,9 +15943,9 @@ mod tests {
                 board.add_life_essence(target);
                 assert!(board.freeze_water(target));
             }
-            click(&mut app, Vec2::new(-450.0, 0.0));
+            click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
             click(&mut app, cell_center(target));
-            click(&mut app, Vec2::new(450.0, 0.0));
+            click(&mut app, p2_item(STONE_DUST_ITEM_INDEX));
             click(&mut app, cell_center(target));
             let world = app.world_mut();
             assert_eq!(
@@ -15826,11 +16002,11 @@ mod tests {
             board.add_life_essence(obsidian);
         }
         move_player_to(&mut app, PlayerId::Two, IVec2::new(8, 5));
-        click(&mut app, Vec2::new(-450.0, 0.0));
+        click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
         click(&mut app, cell_center(obsidian));
         move_player_to(&mut app, PlayerId::One, obsidian);
         app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
-        click(&mut app, Vec2::new(390.0, 60.0));
+        click(&mut app, p2_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(water));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [6, 7]);
         let world = app.world_mut();
@@ -15866,7 +16042,7 @@ mod tests {
             board.add_oil(oil);
             board.add_oil(final_oil);
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(oil));
         let world = app.world_mut();
         assert_eq!(world.query::<&PendingObsidian>().iter(world).count(), 0);
@@ -15901,7 +16077,7 @@ mod tests {
             board.activate_thornheart(thorn, 1, true);
             board.finish_thorn_turn();
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(obsidian));
         assert!(!app.world().resource::<Board>().has_thorns(thorn));
         assert!(
@@ -15930,7 +16106,7 @@ mod tests {
                 board.add_oil(cell);
             }
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(burning[0]));
         let board = app.world().resource::<Board>();
         assert!(burning.iter().all(|cell| !board.has_oil(*cell)));
@@ -15977,7 +16153,7 @@ mod tests {
             board.add_life_essence(wet);
             board.set(natural, Ground::Water);
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(source));
         let board = app.world().resource::<Board>();
         for cell in frozen {
@@ -16006,12 +16182,12 @@ mod tests {
         let mut app = interaction_app();
         let source = IVec2::new(6, 3);
         let adjacent = IVec2::new(7, 3);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(source));
-        click(&mut app, Vec2::new(390.0, -60.0));
+        click(&mut app, p2_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(adjacent));
         assert!(app.world().resource::<Board>().has_oil(adjacent));
-        click(&mut app, Vec2::new(-450.0, -60.0));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert!(!app.world().resource::<Board>().has_oil(source));
         assert!(!app.world().resource::<Board>().has_oil(adjacent));
@@ -16034,7 +16210,7 @@ mod tests {
             board.add_life_essence(healing);
         }
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 1;
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(source));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 0]);
     }
@@ -16053,7 +16229,7 @@ mod tests {
                 }
                 board.add_oil(target);
             }
-            click(&mut app, Vec2::new(-390.0, 180.0));
+            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
             assert!(!app.world().resource::<Board>().has_oil(target));
@@ -16080,7 +16256,7 @@ mod tests {
             board.activate_thornheart(target, 42, false);
             board.start_terrain_growth(target, 42, TerrainGrowthKind::Void);
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         let board = app.world().resource::<Board>();
         assert_eq!(board.ground(target), Some(Ground::Solid));
@@ -16127,12 +16303,12 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(390.0, -60.0));
+        click(&mut app, p2_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(item_count(&mut app), 0);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
         assert_eq!(item_count(&mut app), 0);
@@ -16150,7 +16326,7 @@ mod tests {
         let target = IVec2::new(0, 0);
         move_player_to(&mut app, PlayerId::One, IVec2::new(1, 0));
         app.world_mut().resource_mut::<Board>().add_oil(target);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         {
             let world = app.world_mut();
@@ -16186,7 +16362,7 @@ mod tests {
             board.add_oil(target);
             assert!(board.freeze_water(target));
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 8]);
         assert!(!app.world().resource::<Board>().has_oil(target));
@@ -16211,7 +16387,7 @@ mod tests {
             board.set(target, Ground::Water);
             board.set(IVec2::new(5, 3), Ground::Ridge);
         }
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
         assert_eq!(
@@ -16232,7 +16408,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(target, Ground::Water);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [0, 0]);
     }
@@ -16256,7 +16432,7 @@ mod tests {
                 board.make_water(target);
                 board.set(ridge, Ground::Ridge);
             }
-            click(&mut app, Vec2::new(-390.0, 180.0));
+            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(app.world().resource::<PlayerHealth>().0[1], expected_health);
             let cells = steam_positions(&mut app);
@@ -16275,11 +16451,11 @@ mod tests {
             board.set(IVec2::new(5, 3), Ground::Water);
             board.set(IVec2::new(7, 3), Ground::Water);
         }
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, -60.0));
+        click(&mut app, p2_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().is_frozen(cell));
         assert_eq!(
@@ -16296,7 +16472,7 @@ mod tests {
             );
         }
         assert!(app.world().resource::<Board>().is_frozen(cell));
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [5, 6]);
         assert_eq!(
@@ -16311,7 +16487,7 @@ mod tests {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().inventory = [[1; 14]; 2];
         let cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         for _ in 0..10 {
             press_key(&mut app, KeyCode::KeyR);
@@ -16328,9 +16504,9 @@ mod tests {
         let mut app = interaction_app();
         let first = IVec2::new(6, 3);
         let second = IVec2::new(6, 5);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(first));
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(second));
         for _ in 0..6 {
             press_key(&mut app, KeyCode::KeyR);
@@ -16355,7 +16531,7 @@ mod tests {
             board.add_life_essence(cell);
             assert!(board.freeze_water(cell));
         }
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let board = app.world().resource::<Board>();
         assert_eq!(board.ground(cell), Some(Ground::Water));
@@ -16384,7 +16560,7 @@ mod tests {
                     turn.hovering[0] = true;
                 }
                 let other = app.world_mut().spawn((BoardItem, Name::new("Other"))).id();
-                click(&mut app, Vec2::new(-450.0, 180.0));
+                click(&mut app, p1_item(WATER_ITEM_INDEX));
                 click(&mut app, cell_center(cell));
                 assert_eq!(app.world().resource::<Board>().ground(cell), Some(ground));
                 assert!(!app.world().resource::<Board>().is_wet(cell));
@@ -16434,7 +16610,7 @@ mod tests {
                 }
             }
             app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
-            click(&mut app, Vec2::new(-450.0, 180.0));
+            click(&mut app, p1_item(WATER_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
             assert_eq!(app.world().resource::<TurnState>().strength, [2, 5]);
@@ -16456,7 +16632,7 @@ mod tests {
                 .resource_mut::<Board>()
                 .set(cell, Ground::Water);
             app.world_mut().resource_mut::<TurnState>().strength[0] = energy;
-            click(&mut app, Vec2::new(-450.0, 180.0));
+            click(&mut app, p1_item(WATER_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert_eq!(item_count(&mut app), 0);
             assert_eq!(
@@ -16479,7 +16655,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(matches!(
             app.world().resource::<Selection>().0,
@@ -16508,9 +16684,9 @@ mod tests {
             }
         }
         app.world_mut().resource_mut::<TurnState>().strength[1] = 0;
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().is_frozen(cell));
         assert_eq!(
@@ -16541,17 +16717,16 @@ mod tests {
     fn assert_heart(app: &mut App, owner: PlayerId, index: usize, half: bool, visible: bool) {
         let world = app.world_mut();
         let mut hearts = world.query::<(&Heart, &ImageNode, &Visibility)>();
-        let (heart, image, visibility) = hearts
+        let (_, image, visibility) = hearts
             .iter(world)
             .find(|(heart, _, _)| heart.owner == owner && heart.index == index)
             .unwrap();
-        assert_ne!(heart.full_image, heart.half_image);
         assert_eq!(
-            image.image,
+            image.rect,
             if half {
-                heart.half_image.clone()
+                Some(Rect::new(32.0, 0.0, 64.0, 32.0))
             } else {
-                heart.full_image.clone()
+                Some(Rect::new(0.0, 0.0, 32.0, 32.0))
             }
         );
         assert_eq!(*visibility != Visibility::Hidden, visible);
@@ -16569,7 +16744,7 @@ mod tests {
             } else {
                 board.set(cell, Ground::Water);
             }
-            click(&mut app, Vec2::new(-450.0, 120.0));
+            click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
@@ -16632,7 +16807,7 @@ mod tests {
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, cell);
         app.world_mut().resource_mut::<Board>().make_water(cell);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         click(&mut app, Vec2::new(330.0, 120.0));
         assert!(!app.world().resource::<TurnState>().hovering[1]);
@@ -16676,7 +16851,7 @@ mod tests {
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, cell);
         app.world_mut().resource_mut::<Board>().make_water(cell);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 9);
@@ -16705,7 +16880,7 @@ mod tests {
                 board.make_water(cell);
             }
         }
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(source));
         let board = app.world().resource::<Board>();
         assert!(water.into_iter().all(|cell| board.is_frozen(cell)));
@@ -16726,10 +16901,10 @@ mod tests {
                 app.world_mut().resource_mut::<Board>().make_water(target);
             }
             app.world_mut().resource_mut::<TurnState>().inventory[1][SUNSTONE_ITEM_INDEX] = 1;
-            click(&mut app, Vec2::new(-450.0, 120.0));
+            click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
-            click_part(&mut app, Vec2::new(450.0, 180.0));
+            click_part(&mut app, p2_item(SUNSTONE_ITEM_INDEX));
             click_part(&mut app, cell_center(target));
             assert_eq!(
                 app.world().resource::<TurnState>().inventory[1][SUNSTONE_ITEM_INDEX],
@@ -16741,7 +16916,7 @@ mod tests {
                 1
             );
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
-            click_part(&mut app, Vec2::new(450.0, 180.0));
+            click_part(&mut app, p2_item(SUNSTONE_ITEM_INDEX));
             click_part(&mut app, cell_center(target));
             press_key(&mut app, KeyCode::KeyR);
             assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 0);
@@ -16774,7 +16949,7 @@ mod tests {
         let mut app = interaction_app();
         let source = IVec2::new(5, 3);
         app.world_mut().resource_mut::<Board>().make_water(source);
-        click_part(&mut app, Vec2::new(-450.0, 120.0));
+        click_part(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click_part(&mut app, cell_center(source));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[0], 2);
@@ -16792,7 +16967,10 @@ mod tests {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, target);
-        for item in [Vec2::new(-450.0, 120.0), Vec2::new(-390.0, 180.0)] {
+        for item in [
+            p1_item(FROST_CRYSTAL_ITEM_INDEX),
+            p1_item(SUNSTONE_ITEM_INDEX),
+        ] {
             click_part(&mut app, item);
             click_part(&mut app, cell_center(target));
         }
@@ -16812,7 +16990,10 @@ mod tests {
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, target);
         app.world_mut().resource_mut::<Board>().make_water(target);
-        for item in [Vec2::new(-450.0, 120.0), Vec2::new(-390.0, 180.0)] {
+        for item in [
+            p1_item(FROST_CRYSTAL_ITEM_INDEX),
+            p1_item(SUNSTONE_ITEM_INDEX),
+        ] {
             click_part(&mut app, item);
             click_part(&mut app, cell_center(target));
         }
@@ -16841,7 +17022,7 @@ mod tests {
             turn.hovering[1] = true;
             turn.magic[1] = 1;
         }
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 0);
         press_key(&mut app, KeyCode::KeyR);
@@ -16864,7 +17045,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         press_key(&mut app, KeyCode::KeyR);
         select_move(&mut app);
@@ -16886,7 +17067,7 @@ mod tests {
             board.set(target, Ground::Water);
             assert!(board.freeze_water(existing));
         }
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns, [2, 2]);
@@ -16903,7 +17084,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
@@ -16917,13 +17098,13 @@ mod tests {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         press_key(&mut app, KeyCode::KeyR);
         click(&mut app, Vec2::new(-330.0, 120.0));
         select_move(&mut app);
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().is_frozen(cell));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
@@ -16943,9 +17124,9 @@ mod tests {
                 board.set(adjacent, Ground::Water);
             }
             app.world_mut().resource_mut::<PlayerHealth>().0[1] = starting_health;
-            click(&mut app, Vec2::new(-450.0, 120.0));
+            click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
             click(&mut app, cell_center(cell));
-            click(&mut app, Vec2::new(390.0, 60.0));
+            click(&mut app, p2_item(STORM_SHARD_ITEM_INDEX));
             click(&mut app, cell_center(adjacent));
             assert_eq!(
                 app.world().resource::<PlayerHealth>().0,
@@ -16963,10 +17144,10 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         press_key(&mut app, KeyCode::KeyR);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 9]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
@@ -16989,7 +17170,7 @@ mod tests {
                     board.set(cell, Ground::Water);
                 }
             }
-            click(&mut app, Vec2::new(-450.0, 120.0));
+            click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert!(app.world().resource::<Board>().is_frozen(cell));
             assert_eq!(frozen_sprite_count(&mut app), 1);
@@ -17079,7 +17260,7 @@ mod tests {
             board.make_water(cell);
             assert!(board.freeze_water(cell));
         }
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().is_frozen(cell));
         assert_eq!(
@@ -17109,7 +17290,7 @@ mod tests {
             },
             PendingObsidian(obsidian),
         ));
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(water));
         let board = app.world().resource::<Board>();
         assert!(!board.is_frozen(ice));
@@ -17125,9 +17306,9 @@ mod tests {
                 move_player_to(&mut app, PlayerId::Two, cell);
                 app.world_mut().resource_mut::<TurnState>().hovering[1] = hover;
                 let inventory = if frost {
-                    Vec2::new(-450.0, 120.0)
+                    p1_item(FROST_CRYSTAL_ITEM_INDEX)
                 } else {
-                    Vec2::new(-450.0, 60.0)
+                    p1_item(STORM_SHARD_ITEM_INDEX)
                 };
                 click(&mut app, inventory);
                 click(&mut app, cell_center(cell));
@@ -17216,7 +17397,7 @@ mod tests {
     fn dry_frost_without_a_player_does_not_create_an_impact() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         let world = app.world_mut();
         assert_eq!(world.query::<&FrostImpact>().iter(world).count(), 0);
@@ -17236,7 +17417,7 @@ mod tests {
             },
             PendingObsidian(cell),
         ));
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 7);
     }
@@ -17248,9 +17429,9 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(cell, Ground::Water);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, Vec2::new(390.0, 120.0));
+        click(&mut app, p2_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(frozen_sprite_count(&mut app), 1);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
@@ -17267,10 +17448,10 @@ mod tests {
     fn created_water_remains_frozen_after_multiple_turns() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(item_count(&mut app), 0);
-        click(&mut app, Vec2::new(390.0, 120.0));
+        click(&mut app, p2_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert!(app.world().resource::<Board>().is_frozen(cell));
         assert_eq!(item_count(&mut app), 0);
@@ -17290,12 +17471,12 @@ mod tests {
     fn water_on_a_placed_frost_crystal_freezes_permanently() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(item_count(&mut app), 1);
         assert!(!app.world().resource::<Board>().is_wet(cell));
 
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
@@ -17334,11 +17515,11 @@ mod tests {
     fn water_only_reacts_with_a_crystal_on_the_target_cell_after_a_valid_action() {
         let mut app = interaction_app();
         let frost_cell = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(frost_cell));
         let other = app.world_mut().spawn((BoardItem, Name::new("Other"))).id();
         app.world_mut().resource_mut::<TurnState>().strength[1] = 0;
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(frost_cell));
         assert!(!app.world().resource::<Board>().is_wet(frost_cell));
         assert!(!app.world().resource::<Board>().is_frozen(frost_cell));
@@ -17349,7 +17530,7 @@ mod tests {
         press_key(&mut app, KeyCode::KeyR);
 
         let other_cell = IVec2::new(6, 5);
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(other_cell));
         assert_eq!(
             app.world().resource::<Board>().ground(other_cell),
@@ -17367,7 +17548,7 @@ mod tests {
     fn frost_on_dry_ground_or_without_throw_energy_does_not_freeze_water() {
         let mut app = interaction_app();
         let adjacent = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(adjacent));
         assert!(!app.world().resource::<Board>().is_frozen(adjacent));
         assert_eq!(item_count(&mut app), 1);
@@ -17378,7 +17559,7 @@ mod tests {
             .resource_mut::<Board>()
             .set(distant, Ground::Water);
         app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(distant));
         assert!(!app.world().resource::<Board>().is_frozen(distant));
         assert!(app.world().resource::<Selection>().0.is_some());
@@ -17407,11 +17588,11 @@ mod tests {
             board.set(IVec2::new(7, 5), Ground::Water);
             board.set(IVec2::new(7, 6), Ground::Water);
         }
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(item_count(&mut app), 1);
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 8]);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
@@ -17441,16 +17622,16 @@ mod tests {
     fn water_only_activates_a_placed_shard_on_a_valid_matching_tile() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(target));
         app.world_mut().resource_mut::<TurnState>().strength[1] = 0;
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert!(!app.world().resource::<Board>().is_wet(target));
         assert_eq!(item_count(&mut app), 1);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         press_key(&mut app, KeyCode::Escape);
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(IVec2::new(7, 5)));
         assert!(!app.world().resource::<Board>().is_wet(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
@@ -17459,7 +17640,7 @@ mod tests {
             let mut shards = world.query::<&PendingStormShard>();
             assert_eq!(shards.iter(world).count(), 1);
         }
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(
             app.world().resource::<Board>().ground(target),
@@ -17480,11 +17661,11 @@ mod tests {
             board.set(IVec2::new(5, 3), Ground::Water);
             board.set(IVec2::new(7, 3), Ground::Water);
         }
-        click(&mut app, Vec2::new(-450.0, 120.0));
+        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(390.0, 60.0));
+        click(&mut app, p2_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [7, 8]);
         assert!(app.world().resource::<Board>().is_frozen(target));
@@ -17516,7 +17697,7 @@ mod tests {
                 board.set(IVec2::new(7, 5), Ground::Water);
                 board.set(IVec2::new(7, 6), Ground::Water);
             }
-            click(&mut app, Vec2::new(-450.0, 60.0));
+            click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
             click(&mut app, cell_center(IVec2::new(6, 3)));
             assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 8]);
             assert_eq!(visible_hearts(&mut app, PlayerId::One), 4);
@@ -17556,7 +17737,7 @@ mod tests {
                 board.make_water(origin + IVec2::X);
             }
             app.world_mut().resource_mut::<TurnState>().hovering[0] = hovering;
-            click(&mut app, Vec2::new(-450.0, 60.0));
+            click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
             click(&mut app, cell_center(origin));
             assert_eq!(app.world().resource::<PlayerHealth>().0, expected);
             press_key(&mut app, KeyCode::KeyR);
@@ -17575,7 +17756,7 @@ mod tests {
             board.make_water(origin);
             board.make_water(IVec2::X);
         }
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(origin));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
         let world = app.world_mut();
@@ -17622,10 +17803,10 @@ mod tests {
         let target = IVec2::new(4, 3);
         move_player_to(&mut app, PlayerId::One, IVec2::new(5, 3));
         move_player_to(&mut app, PlayerId::Two, IVec2::new(4, 4));
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
     }
@@ -17641,7 +17822,7 @@ mod tests {
                 }
                 board.set(IVec2::new(7, 6), Ground::Water);
             }
-            click(&mut app, Vec2::new(-450.0, 60.0));
+            click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
             click(&mut app, cell_center(IVec2::new(6, 3)));
             assert_eq!(
                 app.world().resource::<PlayerHealth>().0,
@@ -17665,7 +17846,7 @@ mod tests {
             .resource_mut::<Board>()
             .set(target, Ground::Water);
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 0;
-        click(&mut app, Vec2::new(-450.0, 60.0));
+        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 0]);
         assert_eq!(visible_hearts(&mut app, PlayerId::Two), 0);
@@ -17676,8 +17857,8 @@ mod tests {
     #[test]
     fn renamed_ingredients_are_used_for_hover_and_placed_items() {
         for (position, name) in [
-            (Vec2::new(-390.0, 180.0), "Sunstone"),
-            (Vec2::new(-390.0, -180.0), "Aquatic Creature"),
+            (p1_item(SUNSTONE_ITEM_INDEX), "Sunstone"),
+            (p1_item(AQUATIC_ITEM_INDEX), "Aquatic Creature"),
         ] {
             let mut app = interaction_app();
             app.world_mut().resource_mut::<BoardCursor>().0 = Some(position);
@@ -17699,7 +17880,7 @@ mod tests {
     #[test]
     fn selected_item_preview_is_centered_on_cursor_in_hud() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         let icon = match &app.world().resource::<Selection>().0 {
             Some(SelectedAction::Item { icon, .. }) => *icon,
             _ => panic!("item should be selected"),
@@ -17738,12 +17919,12 @@ mod tests {
     #[test]
     fn selected_slot_remains_highlighted_until_cancelled_or_placed() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         assert_eq!(
             slot_border(&mut app, PlayerId::One, 0),
             UiRect::all(Val::Px(3.0))
         );
-        app.world_mut().resource_mut::<BoardCursor>().0 = Some(Vec2::new(-390.0, 180.0));
+        app.world_mut().resource_mut::<BoardCursor>().0 = Some(p1_item(SUNSTONE_ITEM_INDEX));
         app.update();
         assert_eq!(
             slot_border(&mut app, PlayerId::One, 0),
@@ -17759,7 +17940,7 @@ mod tests {
             UiRect::all(Val::Px(0.5))
         );
 
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, Vec2::new(90.0, 60.0));
         assert_eq!(
             slot_border(&mut app, PlayerId::One, 0),
@@ -17771,11 +17952,11 @@ mod tests {
     #[test]
     fn item_selection_can_be_cancelled_or_changed_without_a_turn() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(-450.0, 180.0));
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_none());
-        click(&mut app, Vec2::new(-450.0, 180.0));
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         assert!(matches!(
             app.world().resource::<Selection>().0,
             Some(SelectedAction::Item { index: 1, .. })
@@ -17789,7 +17970,7 @@ mod tests {
     #[test]
     fn switching_between_item_and_move_clears_previews() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         let (icon, highlight) = match &app.world().resource::<Selection>().0 {
             Some(SelectedAction::Item {
                 icon, highlight, ..
@@ -17804,7 +17985,7 @@ mod tests {
             _ => panic!("movement should be selected"),
         };
         assert_eq!(highlights.len(), 24);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         assert!(
             highlights
                 .iter()
@@ -18048,13 +18229,13 @@ mod tests {
     #[test]
     fn turns_strength_and_right_inventory_apply_to_two_click_actions() {
         let mut app = interaction_app();
-        click(&mut app, Vec2::new(450.0, 180.0));
+        click(&mut app, p2_item(SUNSTONE_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_none());
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, Vec2::new(30.0, -120.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
-        click(&mut app, Vec2::new(450.0, 120.0));
+        click(&mut app, p2_item(THORNHEART_ITEM_INDEX));
         click(&mut app, Vec2::new(30.0, -120.0));
         assert_eq!(item_count(&mut app), 1);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
@@ -18076,7 +18257,7 @@ mod tests {
         app.world_mut().resource_mut::<TurnState>().magic = [3, 3];
         click(&mut app, Vec2::new(330.0, 0.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         assert!(app.world().resource::<Selection>().0.is_some());
         click(&mut app, Vec2::new(-330.0, 0.0));
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
@@ -18161,7 +18342,7 @@ mod tests {
             Val::Percent(100.0)
         );
 
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, Vec2::new(-90.0, 0.0));
         assert_eq!(
             energy_bar_width(&mut app, PlayerId::One),
@@ -18201,7 +18382,7 @@ mod tests {
     fn insufficient_strength_keeps_selection_until_cancelled() {
         let mut app = interaction_app();
         app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
-        click(&mut app, Vec2::new(-450.0, 180.0));
+        click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, Vec2::new(-270.0, 180.0));
         assert_eq!(item_count(&mut app), 0);
         assert!(app.world().resource::<Selection>().0.is_some());
@@ -18227,7 +18408,7 @@ mod tests {
         app.world_mut().resource_mut::<TurnState>().strength[0] = 0;
         press_key(&mut app, KeyCode::ArrowRight);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
-        click(&mut app, Vec2::new(-390.0, 180.0));
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, Vec2::new(90.0, 60.0));
         assert_eq!(item_count(&mut app), 1);
         assert_eq!(app.world().resource::<TurnState>().strength, [2, 5]);
@@ -18283,7 +18464,7 @@ mod tests {
         select_move(&mut app);
         click(&mut app, cell_center(IVec2::new(7, 3)));
         assert_eq!(app.world().resource::<TurnState>().strength, [4, 3]);
-        click(&mut app, Vec2::new(390.0, 180.0));
+        click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(IVec2::new(7, 4)));
         assert_eq!(app.world().resource::<TurnState>().strength, [4, 4]);
     }

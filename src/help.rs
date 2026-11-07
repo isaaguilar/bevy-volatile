@@ -695,7 +695,7 @@ fn render(
                     })
                     .with_children(|heading| {
                         heading.spawn((
-                            ImageNode::new(images.0[index].clone()),
+                            images.icon(index),
                             Node {
                                 width: Val::Px(42.0),
                                 height: Val::Px(42.0),
@@ -866,12 +866,7 @@ fn spawn_visual(
         ..default()
     };
     if let ReactionVisual::Ingredient(index) = visual {
-        parent.spawn((
-            ReactionIcon,
-            ImageNode::new(images.0[index].clone()),
-            node,
-            Pickable::IGNORE,
-        ));
+        parent.spawn((ReactionIcon, images.icon(index), node, Pickable::IGNORE));
         return;
     }
 
@@ -921,11 +916,7 @@ fn spawn_visual(
             if let Some(color) = overlay {
                 tile.spawn((inset, BackgroundColor(color), Pickable::IGNORE));
             } else if visual == ReactionVisual::WetGround {
-                tile.spawn((
-                    inset,
-                    ImageNode::new(images.0[WATER_ITEM_INDEX].clone()),
-                    Pickable::IGNORE,
-                ));
+                tile.spawn((inset, images.icon(WATER_ITEM_INDEX), Pickable::IGNORE));
             }
         });
 }
@@ -997,7 +988,7 @@ mod tests {
         let mut app = App::new();
         let hud = app.world_mut().spawn_empty().id();
         app.insert_resource(Hud(hud))
-            .insert_resource(InventoryImages(std::array::from_fn(|_| Handle::default())))
+            .init_resource::<InventoryImages>()
             .insert_resource(Help {
                 item: Some(STONE_DUST_ITEM_INDEX),
                 dirty: true,
@@ -1017,6 +1008,20 @@ mod tests {
         assert_eq!(icons.len(), expected);
         assert!(icons.iter().any(|(_, image, _)| image.is_some()));
         assert!(icons.iter().any(|(_, _, background)| background.is_some()));
+        let expected_rects: Vec<_> = GUIDES[STONE_DUST_ITEM_INDEX]
+            .reactions
+            .iter()
+            .flat_map(|(_, visuals, _)| visuals.iter())
+            .filter_map(|visual| match visual {
+                ReactionVisual::Ingredient(index) => Some(InventoryImages::rect(*index)),
+                _ => None,
+            })
+            .collect();
+        let rects: Vec<_> = icons
+            .iter()
+            .filter_map(|(_, image, _)| image.and_then(|image| image.rect))
+            .collect();
+        assert_eq!(rects, expected_rects);
 
         let viewport = world
             .query_filtered::<Entity, With<HelpViewport>>()
