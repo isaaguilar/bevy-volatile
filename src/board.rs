@@ -49,11 +49,12 @@ impl Ground {
     }
 }
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub struct Board {
     tiles: [Ground; COLUMNS * ROWS],
     wet: [u8; COLUMNS * ROWS],
     oil: [bool; COLUMNS * ROWS],
+    expired_oil_sources: u32,
     life_essence: [u8; COLUMNS * ROWS],
     life_sources: [u32; COLUMNS * ROWS],
     expired_life_sources: u32,
@@ -78,6 +79,7 @@ struct Acid {
     electric_fresh: bool,
 }
 
+#[derive(Clone)]
 struct PoisonWave {
     remaining: [u8; COLUMNS * ROWS],
     visited: [bool; COLUMNS * ROWS],
@@ -90,6 +92,7 @@ impl Default for Board {
             tiles: [Ground::Solid; COLUMNS * ROWS],
             wet: [0; COLUMNS * ROWS],
             oil: [false; COLUMNS * ROWS],
+            expired_oil_sources: 0,
             life_essence: [0; COLUMNS * ROWS],
             life_sources: [0; COLUMNS * ROWS],
             expired_life_sources: 0,
@@ -200,7 +203,14 @@ impl Board {
     }
 
     pub fn remove_oil(&mut self, cell: IVec2) {
-        self.oil[Self::index(cell).expect("board cell must be in bounds")] = false;
+        let oil = &mut self.oil[Self::index(cell).expect("board cell must be in bounds")];
+        if std::mem::take(oil) {
+            self.expired_oil_sources += 1;
+        }
+    }
+
+    pub fn take_expired_oil_sources(&mut self) -> u32 {
+        std::mem::take(&mut self.expired_oil_sources)
     }
 
     pub fn is_water(&self, cell: IVec2) -> bool {
@@ -373,7 +383,7 @@ impl Board {
         let index = Self::index(cell).expect("hole cell must be in bounds");
         let changed = self.tiles[index] != Ground::Hole;
         self.wet[index] = 0;
-        self.oil[index] = false;
+        self.remove_oil(cell);
         self.thaw(cell);
         self.acid[index] = None;
         self.clear_poison(cell);

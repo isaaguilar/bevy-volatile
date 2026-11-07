@@ -48,9 +48,9 @@ const GUIDES: [Guide; 14] = [
                 "Creates a permanent water tile.",
             ),
             (
-                "Sunstone",
-                &[ReactionVisual::Ingredient(SUNSTONE_ITEM_INDEX)],
-                "On solid ground, creates water and steam. The center takes 1 heart and other affected tiles take half a heart; wind extends the steam.",
+                "Ember Tile",
+                &[ReactionVisual::Ember],
+                "On solid ground, creates water and consumes the ember to produce steam. The center takes 1 heart and other affected tiles take half a heart; wind extends the steam.",
             ),
             (
                 "Frost Crystal",
@@ -101,11 +101,6 @@ const GUIDES: [Guide; 14] = [
         basics: "A limited ingredient. Sunstone can thaw a frozen player early.",
         reactions: &[
             (
-                "Water Tile",
-                &[ReactionVisual::Ground(Ground::Water)],
-                "On unfrozen water without ember, creates steam. The center takes 1 heart and other affected tiles take half a heart; wind extends the steam.",
-            ),
-            (
                 "Frozen Water Tile",
                 &[ReactionVisual::Frozen],
                 "Thaws the water and any frozen player on it without steam, unless another reaction takes priority.",
@@ -128,7 +123,7 @@ const GUIDES: [Guide; 14] = [
         ],
     },
     Guide {
-        basics: "Freezes grounded players for two turns. A missed crystal on solid ground waits for a player to step or land on it; hovering does not trigger it.",
+        basics: "Freezes grounded players for two turns. A missed crystal on solid ground waits for a player to step or land on it; hovering does not trigger it. Cannot be placed on ember.",
         reactions: &[
             (
                 "Water Tile",
@@ -283,7 +278,7 @@ const GUIDES: [Guide; 14] = [
         ],
     },
     Guide {
-        basics: "Unlimited. Creates a permanent ember layer on any tile except a hole.",
+        basics: "A limited ingredient. Leaves a layer on solid ground or a ridge. Cannot be placed on frozen water, a Frost Crystal, a hole, or an existing ember layer.",
         reactions: &[
             (
                 "Solid Ground",
@@ -293,7 +288,7 @@ const GUIDES: [Guide; 14] = [
             (
                 "Water Tile",
                 &[ReactionVisual::Ground(Ground::Water)],
-                "Leaves an ember layer on the water. An explosion centered on unfrozen water dries it without making steam.",
+                "Consumes the ember to produce steam; the water remains. The center takes 1 heart and other affected tiles take half a heart; wind extends the steam.",
             ),
             (
                 "Ridge",
@@ -951,7 +946,7 @@ mod tests {
                 .iter()
                 .map(|guide| guide.reactions.len())
                 .sum::<usize>(),
-            66
+            65
         );
         for (index, guide) in GUIDES.iter().enumerate() {
             for &(name, visuals, description) in guide.reactions {

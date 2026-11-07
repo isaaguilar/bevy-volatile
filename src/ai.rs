@@ -91,12 +91,28 @@ fn available(turn: &TurnState, item: usize) -> bool {
     is_unlimited(item) || turn.inventory[PlayerId::Two.index()][item] > 0
 }
 
-fn can_place(board: &Board, turn: &TurnState, player: Vec2, item: usize, cell: IVec2) -> bool {
+fn can_place(
+    board: &Board,
+    turn: &TurnState,
+    player: Vec2,
+    item: usize,
+    cell: IVec2,
+    items: &[&Collectible],
+) -> bool {
     available(turn, item)
         && item_target(player, cell_center(cell)).is_some_and(|target| {
             turn.strength[PlayerId::Two.index()] as u32 >= item_energy_cost(&target)
-                && queued_placement_error(board, item, cell, turn.pending_placement.as_ref(), false)
-                    .is_none()
+                && queued_placement_error(
+                    board,
+                    item,
+                    cell,
+                    turn.pending_placement.as_ref(),
+                    false,
+                    items
+                        .iter()
+                        .any(|item| item.cell == cell && item.index == FROST_CRYSTAL_ITEM_INDEX),
+                )
+                .is_none()
         })
 }
 
@@ -126,7 +142,7 @@ fn choose_action(
         && !board.has_oil(cell)
         && (!board.is_water(cell) || board.is_frozen(cell))
         && !items.iter().any(|item| item.cell == cell)
-        && can_place(board, turn, player, SUNSTONE_ITEM_INDEX, cell)
+        && can_place(board, turn, player, SUNSTONE_ITEM_INDEX, cell, items)
     {
         return BotAction::Place {
             item: SUNSTONE_ITEM_INDEX,
@@ -150,11 +166,14 @@ fn choose_action(
         if pending.index == WATER_ITEM_INDEX
             && pending.target.cell == enemy
             && !board.has_oil(enemy)
+            && !items
+                .iter()
+                .any(|item| item.cell == enemy && item.index == FROST_CRYSTAL_ITEM_INDEX)
             && !steam_cells(board, enemy, turn.wind).contains(&cell)
-            && can_place(board, turn, player, SUNSTONE_ITEM_INDEX, enemy)
+            && can_place(board, turn, player, OIL_ITEM_INDEX, enemy, items)
         {
             return BotAction::Place {
-                item: SUNSTONE_ITEM_INDEX,
+                item: OIL_ITEM_INDEX,
                 cell: enemy,
             };
         }
@@ -174,7 +193,7 @@ fn choose_action(
         && !board.is_frozen(cell)
         && !board.has_life_essence(cell)
         && current_danger == 0
-        && can_place(board, turn, player, LIFE_ESSENCE_ITEM_INDEX, cell)
+        && can_place(board, turn, player, LIFE_ESSENCE_ITEM_INDEX, cell, items)
     {
         return BotAction::Place {
             item: LIFE_ESSENCE_ITEM_INDEX,
@@ -189,7 +208,7 @@ fn choose_action(
             || electric_water
                 .iter()
                 .all(|water| (*water - cell).abs().max_element() > 1);
-        if shock_safe && can_place(board, turn, player, STORM_SHARD_ITEM_INDEX, enemy) {
+        if shock_safe && can_place(board, turn, player, STORM_SHARD_ITEM_INDEX, enemy, items) {
             return BotAction::Place {
                 item: STORM_SHARD_ITEM_INDEX,
                 cell: enemy,
@@ -199,10 +218,10 @@ fn choose_action(
             && !board.is_frozen(enemy)
             && !board.has_oil(enemy)
             && !steam_cells(board, enemy, turn.wind).contains(&cell)
-            && can_place(board, turn, player, SUNSTONE_ITEM_INDEX, enemy)
+            && can_place(board, turn, player, OIL_ITEM_INDEX, enemy, items)
         {
             return BotAction::Place {
-                item: SUNSTONE_ITEM_INDEX,
+                item: OIL_ITEM_INDEX,
                 cell: enemy,
             };
         }
@@ -212,14 +231,16 @@ fn choose_action(
                 || hovering
                 || (enemy - cell).abs().max_element() > 1
                 || !board.is_water(cell))
-            && can_place(board, turn, player, FROST_CRYSTAL_ITEM_INDEX, enemy)
+            && can_place(board, turn, player, FROST_CRYSTAL_ITEM_INDEX, enemy, items)
         {
             return BotAction::Place {
                 item: FROST_CRYSTAL_ITEM_INDEX,
                 cell: enemy,
             };
         }
-        if !board.is_poisoned(enemy) && can_place(board, turn, player, ACID_ITEM_INDEX, enemy) {
+        if !board.is_poisoned(enemy)
+            && can_place(board, turn, player, ACID_ITEM_INDEX, enemy, items)
+        {
             return BotAction::Place {
                 item: ACID_ITEM_INDEX,
                 cell: enemy,
@@ -228,7 +249,7 @@ fn choose_action(
         if !board.is_frozen(enemy)
             && !board.is_acidic(enemy)
             && (!water || !board.connected_water(enemy).contains(&cell))
-            && can_place(board, turn, player, POISON_ITEM_INDEX, enemy)
+            && can_place(board, turn, player, POISON_ITEM_INDEX, enemy, items)
         {
             return BotAction::Place {
                 item: POISON_ITEM_INDEX,
@@ -240,9 +261,9 @@ fn choose_action(
             && !board.has_oil(enemy)
             && !board.is_acidic(enemy)
             && !board.is_poisoned(enemy)
-            && available(turn, SUNSTONE_ITEM_INDEX)
+            && available(turn, OIL_ITEM_INDEX)
             && !steam_cells(board, enemy, turn.wind).contains(&cell)
-            && can_place(board, turn, player, WATER_ITEM_INDEX, enemy)
+            && can_place(board, turn, player, WATER_ITEM_INDEX, enemy, items)
         {
             return BotAction::Place {
                 item: WATER_ITEM_INDEX,

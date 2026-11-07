@@ -16,6 +16,7 @@ const DIRECTIONS: [IVec2; 8] = [
 ];
 pub const ACTIVE_TURNS: u8 = 7;
 
+#[derive(Clone)]
 struct Segment {
     cell: IVec2,
     present: bool,
@@ -23,6 +24,7 @@ struct Segment {
     detached_this_turn: bool,
 }
 
+#[derive(Clone)]
 struct Growth {
     base: IVec2,
     base_present: bool,
@@ -38,7 +40,7 @@ struct Growth {
     rng: WyRand,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ThornGarden {
     growths: Vec<Growth>,
 }

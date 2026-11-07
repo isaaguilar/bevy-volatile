@@ -2,16 +2,17 @@ use bevy::{
     image::{ImageLoaderSettings, ImageSampler},
     prelude::*,
 };
+use bevy_rand::prelude::WyRand;
+use rand::{RngExt, SeedableRng};
 
 use crate::{
-    AcidTile, Board, ElectricFlash, FireFlash, FrozenTile, GRID_BLOCK_SIZE, Ground, GroundTile,
-    InventoryImages, OIL_ITEM_INDEX, PoisonTile, SteamFlash, TerrainGrowthKind, ThornTile,
-    TurnState, VoidGrowthTile, effects, help, menu, spawn_board_terrain, update_aquatic_visuals,
+    AcidTile, Board, FrozenTile, GRID_BLOCK_SIZE, Ground, GroundTile, PoisonTile,
+    TerrainGrowthKind, ThornTile, TurnState, VoidGrowthTile, effects, help, menu,
+    spawn_board_terrain, update_aquatic_visuals,
 };
 
 const TERRAIN_SHEET: &str = "basictilesheet.png";
-const EFFECT_SHEET: &str = "ground_sprites.png";
-const EFFECTS_Y: u32 = 2048;
+const EFFECT_SHEET: &str = "ground-effects-Sheet.png";
 const SOURCE_TILE: u32 = 32;
 
 #[derive(Resource, Default)]
@@ -62,32 +63,9 @@ enum Effect {
     Thorns,
     VoidGrowth,
     StoneGrowth,
-    ElectricWater,
-    AdjacentShock,
-    Steam,
-    Fire,
 }
 
 impl Effect {
-    fn row(self) -> u32 {
-        match self {
-            Self::Wet => 0,
-            Self::Frozen => 1,
-            Self::Poison => 2,
-            Self::Acid => 3,
-            Self::ElectricAcid => 4,
-            Self::Ember => 5,
-            Self::Healing => 6,
-            Self::Thorns => 7,
-            Self::VoidGrowth => 8,
-            Self::StoneGrowth => 9,
-            Self::ElectricWater => 10,
-            Self::AdjacentShock => 11,
-            Self::Steam => 12,
-            Self::Fire => 13,
-        }
-    }
-
     fn present(self, board: &Board, cell: IVec2) -> bool {
         if board.ground(cell).is_none() {
             return false;
@@ -105,7 +83,6 @@ impl Effect {
             Self::StoneGrowth => {
                 board.terrain_growth_kind_at(cell) == Some(TerrainGrowthKind::Stone)
             }
-            Self::ElectricWater | Self::AdjacentShock | Self::Steam | Self::Fire => false,
         }
     }
 }
@@ -119,7 +96,6 @@ struct GroundArt {
 enum GroundArtPart {
     Border(Side),
     Overlay(Effect),
-    RidgeEmber,
 }
 
 pub(crate) fn plugin(app: &mut App) {
@@ -133,7 +109,12 @@ pub(crate) fn plugin(app: &mut App) {
         )
         .add_systems(
             Update,
-            (update_ground_art, update_effect_art)
+            (
+                update_ground_art,
+                update_effect_art,
+                spawn_poison_bubbles,
+                animate_poison_bubbles,
+            )
                 .chain()
                 .after(update_aquatic_visuals)
                 .in_set(menu::GameplaySystems)
@@ -223,63 +204,54 @@ fn animated_border_rect(
     Some(tile_rect(first_column + side.index()))
 }
 
-fn normalize_mask(mut mask: u8) -> u8 {
-    for (diagonal, vertical, horizontal) in [(16, 1, 2), (32, 4, 2), (64, 4, 8), (128, 1, 8)] {
-        if mask & vertical == 0 || mask & horizontal == 0 {
-            mask &= !diagonal;
+// Aseprite omitted transparent frames and packed repeated frames into the same atlas cell.
+fn atlas_rect(frame: u32) -> Option<Rect> {
+    let index = match frame {
+        0 | 1 => frame,
+        2..=4 => 2,
+        5 => 1,
+        6 => 3,
+        7..=21 => frame - 3,
+        22 => 18,
+        37..=48 => frame - 18,
+        59..=71 => frame - 28,
+        73..=96 => frame - 29,
+        _ => return None,
+    };
+    let x = (index % 9 * SOURCE_TILE) as f32;
+    let y = (index / 9 * SOURCE_TILE) as f32;
+    Some(Rect::new(x, y, x + 32.0, y + 32.0))
+}
+
+fn effect_frame(effect: Effect, elapsed: f32) -> Option<u32> {
+    Some(match effect {
+        Effect::Wet => return None,
+        Effect::Ember => {
+            let time = elapsed.rem_euclid(0.75);
+            if time < 0.4 {
+                (time / 0.1) as u32
+            } else if time < 0.65 {
+                4
+            } else {
+                5
+            }
         }
-    }
-    mask
-}
-
-fn effect_rect(effect: Effect, cell: IVec2, board: &Board) -> Rect {
-    animated_effect_rect(effect, cell, board, None)
-}
-
-fn animated_effect_rect(
-    effect: Effect,
-    cell: IVec2,
-    board: &Board,
-    effects: Option<&effects::Effects>,
-) -> Rect {
-    let directions = [
-        (IVec2::NEG_Y, 1),
-        (IVec2::X, 2),
-        (IVec2::Y, 4),
-        (IVec2::NEG_X, 8),
-        (IVec2::new(1, -1), 16),
-        (IVec2::new(1, 1), 32),
-        (IVec2::new(-1, 1), 64),
-        (IVec2::new(-1, -1), 128),
-    ];
-    let mask = normalize_mask(directions.into_iter().fold(0, |mask, (offset, bit)| {
-        let neighbor = cell + offset;
-        let present = effects
-            .and_then(|effects| effects.held(neighbor))
-            .map_or_else(
-                || effect.present(board, neighbor),
-                |old| match effect {
-                    Effect::Wet => old.wet,
-                    Effect::Frozen => old.frozen,
-                    Effect::Poison => old.poison,
-                    Effect::Acid => old.acid && !old.electric_acid,
-                    Effect::ElectricAcid => old.electric_acid,
-                    Effect::Ember => old.fuel,
-                    Effect::Healing => old.healing,
-                    Effect::Thorns => old.thorns,
-                    Effect::VoidGrowth => old.growth == Some(TerrainGrowthKind::Void),
-                    Effect::StoneGrowth => old.growth == Some(TerrainGrowthKind::Stone),
-                    _ => effect.present(board, neighbor),
-                },
-            );
-        if present { mask | bit } else { mask }
-    }));
-    let column = (0..mask)
-        .filter(|&value| normalize_mask(value) == value)
-        .count() as u32;
-    let x = column * SOURCE_TILE;
-    let y = EFFECTS_Y + effect.row() * 64 + 32;
-    Rect::new(x as f32, y as f32, (x + 32) as f32, (y + 32) as f32)
+        Effect::Frozen => {
+            let time = elapsed.rem_euclid(1.75);
+            if time < 1.25 {
+                6
+            } else {
+                7 + ((time - 1.25) / 0.1) as u32
+            }
+        }
+        Effect::Poison => 12,
+        Effect::Acid => 73 + ((elapsed / 0.333) as u32 % 6),
+        Effect::ElectricAcid => 79 + ((elapsed / 0.333) as u32 % 6),
+        Effect::Healing => 85 + ((elapsed / 0.333) as u32 % 9),
+        Effect::Thorns => 94,
+        Effect::VoidGrowth => 95,
+        Effect::StoneGrowth => 96,
+    })
 }
 
 fn attach_ground_art(
@@ -287,7 +259,6 @@ fn attach_ground_art(
     board: Res<Board>,
     turn: Res<TurnState>,
     sheet: Res<GroundSheet>,
-    images: Res<InventoryImages>,
     mut tiles: Query<(Entity, &GroundTile, &mut Sprite)>,
 ) {
     for (entity, tile, mut sprite) in &mut tiles {
@@ -329,8 +300,17 @@ fn attach_ground_art(
                         part: GroundArtPart::Overlay(effect),
                     },
                     Sprite {
-                        image: sheet.effects.clone(),
-                        rect: Some(effect_rect(effect, tile.0, &board)),
+                        image: if effect == Effect::Wet {
+                            default()
+                        } else {
+                            sheet.effects.clone()
+                        },
+                        rect: effect_frame(effect, 0.0).and_then(atlas_rect),
+                        color: if effect == Effect::Wet {
+                            Color::srgba(0.12, 0.45, 0.75, 0.35)
+                        } else {
+                            Color::WHITE
+                        },
                         custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE)),
                         ..default()
                     },
@@ -342,21 +322,6 @@ fn attach_ground_art(
                     Transform::from_xyz(0.0, 0.0, z),
                 ));
             }
-            parent.spawn((
-                GroundArt {
-                    cell: tile.0,
-                    part: GroundArtPart::RidgeEmber,
-                },
-                images.sprite(OIL_ITEM_INDEX, 24.0),
-                if visible_ground(&board, &turn, tile.0) == Some(Ground::Ridge)
-                    && board.has_oil(tile.0)
-                {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                },
-                Transform::from_xyz(17.0, 16.0, 1.7),
-            ));
         });
     }
 }
@@ -364,26 +329,29 @@ fn attach_ground_art(
 fn update_ground_art(
     board: Res<Board>,
     turn: Res<TurnState>,
+    time: Res<Time>,
     effects: Option<Res<effects::Effects>>,
     mut tiles: Query<(&GroundTile, &mut Sprite), Without<GroundArt>>,
     mut art: Query<(&GroundArt, &mut Sprite, &mut Visibility), Without<GroundTile>>,
 ) {
-    if !board.is_changed()
-        && !turn.is_changed()
-        && !effects.as_ref().is_some_and(|e| e.is_changed())
-    {
-        return;
-    }
-    for (tile, mut sprite) in &mut tiles {
-        sprite.rect = Some(tile_rect(ground_index(
-            animated_ground(&board, &turn, effects.as_deref(), tile.0)
-                .expect("terrain tile must be in bounds"),
-        )));
-        sprite.color = Color::WHITE;
+    let changed = board.is_changed()
+        || turn.is_changed()
+        || effects.as_ref().is_some_and(|effects| effects.is_changed());
+    if changed {
+        for (tile, mut sprite) in &mut tiles {
+            sprite.rect = Some(tile_rect(ground_index(
+                animated_ground(&board, &turn, effects.as_deref(), tile.0)
+                    .expect("terrain tile must be in bounds"),
+            )));
+            sprite.color = Color::WHITE;
+        }
     }
     for (piece, mut sprite, mut visibility) in &mut art {
         match piece.part {
             GroundArtPart::Border(side) => {
+                if !changed {
+                    continue;
+                }
                 *visibility = if let Some(rect) =
                     animated_border_rect(&board, &turn, effects.as_deref(), piece.cell, side)
                 {
@@ -406,31 +374,20 @@ fn update_ground_art(
                             _ => effect.present(&board, piece.cell),
                         },
                     );
-                *visibility = if present {
-                    sprite.rect = Some(animated_effect_rect(
-                        effect,
-                        piece.cell,
-                        &board,
-                        effects.as_deref(),
-                    ));
+                let next_visibility = if present {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
                 };
-            }
-            GroundArtPart::RidgeEmber => {
-                let fuel = effects
-                    .as_ref()
-                    .and_then(|effects| effects.held(piece.cell))
-                    .map_or_else(|| board.has_oil(piece.cell), |old| old.fuel);
-                *visibility = if fuel
-                    && animated_ground(&board, &turn, effects.as_deref(), piece.cell)
-                        == Some(Ground::Ridge)
-                {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                };
+                if *visibility != next_visibility {
+                    *visibility = next_visibility;
+                }
+                if present {
+                    let rect = effect_frame(effect, time.elapsed_secs()).and_then(atlas_rect);
+                    if sprite.rect != rect {
+                        sprite.rect = rect;
+                    }
+                }
             }
         }
     }
@@ -442,45 +399,26 @@ type EffectMarkers = Or<(
     With<AcidTile>,
     With<VoidGrowthTile>,
     With<ThornTile>,
-    With<ElectricFlash>,
-    With<SteamFlash>,
-    With<FireFlash>,
 )>;
 
 type EffectSprite = (
     &'static mut Sprite,
     &'static mut Visibility,
-    &'static Transform,
     Option<&'static FrozenTile>,
     Option<&'static PoisonTile>,
     Option<&'static AcidTile>,
     Option<&'static VoidGrowthTile>,
     Option<&'static ThornTile>,
-    Has<ElectricFlash>,
-    Has<SteamFlash>,
-    Has<FireFlash>,
 );
 
 fn update_effect_art(
     sheet: Res<GroundSheet>,
     board: Res<Board>,
+    time: Res<Time>,
     effects: Option<Res<effects::Effects>>,
     mut sprites: Query<EffectSprite, EffectMarkers>,
 ) {
-    for (
-        mut sprite,
-        mut visibility,
-        transform,
-        frozen,
-        poison,
-        acid,
-        growth,
-        thorn,
-        electric,
-        steam,
-        fire,
-    ) in &mut sprites
-    {
+    for (mut sprite, mut visibility, frozen, poison, acid, growth, thorn) in &mut sprites {
         let (cell, effect) = if let Some(tile) = frozen {
             (tile.0, Effect::Frozen)
         } else if let Some(tile) = poison {
@@ -517,23 +455,8 @@ fn update_effect_art(
             )
         } else if let Some(tile) = thorn {
             (tile.0, Effect::Thorns)
-        } else if let Some(cell) = crate::board_cell(transform.translation.truncate()) {
-            let effect = if electric {
-                if board.is_water(cell) {
-                    Effect::ElectricWater
-                } else {
-                    Effect::AdjacentShock
-                }
-            } else if steam {
-                Effect::Steam
-            } else if fire {
-                Effect::Fire
-            } else {
-                unreachable!("effect query requires a marker")
-            };
-            (cell, effect)
         } else {
-            continue;
+            unreachable!("effect query requires a marker")
         };
         if frozen.is_some() || poison.is_some() || acid.is_some() {
             *visibility = if effects::visible_effect(
@@ -549,27 +472,86 @@ fn update_effect_art(
                 Visibility::Hidden
             };
         }
-        let alpha = if electric || steam || fire {
-            sprite.color.to_srgba().alpha
-        } else {
-            1.0
-        };
         sprite.image = sheet.effects.clone();
-        sprite.rect = Some(animated_effect_rect(
-            effect,
-            cell,
-            &board,
-            effects.as_deref(),
-        ));
-        sprite.color = Color::srgba(1.0, 1.0, 1.0, alpha);
+        sprite.rect = effect_frame(effect, time.elapsed_secs()).and_then(atlas_rect);
+        sprite.color = Color::WHITE;
         sprite.custom_size = Some(Vec2::splat(GRID_BLOCK_SIZE));
+    }
+}
+
+#[derive(Component)]
+struct PoisonBubblesAttached;
+
+#[derive(Component)]
+struct PoisonBubble {
+    first_frame: u32,
+    elapsed: f32,
+    rng: WyRand,
+}
+
+fn spawn_poison_bubbles(
+    mut commands: Commands,
+    sheet: Res<GroundSheet>,
+    time: Res<Time>,
+    tiles: Query<(Entity, &PoisonTile), Without<PoisonBubblesAttached>>,
+) {
+    for (entity, tile) in &tiles {
+        commands
+            .entity(entity)
+            .insert(PoisonBubblesAttached)
+            .with_children(|parent| {
+                for (layer, first_frame) in [13, 33, 53].into_iter().enumerate() {
+                    let seed = time.elapsed().as_nanos() as u64
+                        ^ ((tile.0.x as u64) << 32)
+                        ^ ((tile.0.y as u64) << 16)
+                        ^ (layer as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
+                    let mut rng = WyRand::seed_from_u64(seed);
+                    let elapsed = -rng.random_range(0.0..2.0);
+                    parent.spawn((
+                        PoisonBubble {
+                            first_frame,
+                            elapsed,
+                            rng,
+                        },
+                        Sprite {
+                            image: sheet.effects.clone(),
+                            rect: atlas_rect(first_frame),
+                            custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE)),
+                            ..default()
+                        },
+                        Visibility::Hidden,
+                        Transform::from_xyz(0.0, 0.0, 0.001 * (layer + 1) as f32),
+                    ));
+                }
+            });
+    }
+}
+
+fn animate_poison_bubbles(
+    time: Res<Time>,
+    mut bubbles: Query<(&mut PoisonBubble, &mut Sprite, &mut Visibility)>,
+) {
+    for (mut bubble, mut sprite, mut visibility) in &mut bubbles {
+        bubble.elapsed += time.delta_secs();
+        while bubble.elapsed >= 2.0 {
+            bubble.elapsed -= 2.0 + bubble.rng.random_range(0.3..2.0);
+        }
+        let frame = (bubble.elapsed >= 0.0)
+            .then(|| bubble.first_frame + (bubble.elapsed / 0.1) as u32)
+            .and_then(atlas_rect);
+        if let Some(rect) = frame {
+            sprite.rect = Some(rect);
+            *visibility = Visibility::Inherited;
+        } else {
+            *visibility = Visibility::Hidden;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{COLUMNS, ROWS};
+    use crate::{COLUMNS, FireFlash, InventoryImages, ROWS};
 
     #[test]
     fn terrain_edges_match_each_sheet_group_and_direction() {
@@ -600,33 +582,106 @@ mod tests {
     }
 
     #[test]
-    fn connected_effects_use_the_47_mask_layout_and_stay_in_bounds() {
-        let cell = IVec2::new(4, 3);
-        let mut board = Board::default();
-        board.add_poison(cell);
-        assert_eq!(
-            effect_rect(Effect::Poison, cell, &board),
-            Rect::new(0.0, 2208.0, 32.0, 2240.0)
-        );
-        for y in -1..=1 {
-            for x in -1..=1 {
-                board.add_poison(cell + IVec2::new(x, y));
-            }
+    fn atlas_uses_packed_and_transparent_frames() {
+        assert_eq!(atlas_rect(2), atlas_rect(4));
+        assert_eq!(atlas_rect(1), atlas_rect(5));
+        assert_eq!(atlas_rect(21), atlas_rect(22));
+        assert_eq!(atlas_rect(23), None);
+        assert_eq!(atlas_rect(33), None);
+        assert_eq!(atlas_rect(37), Some(Rect::new(32.0, 64.0, 64.0, 96.0)));
+        assert_eq!(atlas_rect(72), None);
+        assert_eq!(atlas_rect(96), Some(Rect::new(128.0, 224.0, 160.0, 256.0)));
+    }
+
+    #[test]
+    fn animated_overlays_use_exported_frame_durations() {
+        assert_eq!(effect_frame(Effect::Ember, 0.41), Some(4));
+        assert_eq!(effect_frame(Effect::Ember, 0.66), Some(5));
+        assert_eq!(effect_frame(Effect::Ember, 0.76), Some(0));
+        assert_eq!(effect_frame(Effect::Frozen, 1.24), Some(6));
+        assert_eq!(effect_frame(Effect::Frozen, 1.26), Some(7));
+        assert_eq!(effect_frame(Effect::Frozen, 1.76), Some(6));
+        assert_eq!(effect_frame(Effect::Acid, 0.34), Some(74));
+        assert_eq!(effect_frame(Effect::ElectricAcid, 0.34), Some(80));
+        assert_eq!(effect_frame(Effect::Healing, 0.34), Some(86));
+    }
+
+    #[test]
+    fn poison_bubbles_are_independent_layers_and_disappear_with_their_tile() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<GroundSheet>()
+            .add_systems(
+                Update,
+                (spawn_poison_bubbles, animate_poison_bubbles).chain(),
+            );
+        let parent = app
+            .world_mut()
+            .spawn((
+                PoisonTile(IVec2::new(4, 3)),
+                Sprite::default(),
+                Visibility::Inherited,
+                Transform::default(),
+            ))
+            .id();
+        app.update();
+        let entities: Vec<_> = {
+            let world = app.world_mut();
+            world
+                .query::<(Entity, &PoisonBubble)>()
+                .iter(world)
+                .map(|(entity, bubble)| (entity, bubble.first_frame, bubble.elapsed))
+                .collect()
+        };
+        assert_eq!(entities.len(), 3);
+        assert_ne!(entities[0].2, entities[1].2);
+        assert_ne!(entities[1].2, entities[2].2);
+        for &(entity, first, _) in &entities {
+            let elapsed = match first {
+                13 => 0.01,
+                33 => 0.41,
+                53 => 0.61,
+                _ => unreachable!(),
+            };
+            app.world_mut()
+                .get_mut::<PoisonBubble>(entity)
+                .unwrap()
+                .elapsed = elapsed;
         }
+        app.update();
+        for &(entity, first, _) in &entities {
+            let frame = match first {
+                13 => 13,
+                33 => 37,
+                53 => 59,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                app.world().get::<Sprite>(entity).unwrap().rect,
+                atlas_rect(frame)
+            );
+            assert_eq!(
+                *app.world().get::<Visibility>(entity).unwrap(),
+                Visibility::Inherited
+            );
+        }
+        app.world_mut()
+            .get_mut::<PoisonBubble>(entities[0].0)
+            .unwrap()
+            .elapsed = 1.1;
+        app.update();
         assert_eq!(
-            effect_rect(Effect::Poison, cell, &board),
-            Rect::new(1472.0, 2208.0, 1504.0, 2240.0)
+            *app.world().get::<Visibility>(entities[0].0).unwrap(),
+            Visibility::Hidden
         );
         assert_eq!(
-            (0..=u8::MAX)
-                .filter(|&mask| normalize_mask(mask) == mask)
-                .count(),
-            47
+            *app.world().get::<Visibility>(entities[1].0).unwrap(),
+            Visibility::Inherited
         );
-        assert_eq!(
-            effect_rect(Effect::Wet, IVec2::ZERO, &board),
-            Rect::new(0.0, 2080.0, 32.0, 2112.0)
-        );
+        app.world_mut().despawn(parent);
+        for (entity, _, _) in entities {
+            assert!(app.world().get_entity(entity).is_err());
+        }
     }
 
     #[test]
@@ -659,6 +714,7 @@ mod tests {
         app.insert_resource(Board::default())
             .insert_resource(TurnState::default())
             .insert_resource(GroundSheet::default())
+            .init_resource::<Time>()
             .init_resource::<InventoryImages>()
             .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
             .add_systems(Update, update_ground_art);
@@ -668,7 +724,7 @@ mod tests {
         let north = cell + IVec2::NEG_Y;
         let world = app.world_mut();
         let mut pieces = world.query::<(&GroundArt, &Sprite, &Visibility, &Transform)>();
-        assert_eq!(pieces.iter(world).count(), COLUMNS * ROWS * 8);
+        assert_eq!(pieces.iter(world).count(), COLUMNS * ROWS * 7);
         for side in Side::ALL {
             let piece = pieces
                 .iter(world)
@@ -720,10 +776,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(*overlay.2, Visibility::Inherited);
-        assert_eq!(
-            overlay.1.rect,
-            Some(effect_rect(Effect::Ember, cell, world.resource()))
-        );
+        assert_eq!(overlay.1.rect, atlas_rect(0));
 
         world.resource_mut::<Board>().remove_oil(cell);
         world.resource_mut::<Board>().set(north, Ground::Water);
@@ -743,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn ridge_ember_marker_tracks_fuel_terrain_and_effect_animation() {
+    fn ridge_ember_overlay_tracks_fuel_and_effect_animation() {
         let cell = IVec2::new(4, 3);
         let mut board = Board::default();
         board.set(cell, Ground::Ridge);
@@ -767,7 +820,8 @@ mod tests {
             pieces
                 .iter(world)
                 .find(|(_, piece)| {
-                    piece.cell == cell && matches!(piece.part, GroundArtPart::RidgeEmber)
+                    piece.cell == cell
+                        && matches!(piece.part, GroundArtPart::Overlay(Effect::Ember))
                 })
                 .unwrap()
                 .0
@@ -778,7 +832,7 @@ mod tests {
         );
         assert_eq!(
             app.world().get::<Sprite>(marker).unwrap().rect,
-            Some(InventoryImages::rect(OIL_ITEM_INDEX))
+            atlas_rect(0)
         );
 
         app.world_mut().resource_mut::<Board>().add_oil(cell);
@@ -810,7 +864,7 @@ mod tests {
         app.update();
         assert_eq!(
             *app.world().get::<Visibility>(marker).unwrap(),
-            Visibility::Hidden
+            Visibility::Inherited
         );
         app.world_mut()
             .resource_mut::<Board>()
@@ -818,7 +872,7 @@ mod tests {
         app.update();
         assert_eq!(
             *app.world().get::<Visibility>(marker).unwrap(),
-            Visibility::Hidden
+            Visibility::Inherited
         );
         app.world_mut()
             .resource_mut::<Time>()
@@ -982,6 +1036,7 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(Board::default())
             .insert_resource(GroundSheet::default())
+            .init_resource::<Time>()
             .add_systems(Update, update_effect_art);
         let cell = IVec2::new(4, 3);
         app.world_mut().resource_mut::<Board>().add_acid(cell);
@@ -992,17 +1047,13 @@ mod tests {
         app.update();
         assert_eq!(
             app.world().get::<Sprite>(entity).unwrap().rect,
-            Some(effect_rect(Effect::Acid, cell, app.world().resource()))
+            atlas_rect(73)
         );
         app.world_mut().resource_mut::<Board>().electrify_acid(cell);
         app.update();
         assert_eq!(
             app.world().get::<Sprite>(entity).unwrap().rect,
-            Some(effect_rect(
-                Effect::ElectricAcid,
-                cell,
-                app.world().resource()
-            ))
+            atlas_rect(79)
         );
     }
 
@@ -1011,6 +1062,7 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(Board::default())
             .insert_resource(GroundSheet::default())
+            .init_resource::<Time>()
             .add_systems(Update, update_effect_art);
         let entity = app
             .world_mut()
@@ -1027,13 +1079,6 @@ mod tests {
         app.update();
         let sprite = app.world().get::<Sprite>(entity).unwrap();
         assert_eq!(sprite.color.to_srgba().alpha, 0.35);
-        assert_eq!(
-            sprite.rect,
-            Some(effect_rect(
-                Effect::Fire,
-                IVec2::new(4, 3),
-                app.world().resource()
-            ))
-        );
+        assert_eq!(sprite.rect, None);
     }
 }

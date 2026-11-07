@@ -18,6 +18,7 @@ fn in_bounds(cell: IVec2) -> bool {
     cell.x >= 0 && cell.y >= 0 && cell.x < COLUMNS as i32 && cell.y < ROWS as i32
 }
 
+#[derive(Clone)]
 pub struct VoidGrowth {
     base: IVec2,
     paths: [Vec<IVec2>; 2],

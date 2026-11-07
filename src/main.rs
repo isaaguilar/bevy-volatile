@@ -1,3 +1,4 @@
+use bevy::ecs::system::RunSystemOnce;
 use bevy::{
     camera::ScalingMode,
     ecs::system::SystemParam,
@@ -79,7 +80,7 @@ const POISON_ITEM_INDEX: usize = 10;
 const COATL_EGG_ITEM_INDEX: usize = 11;
 const LIFE_ESSENCE_ITEM_INDEX: usize = 12;
 const AQUATIC_ITEM_INDEX: usize = 13;
-const INGREDIENT_WEIGHTS: [u32; 14] = [0, 4, 4, 2, 4, 0, 4, 0, 0, 4, 4, 1, 4, 2];
+const INGREDIENT_WEIGHTS: [u32; 14] = [0, 4, 4, 2, 4, 0, 4, 0, 4, 4, 4, 1, 4, 2];
 const INVENTORY_ITEMS: [(&str, usize); 14] = [
     ("Tlaloc's Water", 0),
     ("Sunstone", 4),
@@ -324,8 +325,7 @@ impl Default for TurnState {
         let mut inventory = [[0; INVENTORY_ITEMS.len()]; 2];
         let mut spawned_ingredients = [0; INVENTORY_ITEMS.len()];
         for player in &mut inventory {
-            player[OIL_ITEM_INDEX] = 1;
-            for index in [SUNSTONE_ITEM_INDEX, LIFE_ESSENCE_ITEM_INDEX] {
+            for index in [SUNSTONE_ITEM_INDEX, LIFE_ESSENCE_ITEM_INDEX, OIL_ITEM_INDEX] {
                 player[index] = 1;
                 spawned_ingredients[index] += 1;
             }
@@ -629,6 +629,10 @@ impl TurnState {
         self.ingredient_respawns.extend(std::iter::repeat_n(
             (THORNHEART_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY),
             expired_thorns as usize,
+        ));
+        self.ingredient_respawns.extend(std::iter::repeat_n(
+            (OIL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY),
+            board.take_expired_oil_sources() as usize,
         ));
         let index = self.active.index();
         self.frozen_turns[index] = self.frozen_turns[index].saturating_sub(1);
@@ -1034,12 +1038,13 @@ struct SelectionActors<'w, 's> {
     void_dust: Query<'w, 's, (Entity, &'static PendingVoidDust), Without<PickedUpForUndo>>,
     eggs: Query<'w, 's, (Entity, &'static PendingCoatlEgg), Without<PickedUpForUndo>>,
     aquatic: Query<'w, 's, (Entity, &'static PendingAquaticCreature), Without<PickedUpForUndo>>,
+    collectibles: Query<'w, 's, &'static Collectible, Without<PickedUpForUndo>>,
 }
 
 fn is_unlimited(index: usize) -> bool {
     matches!(
         index,
-        WATER_ITEM_INDEX | VOID_DUST_ITEM_INDEX | STONE_DUST_ITEM_INDEX | OIL_ITEM_INDEX
+        WATER_ITEM_INDEX | VOID_DUST_ITEM_INDEX | STONE_DUST_ITEM_INDEX
     )
 }
 
@@ -1160,12 +1165,24 @@ fn item_placement_error(
     index: usize,
     cell: IVec2,
     reactive_item: bool,
+    has_frost: bool,
 ) -> Option<&'static str> {
     if index != STONE_DUST_ITEM_INDEX && board.ground(cell) == Some(Ground::Hole) {
         return Some("Only Stone Dust can be placed in a hole");
     }
     if index == THORNHEART_ITEM_INDEX && board.is_acidic(cell) {
         return Some("Cannot place Thornheart on acid - choose another tile");
+    }
+    if (index == OIL_ITEM_INDEX && has_frost)
+        || (index == FROST_CRYSTAL_ITEM_INDEX && board.has_oil(cell))
+    {
+        return Some("Frost Crystal and Tlexochtli Ember cannot share a tile");
+    }
+    if index == OIL_ITEM_INDEX && board.is_frozen(cell) {
+        return Some("Cannot place Tlexochtli Ember on frozen water");
+    }
+    if index == OIL_ITEM_INDEX && board.has_oil(cell) {
+        return Some("Tile already has Tlexochtli Ember");
     }
     let reacts = reactive_item || board.has_life_essence(cell);
     if index == VOID_DUST_ITEM_INDEX && board.ground(cell) == Some(Ground::Water) && !reacts {
@@ -1195,8 +1212,19 @@ fn queued_placement_error(
     cell: IVec2,
     pending: Option<&PendingPlacement>,
     reactive_item: bool,
+    has_frost: bool,
 ) -> Option<&'static str> {
-    let error = item_placement_error(board, index, cell, reactive_item)?;
+    if pending.is_some_and(|first| {
+        first.target.cell == cell
+            && matches!(
+                (first.index, index),
+                (FROST_CRYSTAL_ITEM_INDEX, OIL_ITEM_INDEX)
+                    | (OIL_ITEM_INDEX, FROST_CRYSTAL_ITEM_INDEX)
+            )
+    }) {
+        return Some("Frost Crystal and Tlexochtli Ember cannot share a tile");
+    }
+    let error = item_placement_error(board, index, cell, reactive_item, has_frost)?;
     if let Some(first) = pending
         && first.target.cell == cell
         && ((first.index == STONE_DUST_ITEM_INDEX && board.ground(cell) == Some(Ground::Hole))
@@ -1214,6 +1242,151 @@ fn queued_placement_error(
         return None;
     }
     Some(error)
+}
+
+fn projected_placement_error(
+    state: (&Board, &TurnState, &PlayerHealth),
+    players: &[(PlayerId, Vec2)],
+    items: &[(usize, IVec2)],
+    rng: &WyRand,
+    first: &PendingPlacement,
+    second_index: usize,
+    second_target: &DropTarget,
+) -> Option<String> {
+    let (board, turn, health) = state;
+    let frost_ember = match (first.index, second_index) {
+        (FROST_CRYSTAL_ITEM_INDEX, OIL_ITEM_INDEX) => Some((first.target.cell, second_target.cell)),
+        (OIL_ITEM_INDEX, FROST_CRYSTAL_ITEM_INDEX) => Some((second_target.cell, first.target.cell)),
+        _ => None,
+    };
+    if let Some((frost, ember)) = frost_ember {
+        if frost == ember {
+            return Some("Frost Crystal and Tlexochtli Ember cannot share a tile".into());
+        }
+        if board.is_water(frost)
+            && board.is_water(ember)
+            && (frost - ember).abs().max_element() <= 1
+        {
+            return Some("Cannot combine Ember and Frost on affected water in one turn".into());
+        }
+    }
+
+    let mut world = World::new();
+    let hud = world.spawn_empty().id();
+    let first_marker = world.spawn_empty().id();
+    let second_marker = world.spawn_empty().id();
+    world.insert_resource(Hud(hud));
+    world.insert_resource(board.clone());
+    world.insert_resource(PlayerHealth(health.0));
+    world.insert_resource(InventoryImages::default());
+    world.insert_resource(ButtonInput::<MouseButton>::default());
+    world.insert_resource(ButtonInput::<KeyCode>::default());
+    world.insert_resource(BoardCursor::default());
+    world.insert_resource(Selection::default());
+    world.spawn((rng.clone(), GlobalRng));
+    world.spawn((DropFeedback, Text::default()));
+    for &(player, position) in players {
+        world.spawn((
+            Player(player),
+            Transform::from_xyz(position.x, position.y, 0.0),
+        ));
+    }
+    for &(index, cell) in items {
+        let mut item = world.spawn((Collectible { index, cell }, BoardItem));
+        match index {
+            WATER_ITEM_INDEX => {
+                item.insert(PendingWaterStone(cell));
+            }
+            SUNSTONE_ITEM_INDEX => {
+                item.insert(PendingSunstone(cell));
+            }
+            FROST_CRYSTAL_ITEM_INDEX => {
+                item.insert(PendingFrost(cell));
+            }
+            THORNHEART_ITEM_INDEX => {
+                item.insert(PendingThornheart(cell));
+            }
+            STORM_SHARD_ITEM_INDEX => {
+                item.insert(PendingStormShard(cell));
+            }
+            VOID_DUST_ITEM_INDEX => {
+                item.insert(PendingVoidDust(cell));
+            }
+            OBSIDIAN_ITEM_INDEX => {
+                item.insert(PendingObsidian(cell));
+            }
+            STONE_DUST_ITEM_INDEX => {
+                item.insert(PendingStoneDust(cell));
+            }
+            COATL_EGG_ITEM_INDEX => {
+                item.insert(PendingCoatlEgg(cell));
+            }
+            LIFE_ESSENCE_ITEM_INDEX => {
+                item.insert(PendingLifeEssence(cell));
+            }
+            AQUATIC_ITEM_INDEX => {
+                item.insert(PendingAquaticCreature(cell));
+            }
+            _ => {}
+        }
+    }
+    let projected = TurnState {
+        active: turn.active,
+        strength: turn.strength,
+        magic: turn.magic,
+        hovering: turn.hovering,
+        frozen_turns: turn.frozen_turns,
+        inventory: turn.inventory,
+        wind: turn.wind,
+        actions_used: 2,
+        free_action: turn.free_action,
+        pending_placement: Some(PendingPlacement {
+            index: first.index,
+            target: first.target.clone(),
+            marker: first_marker,
+            ready: true,
+            previous_free_action: first.previous_free_action,
+            landed: true,
+        }),
+        next_placement: Some(PendingPlacement {
+            index: second_index,
+            target: second_target.clone(),
+            marker: second_marker,
+            ready: true,
+            previous_free_action: turn.free_action,
+            landed: true,
+        }),
+        ..default()
+    };
+    world.insert_resource(projected);
+    world
+        .run_system_once(handle_selection)
+        .expect("placement preview system failed");
+    if world.resource::<TurnState>().pending_placement.is_none() {
+        return Some("Queued placement cannot resolve - undo it and choose another action".into());
+    }
+    world
+        .run_system_once(clear_hole_items)
+        .expect("placement preview cleanup failed");
+    world
+        .run_system_once(handle_selection)
+        .expect("placement preview system failed");
+    if world.resource::<TurnState>().active == turn.active {
+        let feedback = world
+            .query_filtered::<&Text, With<DropFeedback>>()
+            .single(&world)
+            .expect("placement preview feedback missing");
+        Some(
+            feedback
+                .0
+                .split(" - first item resolved")
+                .next()
+                .unwrap_or(&feedback.0)
+                .to_owned(),
+        )
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3698,11 +3871,13 @@ fn handle_selection(
         void_dust,
         eggs,
         aquatic,
+        collectibles,
     } = actors;
     let has_dust_reaction = |cell| {
         obsidians.iter().any(|(_, item)| item.0 == cell)
             || life_essences.iter().any(|(_, item)| item.0 == cell)
     };
+    let has_frost = |cell| crystals.iter().any(|(_, item)| item.0 == cell);
     let Some((player_entity, player)) = players.iter().find_map(|(entity, player, transform)| {
         (player.0 == turn.active).then_some((entity, transform.translation.truncate()))
     }) else {
@@ -3769,6 +3944,7 @@ fn handle_selection(
             pending.index,
             pending.target.cell,
             has_dust_reaction(pending.target.cell),
+            has_frost(pending.target.cell),
         ) {
             let cost = u8::try_from(item_energy_cost(&pending.target)).expect("validated cost");
             let player_index = turn.active.index();
@@ -3872,16 +4048,42 @@ fn handle_selection(
                 }
             }
         });
+        let placement_error = match (&active_selection, &target) {
+            (Some(ActiveSelection::Item(index)), Some(target)) => {
+                if !resolving_pending && let Some(first) = turn.pending_placement.as_ref() {
+                    let positions: Vec<_> = players
+                        .iter()
+                        .map(|(_, player, transform)| (player.0, transform.translation.truncate()))
+                        .collect();
+                    let items: Vec<_> = collectibles
+                        .iter()
+                        .map(|item| (item.index, item.cell))
+                        .collect();
+                    projected_placement_error(
+                        (&board, &turn, &health),
+                        &positions,
+                        &items,
+                        &rng,
+                        first,
+                        *index,
+                        target,
+                    )
+                } else {
+                    item_placement_error(
+                        &board,
+                        *index,
+                        target.cell,
+                        has_dust_reaction(target.cell),
+                        has_frost(target.cell),
+                    )
+                    .map(str::to_owned)
+                }
+            }
+            _ => None,
+        };
         match (&active_selection, &target) {
             (Some(ActiveSelection::Item(index)), Some(target))
-                if queued_placement_error(
-                    &board,
-                    *index,
-                    target.cell,
-                    turn.pending_placement.as_ref(),
-                    has_dust_reaction(target.cell),
-                )
-                .is_none()
+                if placement_error.is_none()
                     && (resolving_pending
                         || (!must_land(&turn, &board, player)
                             && (is_unlimited(*index)
@@ -4162,8 +4364,7 @@ fn handle_selection(
                                     || direct_hit
                             }
                             SUNSTONE_ITEM_INDEX => {
-                                board.is_water(target.cell)
-                                    || board.is_frozen(target.cell)
+                                board.is_frozen(target.cell)
                                     || board.has_oil(target.cell)
                                     || pending_obsidian.is_some()
                                     || frozen_player_on_target
@@ -4540,29 +4741,31 @@ fn handle_selection(
                 {
                     commands.entity(entity).despawn();
                 }
-                let reacts_as_sunstone = is_sunstone
-                    || (existing_sunstone.is_some()
-                        && (water_on_solid || is_oil || direct_sunstone));
-                let heats_water = reacts_as_sunstone
-                    && board.is_water(target.cell)
-                    && !board.is_frozen(target.cell);
-                let ignites_oil = reacts_as_sunstone && board.has_oil(target.cell);
+                let reacts_as_sunstone =
+                    is_sunstone || (existing_sunstone.is_some() && (is_oil || direct_sunstone));
+                let ignites_oil = reacts_as_sunstone
+                    && board.has_oil(target.cell)
+                    && !(is_oil && board.is_water(target.cell) && !board.is_frozen(target.cell));
                 let thaws_ice = reacts_as_sunstone && was_frozen && !ignites_oil;
                 if thaws_ice {
                     board.thaw(target.cell);
                 }
-                let makes_steam = heats_water && !ignites_oil;
+                let makes_steam = (is_oil || water_on_solid)
+                    && board.has_oil(target.cell)
+                    && board.is_water(target.cell)
+                    && !board.is_frozen(target.cell)
+                    && !ignites_oil;
+                if makes_steam {
+                    board.remove_oil(target.cell);
+                }
                 let mut refreshed_water = Vec::new();
                 if water_on_solid {
                     refreshed_water.push(target.cell);
                 }
                 if let Some(entity) = existing_sunstone
-                    && (makes_steam || ignites_oil || direct_sunstone)
+                    && (ignites_oil || direct_sunstone)
                 {
                     commands.entity(entity).despawn();
-                }
-                if !ignites_oil && heats_water && board.ground(target.cell) == Some(Ground::Solid) {
-                    board.dry(target.cell);
                 }
                 let mut obsidian_sources: Vec<_> = obsidians
                     .iter()
@@ -4783,11 +4986,7 @@ fn handle_selection(
                     && (!is_storm || (electrified.is_empty() && !direct_storm && !storm_hits_acid))
                     && !(is_frost && froze)
                     && !(is_sunstone
-                        && (makes_steam
-                            || ignites_oil
-                            || direct_sunstone
-                            || thaws_ice
-                            || thawed_player))
+                        && (ignites_oil || direct_sunstone || thaws_ice || thawed_player))
                     && !(is_obsidian && (creates_ridge || consumed_new_obsidian))
                     && !(is_stone && uses_stone)
                     && !(is_void && (void_hole || void_levels_ridge))
@@ -4946,7 +5145,7 @@ fn handle_selection(
                     turn.ingredient_respawns
                         .push((STORM_SHARD_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY));
                 }
-                if (makes_steam || ignites_oil || direct_sunstone || thaws_ice || thawed_player)
+                if (ignites_oil || direct_sunstone || thaws_ice || thawed_player)
                     && (is_sunstone || existing_sunstone.is_some())
                 {
                     turn.ingredient_respawns
@@ -5140,16 +5339,39 @@ fn handle_selection(
             highlight,
         }) => {
             let placement_error = cell.and_then(|cell| {
-                queued_placement_error(
-                    &board,
-                    *index,
-                    cell,
-                    turn.pending_placement.as_ref(),
-                    has_dust_reaction(cell),
-                )
+                if let Some(first) = turn.pending_placement.as_ref()
+                    && let Some(target) = target.as_ref()
+                {
+                    let positions: Vec<_> = players
+                        .iter()
+                        .map(|(_, player, transform)| (player.0, transform.translation.truncate()))
+                        .collect();
+                    let items: Vec<_> = collectibles
+                        .iter()
+                        .map(|item| (item.index, item.cell))
+                        .collect();
+                    projected_placement_error(
+                        (&board, &turn, &health),
+                        &positions,
+                        &items,
+                        &rng,
+                        first,
+                        *index,
+                        target,
+                    )
+                } else {
+                    item_placement_error(
+                        &board,
+                        *index,
+                        cell,
+                        has_dust_reaction(cell),
+                        has_frost(cell),
+                    )
+                    .map(str::to_owned)
+                }
                 .or_else(|| {
                     (turn.terrain_rejection == Some((*index, cell)))
-                        .then_some("Cannot create terrain: 60% ridge and hole limit")
+                        .then(|| "Cannot create terrain: 60% ridge and hole limit".to_owned())
                 })
             });
             let can_use = target.as_ref().is_some_and(|target| {
@@ -5186,7 +5408,7 @@ fn handle_selection(
                 format!("Click ? to see {} reactions", INVENTORY_ITEMS[*index].0)
             } else {
                 match (&target, placement_error) {
-                    (_, Some(message)) => message.into(),
+                    (_, Some(message)) => message,
                     (Some(target), None) if !can_use => format!(
                         "Not enough energy - needs {} - choose Move, a nearby tile, or rest",
                         item_energy_cost(target)
@@ -6272,8 +6494,8 @@ fn update_aquatic_visuals(
 }
 
 fn rest(
+    selection: (Commands, ResMut<Selection>),
     input: (Res<ButtonInput<KeyCode>>, Option<Res<ai::BotController>>),
-    selection: Res<Selection>,
     mut turn: ResMut<TurnState>,
     mut board: ResMut<Board>,
     mut health: ResMut<PlayerHealth>,
@@ -6283,6 +6505,7 @@ fn rest(
         Option<ResMut<sound::SoundCues>>,
     ),
 ) {
+    let (mut commands, mut selection) = selection;
     let (keyboard, bot) = input;
     let (mut feedback, mut sounds) = output;
     if !bot.as_ref().is_some_and(|bot| bot.bot_turn)
@@ -6290,10 +6513,12 @@ fn rest(
         && !turn.acted_this_frame
         && !turn.animation_active()
         && !turn.pending_placement.as_ref().is_some_and(|p| p.ready)
-        && selection.0.is_none()
     {
         match finish_rest(&mut turn, &mut board, &mut health, &players) {
-            Ok(()) => sound::request(&mut sounds, sound::Cue::Chime),
+            Ok(()) => {
+                clear_selection(&mut commands, &mut selection);
+                sound::request(&mut sounds, sound::Cue::Chime);
+            }
             Err(message) => {
                 if let Ok(mut feedback) = feedback.single_mut() {
                     feedback.0 = message.into();
@@ -7209,7 +7434,7 @@ mod tests {
                 assert_eq!(count_node.position_type, PositionType::Absolute);
                 assert_eq!(count_node.top, Val::Px(2.0));
                 assert_eq!(count_node.right, Val::Px(3.0));
-                if index < 4 {
+                if is_unlimited(INVENTORY_ORDER[index]) {
                     assert!(world.get::<ImageNode>(children[2]).is_some());
                     assert!(world.get::<Text>(children[2]).is_none());
                 } else {
@@ -7726,6 +7951,7 @@ mod tests {
             turn.inventory = [[0; 14]; 2];
             turn.inventory[1][SUNSTONE_ITEM_INDEX] = 1;
             turn.inventory[1][LIFE_ESSENCE_ITEM_INDEX] = 1;
+            turn.inventory[1][OIL_ITEM_INDEX] = 1;
             turn.wind = WindDirection::West;
         }
         app
@@ -8142,7 +8368,7 @@ mod tests {
     }
 
     #[test]
-    fn computer_queues_water_and_sunstone_through_normal_turn_resolution() {
+    fn computer_queues_water_and_ember_through_normal_turn_resolution() {
         let mut app = computer_app();
         {
             let world = app.world_mut();
@@ -8168,7 +8394,7 @@ mod tests {
         let turn = app.world().resource::<TurnState>();
         assert_eq!(turn.active, PlayerId::One);
         assert!(turn.pending_placement.is_none());
-        assert_eq!(turn.inventory[1][SUNSTONE_ITEM_INDEX], 0);
+        assert_eq!(turn.inventory[1][OIL_ITEM_INDEX], 0);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [8, 10]);
         assert_eq!(
             app.world().resource::<Board>().ground(IVec2::new(1, 1)),
@@ -8178,7 +8404,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].text, "Computer used Tlaloc's Water at B2");
         assert_eq!(entries[0].item, Some(WATER_ITEM_INDEX));
-        assert_eq!(entries[1].text, "Computer used Sunstone at B2");
+        assert_eq!(entries[1].text, "Computer used Tlexochtli Ember at B2");
     }
 
     #[test]
@@ -10697,7 +10923,10 @@ mod tests {
         assert_eq!(turn.active, PlayerId::One);
         assert_eq!(turn.actions_used, 1);
         assert_eq!(turn.inventory[0][WATER_ITEM_INDEX], 2);
-        assert!(app.world().resource::<Board>().is_water(target));
+        assert_eq!(
+            app.world().resource::<Board>().ground(target),
+            Some(Ground::Solid)
+        );
         let world = app.world_mut();
         let feedback = world
             .query_filtered::<&Text, With<DropFeedback>>()
@@ -10705,10 +10934,16 @@ mod tests {
             .unwrap();
         assert!(feedback.0.contains("Cannot place water"));
         click_part(&mut app, Vec2::new(-330.0, -60.0));
-        assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
-        assert!(app.world().resource::<Board>().is_water(target));
+        assert_eq!(app.world().resource::<TurnState>().actions_used, 0);
+        assert_eq!(
+            app.world().resource::<Board>().ground(target),
+            Some(Ground::Solid)
+        );
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
+        click_part(&mut app, cell_center(target));
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+        assert!(app.world().resource::<Board>().is_water(target));
         assert!(
             app.world()
                 .resource::<TurnState>()
@@ -10803,16 +11038,16 @@ mod tests {
         assert_eq!(turn.strength[0], 5);
         assert_eq!(
             app.world().resource::<Board>().ground(targets[0]),
-            Some(Ground::Ridge)
+            Some(Ground::Solid)
         );
         assert_eq!(
             app.world().resource::<Board>().ground(targets[1]),
-            Some(Ground::Ridge)
+            Some(Ground::Solid)
         );
     }
 
     #[test]
-    fn rejected_second_reaction_still_consumes_a_deferred_direct_hit() {
+    fn rejected_second_reaction_keeps_the_first_hit_queued() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, target);
@@ -10846,10 +11081,7 @@ mod tests {
             1
         );
         assert_eq!(world.query::<&PendingFrost>().iter(world).count(), 0);
-        assert_eq!(
-            world.resource::<TurnState>().ingredient_respawns,
-            [(FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)]
-        );
+        assert_eq!(world.resource::<TurnState>().ingredient_respawns, []);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
@@ -10915,7 +11147,6 @@ mod tests {
             WATER_ITEM_INDEX,
             VOID_DUST_ITEM_INDEX,
             STONE_DUST_ITEM_INDEX,
-            OIL_ITEM_INDEX,
         ] {
             let mut app = interaction_app();
             app.world_mut().resource_mut::<TurnState>().inventory = [[0; 14]; 2];
@@ -10979,7 +11210,6 @@ mod tests {
                         .iter()
                         .all(|&cell| board.ground(cell) == Some(Ground::Solid))
                 ),
-                OIL_ITEM_INDEX => assert!([first, second].iter().all(|&cell| board.has_oil(cell))),
                 _ => unreachable!(),
             }
         }
@@ -11018,7 +11248,7 @@ mod tests {
 
         assert_eq!(
             app.world().resource::<Board>().ground(player_cell),
-            Some(Ground::Hole)
+            Some(Ground::Solid)
         );
         assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
         let destination = [IVec2::X, -IVec2::X, IVec2::Y, -IVec2::Y]
@@ -11051,7 +11281,7 @@ mod tests {
         assert_eq!(turn.strength[0], 3);
         assert_eq!(
             app.world().resource::<Board>().ground(target),
-            Some(Ground::Hole)
+            Some(Ground::Solid)
         );
         assert_eq!(
             app.world_mut()
@@ -11189,7 +11419,7 @@ mod tests {
                     .all(|item| ![IVec2::new(5, 3), IVec2::new(7, 6)].contains(&item.cell))
             );
         }
-        let inventory_items = 4;
+        let inventory_items = 6;
         let field_capacity = INGREDIENT_POOL_SIZE - inventory_items;
         for completed_turns in 1..=60 {
             let acting_player = app.world().resource::<TurnState>().active;
@@ -11299,7 +11529,7 @@ mod tests {
         let world = app.world_mut();
         let item = world.query::<&Collectible>().single(world).unwrap();
         assert_eq!((item.index, item.cell), (SUNSTONE_ITEM_INDEX, IVec2::ZERO));
-        assert_eq!(world.resource::<TurnState>().ingredient_respawns.len(), 1);
+        assert_eq!(world.resource::<TurnState>().ingredient_respawns.len(), 2);
         assert_eq!(world.resource::<TurnState>().spawned_ingredients, [0; 14]);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(item_count(&mut app), 1);
@@ -11412,7 +11642,7 @@ mod tests {
                 .iter()
                 .map(|&n| usize::from(n))
                 .sum::<usize>(),
-            6
+            8
         );
         click_part(&mut app, Vec2::new(-330.0, -60.0));
         assert_eq!(item_count(&mut app), 2);
@@ -11954,7 +12184,14 @@ mod tests {
                 }
             }
             app.world_mut().resource_mut::<TurnState>().hovering = [true, true];
-            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
+            click(
+                &mut app,
+                p1_item(if fire {
+                    SUNSTONE_ITEM_INDEX
+                } else {
+                    OIL_ITEM_INDEX
+                }),
+            );
             click(&mut app, cell_center(target));
             if fire {
                 assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 8]);
@@ -11977,7 +12214,7 @@ mod tests {
         }
         app.world_mut().resource_mut::<TurnState>().hovering[1] = true;
         app.world_mut().resource_mut::<PlayerHealth>().0[1] = 1;
-        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0[1], 0);
     }
@@ -12052,21 +12289,20 @@ mod tests {
             WATER_ITEM_INDEX,
             VOID_DUST_ITEM_INDEX,
             STONE_DUST_ITEM_INDEX,
-            OIL_ITEM_INDEX,
         ] {
             let position = p1_item(index);
             click(&mut app, position);
             assert!(app.world().resource::<Selection>().0.is_some());
             press_key(&mut app, KeyCode::Escape);
         }
-        for item in [p1_item(ACID_ITEM_INDEX), p1_item(POISON_ITEM_INDEX)] {
+        for item in [
+            p1_item(ACID_ITEM_INDEX),
+            p1_item(POISON_ITEM_INDEX),
+            p1_item(OIL_ITEM_INDEX),
+        ] {
             click(&mut app, item);
             assert!(app.world().resource::<Selection>().0.is_none());
         }
-        click(&mut app, p1_item(OIL_ITEM_INDEX));
-        click(&mut app, cell_center(IVec2::new(6, 3)));
-        assert!(app.world().resource::<Board>().has_oil(IVec2::new(6, 3)));
-        assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
     }
 
     #[test]
@@ -12904,31 +13140,58 @@ mod tests {
     }
 
     #[test]
-    fn early_drying_schedules_life_and_sunstone_respawns_once() {
+    fn ember_recycles_only_after_its_layer_is_removed() {
+        for remover in [SUNSTONE_ITEM_INDEX, VOID_DUST_ITEM_INDEX] {
+            let mut app = interaction_app();
+            let cell = IVec2::new(6, 3);
+            click(&mut app, p1_item(OIL_ITEM_INDEX));
+            click(&mut app, cell_center(cell));
+            assert!(app.world().resource::<Board>().has_oil(cell));
+            assert!(
+                app.world()
+                    .resource::<TurnState>()
+                    .ingredient_respawns
+                    .is_empty()
+            );
+            click(&mut app, p2_item(remover));
+            click(&mut app, cell_center(cell));
+            let respawns = &app.world().resource::<TurnState>().ingredient_respawns;
+            assert_eq!(
+                respawns
+                    .iter()
+                    .filter(|&&(item, delay)| item == OIL_ITEM_INDEX && delay == 5)
+                    .count(),
+                1
+            );
+            assert!(!app.world().resource::<Board>().has_oil(cell));
+        }
+    }
+
+    #[test]
+    fn connected_ember_layers_recycle_once_after_five_turns() {
         let mut app = interaction_app();
-        let cell = IVec2::new(6, 3);
+        let source = IVec2::new(6, 3);
         {
             let mut board = app.world_mut().resource_mut::<Board>();
-            board.make_wet(cell);
-            board.add_life_essence(cell);
+            board.add_oil(source);
+            board.add_oil(source + IVec2::X);
         }
+        app.world_mut().resource_mut::<TurnState>().turns_until_drop = 200;
         click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
-        click(&mut app, cell_center(cell));
-        let turn = app.world().resource::<TurnState>();
-        assert_eq!(
-            turn.ingredient_respawns,
-            [(LIFE_ESSENCE_ITEM_INDEX, 5), (SUNSTONE_ITEM_INDEX, 5)]
-        );
-        for _ in 0..6 {
-            press_key(&mut app, KeyCode::KeyR);
+        click(&mut app, cell_center(source));
+        for remaining in (0..=5).rev() {
+            let respawns = &app.world().resource::<TurnState>().ingredient_respawns;
+            assert_eq!(
+                respawns
+                    .iter()
+                    .filter(|&&(item, delay)| item == OIL_ITEM_INDEX && delay == remaining)
+                    .count(),
+                2
+            );
+            if remaining > 0 {
+                press_key(&mut app, KeyCode::KeyR);
+            }
         }
-        let world = app.world_mut();
-        let mut items = world.query::<&Collectible>();
-        let mut indices: Vec<_> = items.iter(world).map(|item| item.index).collect();
-        indices.sort_unstable();
-        assert_eq!(indices, [SUNSTONE_ITEM_INDEX, LIFE_ESSENCE_ITEM_INDEX]);
-        assert_eq!(world.query::<&PendingSunstone>().iter(world).count(), 1);
-        assert_eq!(world.query::<&PendingLifeEssence>().iter(world).count(), 1);
     }
 
     #[test]
@@ -13559,39 +13822,252 @@ mod tests {
     }
 
     #[test]
-    fn oil_persists_when_water_is_removed() {
+    fn ember_on_water_creates_steam_and_recycles_once() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         click(&mut app, p1_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
         click(&mut app, p2_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        assert!(app.world().resource::<Board>().has_oil(cell));
+        assert!(!app.world().resource::<Board>().has_oil(cell));
         assert_eq!(
             app.world().resource::<Board>().ground(cell),
             Some(Ground::Water)
         );
         assert_eq!(item_count(&mut app), 0);
 
-        select_move(&mut app);
-        press_key(&mut app, KeyCode::Escape);
-        assert!(app.world().resource::<Board>().has_oil(cell));
-        for _ in 0..20 {
-            press_key(&mut app, KeyCode::KeyR);
-            assert!(app.world().resource::<Board>().has_oil(cell));
-        }
-        app.world_mut()
-            .resource_mut::<Board>()
-            .set(cell, Ground::Solid);
-        for _ in 0..20 {
-            press_key(&mut app, KeyCode::KeyR);
-            assert!(app.world().resource::<Board>().has_oil(cell));
+        assert!(!steam_positions(&mut app).is_empty());
+        assert_eq!(
+            app.world().resource::<TurnState>().ingredient_respawns,
+            [(OIL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)]
+        );
+    }
+
+    #[test]
+    fn sunstone_on_water_waits_and_ember_produces_steam() {
+        let mut app = interaction_app();
+        let cell = IVec2::new(6, 3);
+        app.world_mut().resource_mut::<Board>().make_water(cell);
+        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
+        click(&mut app, cell_center(cell));
+        assert!(steam_positions(&mut app).is_empty());
+        assert_eq!(item_count(&mut app), 1);
+        click(&mut app, p2_item(OIL_ITEM_INDEX));
+        click(&mut app, cell_center(cell));
+        assert!(!steam_positions(&mut app).is_empty());
+        assert!(app.world().resource::<Board>().is_water(cell));
+        assert_eq!(item_count(&mut app), 1);
+        assert_eq!(
+            app.world().resource::<TurnState>().ingredient_respawns,
+            [(OIL_ITEM_INDEX, 5)]
+        );
+    }
+
+    #[test]
+    fn queued_frost_and_ember_reject_conflicts_before_either_resolves() {
+        for ember_first in [false, true] {
+            for offset in [IVec2::ZERO, IVec2::ONE, IVec2::new(2, 0)] {
+                let mut app = interaction_app();
+                let frost = IVec2::new(6, 3);
+                let ember = frost + offset;
+                move_player_to(&mut app, PlayerId::Two, IVec2::new(10, 5));
+                app.world_mut().resource_mut::<TurnState>().inventory[0]
+                    [FROST_CRYSTAL_ITEM_INDEX] = 1;
+                app.world_mut().resource_mut::<TurnState>().inventory[0][OIL_ITEM_INDEX] = 1;
+                {
+                    let mut board = app.world_mut().resource_mut::<Board>();
+                    board.set(frost, Ground::Water);
+                    board.set(ember, Ground::Water);
+                }
+                let (first, second) = if ember_first {
+                    ((OIL_ITEM_INDEX, ember), (FROST_CRYSTAL_ITEM_INDEX, frost))
+                } else {
+                    ((FROST_CRYSTAL_ITEM_INDEX, frost), (OIL_ITEM_INDEX, ember))
+                };
+                click_part(&mut app, p1_item(first.0));
+                click_part(&mut app, cell_center(first.1));
+                let energy = app.world().resource::<TurnState>().strength[0];
+                click_part(&mut app, p1_item(second.0));
+                click_part(&mut app, cell_center(second.1));
+                if offset == IVec2::new(2, 0) {
+                    assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+                    assert!(app.world().resource::<Board>().is_frozen(frost));
+                    assert!(!steam_positions(&mut app).is_empty());
+                } else {
+                    let turn = app.world().resource::<TurnState>();
+                    assert_eq!(turn.active, PlayerId::One);
+                    assert_eq!(turn.actions_used, 1);
+                    assert_eq!(turn.strength[0], energy);
+                    assert_eq!(turn.inventory[0][second.0], 1);
+                    assert!(turn.pending_placement.is_some());
+                    assert!(!app.world().resource::<Board>().is_frozen(frost));
+                    assert!(!app.world().resource::<Board>().has_oil(ember));
+                    assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
+                    assert!(steam_positions(&mut app).is_empty());
+                }
+            }
         }
     }
 
     #[test]
-    fn oil_can_coat_allowed_ground_types_without_duplicate_icons() {
-        for ground in [Ground::Solid, Ground::Water, Ground::Ridge] {
+    fn frost_and_ember_cannot_be_placed_on_existing_opposites() {
+        for item in [FROST_CRYSTAL_ITEM_INDEX, OIL_ITEM_INDEX] {
+            for placed in [false, true] {
+                let mut app = interaction_app();
+                let cell = IVec2::new(8, 3);
+                app.world_mut().resource_mut::<TurnState>().inventory[0][item] = 1;
+                if item == FROST_CRYSTAL_ITEM_INDEX {
+                    app.world_mut().resource_mut::<Board>().add_oil(cell);
+                } else {
+                    let mut crystal = app.world_mut().spawn((
+                        BoardItem,
+                        Collectible {
+                            index: FROST_CRYSTAL_ITEM_INDEX,
+                            cell,
+                        },
+                        PendingFrost(cell),
+                    ));
+                    if placed {
+                        crystal.insert(PlacedItem);
+                    }
+                }
+                click_part(&mut app, p1_item(item));
+                click_part(&mut app, cell_center(cell));
+                let turn = app.world().resource::<TurnState>();
+                assert_eq!(turn.active, PlayerId::One);
+                assert_eq!(turn.actions_used, 0);
+                assert_eq!(turn.strength[0], 5);
+                assert_eq!(turn.inventory[0][item], 1);
+                assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
+                let world = app.world_mut();
+                assert!(
+                    world
+                        .query_filtered::<&Text, With<DropFeedback>>()
+                        .single(world)
+                        .unwrap()
+                        .0
+                        .contains("cannot share a tile")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_frost_and_ember_reject_same_dry_tile_even_on_a_player() {
+        for first in [FROST_CRYSTAL_ITEM_INDEX, OIL_ITEM_INDEX] {
+            for occupied in [false, true] {
+                let mut app = interaction_app();
+                let cell = IVec2::new(6, 3);
+                let second = if first == FROST_CRYSTAL_ITEM_INDEX {
+                    OIL_ITEM_INDEX
+                } else {
+                    FROST_CRYSTAL_ITEM_INDEX
+                };
+                {
+                    let mut turn = app.world_mut().resource_mut::<TurnState>();
+                    turn.inventory[0][first] = 1;
+                    turn.inventory[0][second] = 1;
+                }
+                if occupied {
+                    move_player_to(&mut app, PlayerId::Two, cell);
+                }
+                click_part(&mut app, p1_item(first));
+                click_part(&mut app, cell_center(cell));
+                let energy = app.world().resource::<TurnState>().strength[0];
+                click_part(&mut app, p1_item(second));
+                click_part(&mut app, cell_center(cell));
+                let turn = app.world().resource::<TurnState>();
+                assert_eq!(turn.active, PlayerId::One);
+                assert_eq!(turn.actions_used, 1);
+                assert_eq!(turn.strength[0], energy);
+                assert_eq!(turn.inventory[0][second], 1);
+                assert!(turn.pending_placement.is_some());
+                assert_eq!(turn.frozen_turns, [0, 0]);
+                assert!(!app.world().resource::<Board>().has_oil(cell));
+                assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
+                click_part(&mut app, Vec2::new(-330.0, -60.0));
+                let turn = app.world().resource::<TurnState>();
+                assert_eq!(turn.actions_used, 0);
+                assert_eq!(turn.inventory[0][first], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn ember_can_be_placed_on_a_frozen_player_without_a_crystal() {
+        let mut app = interaction_app();
+        let cell = IVec2::new(6, 3);
+        move_player_to(&mut app, PlayerId::Two, cell);
+        app.world_mut().resource_mut::<TurnState>().frozen_turns[1] = 2;
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
+        click(&mut app, cell_center(cell));
+        assert!(app.world().resource::<Board>().has_oil(cell));
+        assert_eq!(app.world().resource::<TurnState>().frozen_turns[1], 2);
+    }
+
+    #[test]
+    fn frost_and_ember_can_be_queued_on_separate_dry_tiles() {
+        for first in [FROST_CRYSTAL_ITEM_INDEX, OIL_ITEM_INDEX] {
+            let mut app = interaction_app();
+            let frost = IVec2::new(6, 3);
+            let ember = frost + IVec2::X;
+            let first_cell = if first == FROST_CRYSTAL_ITEM_INDEX {
+                frost
+            } else {
+                ember
+            };
+            let (second, second_cell) = if first == FROST_CRYSTAL_ITEM_INDEX {
+                (OIL_ITEM_INDEX, ember)
+            } else {
+                (FROST_CRYSTAL_ITEM_INDEX, frost)
+            };
+            click_part(&mut app, p1_item(first));
+            click_part(&mut app, cell_center(first_cell));
+            click_part(&mut app, p1_item(second));
+            click_part(&mut app, cell_center(second_cell));
+            assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
+            assert!(app.world().resource::<Board>().has_oil(ember));
+            let world = app.world_mut();
+            assert!(
+                world
+                    .query::<&PendingFrost>()
+                    .iter(world)
+                    .any(|item| item.0 == frost)
+            );
+        }
+    }
+
+    #[test]
+    fn queued_water_and_void_reject_both_orders_without_effects() {
+        for (first, second) in [
+            (WATER_ITEM_INDEX, VOID_DUST_ITEM_INDEX),
+            (VOID_DUST_ITEM_INDEX, WATER_ITEM_INDEX),
+        ] {
+            let mut app = interaction_app();
+            let cell = IVec2::new(6, 3);
+            click_part(&mut app, p1_item(first));
+            click_part(&mut app, cell_center(cell));
+            let energy = app.world().resource::<TurnState>().strength[0];
+            click_part(&mut app, p1_item(second));
+            click_part(&mut app, cell_center(cell));
+            let turn = app.world().resource::<TurnState>();
+            assert_eq!(turn.active, PlayerId::One);
+            assert_eq!(turn.actions_used, 1);
+            assert_eq!(turn.strength[0], energy);
+            assert!(turn.pending_placement.is_some());
+            assert_eq!(
+                app.world().resource::<Board>().ground(cell),
+                Some(Ground::Solid)
+            );
+            assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
+            click_part(&mut app, Vec2::new(-330.0, -60.0));
+            assert_eq!(app.world().resource::<TurnState>().actions_used, 0);
+        }
+    }
+
+    #[test]
+    fn ember_coats_solid_and_ridge_and_rejects_duplicate_placement() {
+        for ground in [Ground::Solid, Ground::Ridge] {
             let mut app = interaction_app();
             let cell = IVec2::new(6, 3);
             move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
@@ -13605,17 +14081,26 @@ mod tests {
                 press_key(&mut app, KeyCode::KeyR);
                 assert!(app.world().resource::<Board>().has_oil(cell));
             }
-            press_key(&mut app, KeyCode::KeyR);
+            app.world_mut().resource_mut::<TurnState>().inventory[0][OIL_ITEM_INDEX] = 1;
+            let before = app.world().resource::<TurnState>().inventory[0][OIL_ITEM_INDEX];
+            let energy = app.world().resource::<TurnState>().strength[0];
             click(&mut app, p1_item(OIL_ITEM_INDEX));
             click(&mut app, cell_center(cell));
             assert!(app.world().resource::<Board>().has_oil(cell));
+            assert_eq!(
+                app.world().resource::<TurnState>().inventory[0][OIL_ITEM_INDEX],
+                before
+            );
+            assert_eq!(app.world().resource::<TurnState>().active, PlayerId::One);
+            assert_eq!(app.world().resource::<TurnState>().strength[0], energy);
+            assert_eq!(app.world().resource::<TurnState>().actions_used, 0);
             assert_eq!(item_count(&mut app), 0);
             assert_eq!(app.world().resource::<Board>().ground(cell), Some(ground));
         }
     }
 
     #[test]
-    fn water_stone_on_oil_creates_permanent_water_and_keeps_oil() {
+    fn water_on_ember_creates_steam_and_permanent_water() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
@@ -13623,13 +14108,20 @@ mod tests {
         click(&mut app, cell_center(cell));
         click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        assert!(app.world().resource::<Board>().has_oil(cell));
+        assert!(!app.world().resource::<Board>().has_oil(cell));
         assert_eq!(
             app.world().resource::<Board>().ground(cell),
             Some(Ground::Water)
         );
         assert_eq!(water_label(&mut app, cell), None);
         assert_eq!(item_count(&mut app), 0);
+        assert!(!steam_positions(&mut app).is_empty());
+        assert!(
+            app.world()
+                .resource::<TurnState>()
+                .ingredient_respawns
+                .contains(&(OIL_ITEM_INDEX, 5))
+        );
     }
 
     #[test]
@@ -13850,44 +14342,31 @@ mod tests {
     }
 
     #[test]
-    fn sunstone_uses_current_wind_and_dries_wet_ground_but_not_water() {
-        for natural_water in [false, true] {
-            let mut app = interaction_app();
-            app.update();
-            let target = IVec2::new(6, 3);
-            app.world_mut().resource_mut::<TurnState>().wind = WindDirection::West;
-            {
-                let mut board = app.world_mut().resource_mut::<Board>();
-                if natural_water {
-                    board.set(target, Ground::Water);
-                } else {
-                    board.make_wet(target);
-                }
-            }
-            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
-            click(&mut app, cell_center(target));
-            assert_eq!(steam_positions(&mut app), west_steam_positions());
-            assert_eq!(app.world().resource::<Board>().water_percentage(target), 0);
-            assert_eq!(
-                app.world().resource::<Board>().is_water(target),
-                natural_water
-            );
-            assert_eq!(item_count(&mut app), 0);
-            assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
-            app.world_mut().resource_mut::<TurnState>().wind = WindDirection::East;
-            app.update();
-            assert_eq!(steam_positions(&mut app), west_steam_positions());
-            assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
-            app.world_mut()
-                .resource_mut::<Time>()
-                .advance_by(std::time::Duration::from_secs(2));
-            app.update();
-            assert!(steam_positions(&mut app).is_empty());
-        }
+    fn ember_uses_current_wind_and_leaves_water() {
+        let mut app = interaction_app();
+        app.update();
+        let target = IVec2::new(6, 3);
+        app.world_mut().resource_mut::<TurnState>().wind = WindDirection::West;
+        app.world_mut().resource_mut::<Board>().make_water(target);
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
+        click(&mut app, cell_center(target));
+        assert_eq!(steam_positions(&mut app), west_steam_positions());
+        assert!(app.world().resource::<Board>().is_water(target));
+        assert_eq!(item_count(&mut app), 0);
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
+        app.world_mut().resource_mut::<TurnState>().wind = WindDirection::East;
+        app.update();
+        assert_eq!(steam_positions(&mut app), west_steam_positions());
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 10]);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(2));
+        app.update();
+        assert!(steam_positions(&mut app).is_empty());
     }
 
     #[test]
-    fn water_stone_on_a_placed_sunstone_creates_steam_and_permanent_water() {
+    fn water_on_a_placed_sunstone_does_not_create_steam() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
@@ -13897,15 +14376,15 @@ mod tests {
         app.world_mut().resource_mut::<TurnState>().wind = WindDirection::West;
         click(&mut app, p2_item(WATER_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        assert_eq!(steam_positions(&mut app), west_steam_positions());
-        assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
+        assert!(steam_positions(&mut app).is_empty());
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [10, 10]);
         assert_eq!(app.world().resource::<Board>().water_percentage(target), 0);
         assert_eq!(
             app.world().resource::<Board>().ground(target),
             Some(Ground::Water)
         );
         assert_eq!(water_label(&mut app, target), None);
-        assert_eq!(item_count(&mut app), 0);
+        assert_eq!(item_count(&mut app), 1);
         assert_eq!(app.world().resource::<TurnState>().strength, [5, 5]);
     }
 
@@ -13929,7 +14408,7 @@ mod tests {
                 app.world_mut().resource_mut::<TurnState>().hovering[1] = hovering;
                 app.world_mut().resource_mut::<TurnState>().wind = WindDirection::West;
                 app.world_mut().resource_mut::<Board>().make_water(target);
-                click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
+                click(&mut app, p1_item(OIL_ITEM_INDEX));
                 click(&mut app, cell_center(target));
                 let expected = if cell == target {
                     8
@@ -14091,7 +14570,7 @@ mod tests {
                 app.world().resource::<Board>().ground(target),
                 Some(Ground::Water)
             );
-            assert_eq!(item_count(&mut app), 0);
+            assert_eq!(item_count(&mut app), usize::from(!freeze_first));
             if freeze_first {
                 press_key(&mut app, KeyCode::KeyR);
                 assert_eq!(
@@ -14284,7 +14763,7 @@ mod tests {
         app.world_mut().spawn((BoardItem, PendingSunstone(target)));
         click(&mut app, p1_item(OBSIDIAN_ITEM_INDEX));
         click(&mut app, cell_center(target));
-        assert_eq!(app.world().resource::<PlayerHealth>().0[1], 2);
+        assert_eq!(app.world().resource::<PlayerHealth>().0[1], 4);
         let world = app.world_mut();
         assert_eq!(world.query::<&PendingStormShard>().iter(world).count(), 0);
         assert_eq!(world.query::<&PendingSunstone>().iter(world).count(), 0);
@@ -15137,7 +15616,7 @@ mod tests {
     }
 
     #[test]
-    fn second_dust_placement_is_revalidated_after_first_item_resolves() {
+    fn second_dust_placement_is_checked_before_first_item_resolves() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
         {
@@ -15150,7 +15629,8 @@ mod tests {
             click_part(&mut app, cell_center(cell));
         }
         let world = app.world_mut();
-        assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Solid));
+        assert_eq!(world.resource::<Board>().ground(cell), Some(Ground::Water));
+        assert!(world.resource::<Board>().has_oil(cell));
         assert_eq!(world.resource::<TurnState>().active, PlayerId::One);
         assert_eq!(world.resource::<TurnState>().actions_used, 1);
         assert_eq!(world.query::<&PendingStoneDust>().iter(world).count(), 0);
@@ -16677,7 +17157,7 @@ mod tests {
     }
 
     #[test]
-    fn sunstone_burns_oil_and_drains_created_water_without_steam() {
+    fn sunstone_on_water_after_steam_does_not_create_more_steam() {
         let mut app = interaction_app();
         let target = IVec2::new(6, 3);
         move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
@@ -16686,13 +17166,19 @@ mod tests {
         click(&mut app, p2_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(item_count(&mut app), 0);
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(2));
+        app.update();
+        assert!(steam_positions(&mut app).is_empty());
         click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
-        assert_eq!(item_count(&mut app), 0);
+        assert_eq!(item_count(&mut app), 1);
         assert_eq!(
             app.world().resource::<Board>().ground(target),
-            Some(Ground::Solid)
+            Some(Ground::Water)
         );
         assert_eq!(water_label(&mut app, target), None);
         assert!(steam_positions(&mut app).is_empty());
@@ -16765,7 +17251,7 @@ mod tests {
             board.set(target, Ground::Water);
             board.set(IVec2::new(5, 3), Ground::Ridge);
         }
-        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [9, 9]);
         assert_eq!(
@@ -16786,7 +17272,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<Board>()
             .set(target, Ground::Water);
-        click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(target));
         assert_eq!(app.world().resource::<PlayerHealth>().0, [0, 0]);
     }
@@ -16810,7 +17296,7 @@ mod tests {
                 board.make_water(target);
                 board.set(ridge, Ground::Ridge);
             }
-            click(&mut app, p1_item(SUNSTONE_ITEM_INDEX));
+            click(&mut app, p1_item(OIL_ITEM_INDEX));
             click(&mut app, cell_center(target));
             assert_eq!(app.world().resource::<PlayerHealth>().0[1], expected_health);
             let cells = steam_positions(&mut app);
@@ -16820,44 +17306,25 @@ mod tests {
     }
 
     #[test]
-    fn oil_on_frozen_water_persists_and_does_not_block_electricity() {
+    fn ember_on_frozen_water_is_rejected_without_spending() {
         let mut app = interaction_app();
         let cell = IVec2::new(6, 3);
-        move_player_to(&mut app, PlayerId::Two, IVec2::new(7, 3));
         {
             let mut board = app.world_mut().resource_mut::<Board>();
-            board.set(IVec2::new(5, 3), Ground::Water);
-            board.set(IVec2::new(7, 3), Ground::Water);
+            board.make_water(cell);
+            assert!(board.freeze_water(cell));
         }
-        click(&mut app, p1_item(WATER_ITEM_INDEX));
+        app.world_mut().resource_mut::<TurnState>().inventory[0][OIL_ITEM_INDEX] = 1;
+        click(&mut app, p1_item(OIL_ITEM_INDEX));
         click(&mut app, cell_center(cell));
-        click(&mut app, p2_item(OIL_ITEM_INDEX));
-        click(&mut app, cell_center(cell));
-        click(&mut app, p1_item(FROST_CRYSTAL_ITEM_INDEX));
-        click(&mut app, cell_center(cell));
+        let turn = app.world().resource::<TurnState>();
+        assert_eq!(turn.inventory[0][OIL_ITEM_INDEX], 1);
+        assert_eq!(turn.actions_used, 0);
+        assert_eq!(turn.active, PlayerId::One);
+        assert_eq!(turn.strength[0], 5);
         assert!(app.world().resource::<Board>().is_frozen(cell));
-        assert_eq!(
-            app.world().resource::<Board>().ground(cell),
-            Some(Ground::Water)
-        );
-        assert!(app.world().resource::<Board>().has_oil(cell));
-        for _ in 0..3 {
-            press_key(&mut app, KeyCode::KeyR);
-            assert!(app.world().resource::<Board>().has_oil(cell));
-            assert_eq!(
-                app.world().resource::<Board>().ground(cell),
-                Some(Ground::Water)
-            );
-        }
-        assert!(app.world().resource::<Board>().is_frozen(cell));
-        click(&mut app, p1_item(STORM_SHARD_ITEM_INDEX));
-        click(&mut app, cell_center(cell));
-        assert_eq!(app.world().resource::<PlayerHealth>().0, [5, 6]);
-        assert_eq!(
-            app.world().resource::<Board>().ground(cell),
-            Some(Ground::Water)
-        );
-        assert!(app.world().resource::<Board>().has_oil(cell));
+        assert!(!app.world().resource::<Board>().has_oil(cell));
+        assert!(steam_positions(&mut app).is_empty());
     }
 
     #[test]

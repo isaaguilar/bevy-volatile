@@ -6,12 +6,14 @@ const DIRECTIONS: [IVec2; 4] = [IVec2::X, IVec2::Y, IVec2::NEG_X, IVec2::NEG_Y];
 const GROWTH_TURNS: u8 = 3;
 const TOTAL_TURNS: u8 = 4;
 
+#[derive(Clone)]
 struct Arm {
     direction: IVec2,
     segments: Vec<Segment>,
     stopped: bool,
 }
 
+#[derive(Clone)]
 struct Segment {
     cell: IVec2,
 }
@@ -41,6 +43,7 @@ pub struct AquaticVisual {
     pub sweep_frame: Option<usize>,
 }
 
+#[derive(Clone)]
 pub struct AquaticCreature {
     id: u64,
     origin: IVec2,
