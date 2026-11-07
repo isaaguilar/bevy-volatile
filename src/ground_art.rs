@@ -716,6 +716,7 @@ mod tests {
             .init_resource::<TurnState>()
             .init_resource::<Time>()
             .init_resource::<effects::Effects>()
+            .init_resource::<crate::FrozenSheet>()
             .init_resource::<GroundSheet>()
             .add_systems(Startup, (spawn_board_terrain, attach_ground_art).chain())
             .add_systems(

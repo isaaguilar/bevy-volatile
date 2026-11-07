@@ -62,6 +62,9 @@ const ITEM_FLIGHT_HEIGHT: f32 = GRID_BLOCK_SIZE * 0.8;
 const ITEM_CORNER_OFFSET: f32 = 15.0;
 const PLAYER_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(333);
 const PLAYER_FRAME_SIZE: f32 = 48.0;
+const FROZEN_FRAME_SIZE: f32 = 32.0;
+const FROZEN_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
+const FROZEN_LAST_FRAME: usize = 5;
 const WATER_ITEM_INDEX: usize = 0;
 const SUNSTONE_ITEM_INDEX: usize = 1;
 const FROST_CRYSTAL_ITEM_INDEX: usize = 2;
@@ -1056,6 +1059,24 @@ struct FrozenTile(IVec2);
 struct FrostImpact(PlayerId);
 
 #[derive(Resource, Default)]
+struct FrozenSheet(Handle<Image>);
+
+#[derive(Component)]
+struct FrozenAnimation {
+    timer: Timer,
+    frame: usize,
+}
+
+impl Default for FrozenAnimation {
+    fn default() -> Self {
+        Self {
+            timer: Timer::new(FROZEN_FRAME_DURATION, TimerMode::Repeating),
+            frame: 0,
+        }
+    }
+}
+
+#[derive(Resource, Default)]
 struct BoardCursor(Option<Vec2>);
 
 #[derive(Resource, Default)]
@@ -1642,6 +1663,14 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
         })
         .load("players-animated-Sheet.png");
     spawn_players(&mut commands, player_sheet);
+    commands.insert_resource(FrozenSheet(
+        asset_server
+            .load_builder()
+            .with_settings(|settings: &mut ImageLoaderSettings| {
+                settings.sampler = ImageSampler::nearest();
+            })
+            .load("frozen-Sheet.png"),
+    ));
     let serpent_sheet = asset_server
         .load_builder()
         .with_settings(|settings: &mut ImageLoaderSettings| {
@@ -1690,6 +1719,9 @@ fn animate_players(
     mut players: Query<(&Player, &mut PlayerAnimation, &mut Sprite)>,
 ) {
     for (player, mut animation, mut sprite) in &mut players {
+        if turn.is_frozen(player.0) {
+            continue;
+        }
         let hovering = turn.hovering[player.0.index()];
         if animation.hovering != hovering {
             animation.hovering = hovering;
@@ -5765,20 +5797,34 @@ fn update_reaction_flashes(
 type FrostImpactSprite = (
     Entity,
     &'static FrostImpact,
+    &'static mut FrozenAnimation,
+    &'static mut Sprite,
     &'static mut Transform,
     &'static mut Visibility,
 );
 type FrostImpactFilter = (Without<Player>, Without<FrozenTile>);
 
+#[derive(SystemParam)]
+struct FrozenAssets<'w> {
+    time: Res<'w, Time>,
+    sheet: Res<'w, FrozenSheet>,
+    effects: Option<Res<'w, effects::Effects>>,
+}
+
 fn update_frozen_tiles(
     mut commands: Commands,
     board: Res<Board>,
     turn: Res<TurnState>,
-    effects: Option<Res<effects::Effects>>,
+    assets: FrozenAssets,
     mut tiles: Query<(Entity, &FrozenTile, &mut Visibility), Without<FrostImpact>>,
     mut impacts: Query<FrostImpactSprite, FrostImpactFilter>,
     players: Query<(&Player, &Transform), Without<FrostImpact>>,
 ) {
+    let FrozenAssets {
+        time,
+        sheet,
+        effects,
+    } = assets;
     for (entity, tile, mut visibility) in &mut tiles {
         let visible = effects
             .as_ref()
@@ -5795,7 +5841,7 @@ fn update_frozen_tiles(
         }
     }
     let mut displayed = [false; 2];
-    for (entity, impact, mut transform, mut visibility) in &mut impacts {
+    for (entity, impact, mut animation, mut sprite, mut transform, mut visibility) in &mut impacts {
         let index = impact.0.index();
         if !turn.is_frozen(impact.0) {
             commands.entity(entity).despawn();
@@ -5804,16 +5850,23 @@ fn update_frozen_tiles(
         {
             transform.translation.x = player_transform.translation.x;
             transform.translation.y = player_transform.translation.y;
-            *visibility =
-                if board_cell(player_transform.translation.truncate()).is_some_and(|cell| {
-                    effects
-                        .as_ref()
-                        .is_some_and(|effects| effects.animating(cell, effects::Effect::Freeze))
-                }) {
-                    Visibility::Hidden
-                } else {
-                    Visibility::Inherited
-                };
+            let hidden = board_cell(player_transform.translation.truncate()).is_some_and(|cell| {
+                effects
+                    .as_ref()
+                    .is_some_and(|effects| effects.animating(cell, effects::Effect::Freeze))
+            });
+            if !hidden && *visibility != Visibility::Hidden {
+                animation.timer.tick(time.delta());
+                animation.frame = (animation.frame
+                    + animation.timer.times_finished_this_tick() as usize)
+                    .min(FROZEN_LAST_FRAME);
+                sprite.rect = Some(frozen_frame_rect(animation.frame));
+            }
+            *visibility = if hidden {
+                Visibility::Hidden
+            } else {
+                Visibility::Inherited
+            };
             displayed[index] = true;
         }
     }
@@ -5822,9 +5875,11 @@ fn update_frozen_tiles(
         if turn.is_frozen(player.0) && !displayed[index] {
             commands.spawn((
                 FrostImpact(player.0),
+                FrozenAnimation::default(),
                 Sprite {
-                    color: Color::srgba(0.7, 0.94, 1.0, 0.55),
-                    custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 4.0)),
+                    image: sheet.0.clone(),
+                    rect: Some(frozen_frame_rect(0)),
+                    custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE)),
                     ..default()
                 },
                 if board_cell(transform.translation.truncate()).is_some_and(|cell| {
@@ -5840,6 +5895,11 @@ fn update_frozen_tiles(
             ));
         }
     }
+}
+
+fn frozen_frame_rect(frame: usize) -> Rect {
+    let x = frame as f32 * FROZEN_FRAME_SIZE;
+    Rect::new(x, 0.0, x + FROZEN_FRAME_SIZE, FROZEN_FRAME_SIZE)
 }
 
 fn update_ground_tiles(
@@ -6685,6 +6745,181 @@ mod tests {
     }
 
     #[test]
+    fn frozen_player_idle_animation_pauses_and_resumes_after_thaw() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<TurnState>()
+            .add_systems(Startup, |mut commands: Commands| {
+                spawn_players(&mut commands, Handle::default());
+            })
+            .add_systems(Update, animate_players);
+        app.update();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(100));
+        app.update();
+        app.world_mut()
+            .resource_mut::<TurnState>()
+            .pending_effects
+            .frozen_players[0] = 2;
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(PLAYER_FRAME_DURATION);
+        app.update();
+        {
+            let world = app.world_mut();
+            let mut query = world.query::<(&Player, &Sprite)>();
+            for (player, sprite) in query.iter(world) {
+                assert_eq!(
+                    sprite.rect,
+                    Some(player_frame_rect(player.0, false, player.0.index()))
+                );
+            }
+        }
+        {
+            let mut turn = app.world_mut().resource_mut::<TurnState>();
+            turn.pending_effects.frozen_players[0] = 0;
+            turn.frozen_turns[0] = 1;
+        }
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(PLAYER_FRAME_DURATION);
+        app.update();
+        {
+            let world = app.world_mut();
+            let mut query = world.query::<(&Player, &Sprite)>();
+            assert!(
+                query
+                    .iter(world)
+                    .all(|(player, sprite)| sprite.rect
+                        == Some(player_frame_rect(player.0, false, 0)))
+            );
+        }
+        app.world_mut().resource_mut::<TurnState>().frozen_turns[0] = 0;
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(233));
+        app.update();
+        let world = app.world_mut();
+        let mut query = world.query::<(&Player, &Sprite)>();
+        let (_, sprite) = query
+            .iter(world)
+            .find(|(player, _)| player.0 == PlayerId::One)
+            .unwrap();
+        assert_eq!(
+            sprite.rect,
+            Some(player_frame_rect(PlayerId::One, false, 1))
+        );
+    }
+
+    #[test]
+    fn frozen_player_overlay_plays_once_follows_player_and_resets() {
+        let mut app = App::new();
+        let image = Assets::<Image>::default().add(Image::default());
+        app.insert_resource(FrozenSheet(image.clone()))
+            .init_resource::<Time>()
+            .init_resource::<Board>()
+            .init_resource::<TurnState>()
+            .add_systems(Startup, |mut commands: Commands| {
+                spawn_players(&mut commands, Handle::default());
+            })
+            .add_systems(Update, update_frozen_tiles);
+        app.update();
+        app.world_mut()
+            .resource_mut::<TurnState>()
+            .pending_effects
+            .frozen_players[0] = 2;
+        app.update();
+
+        fn overlay(app: &mut App) -> (Entity, Sprite, Transform) {
+            let world = app.world_mut();
+            let mut query =
+                world.query_filtered::<(Entity, &Sprite, &Transform), With<FrostImpact>>();
+            let (entity, sprite, transform) = query.single(world).unwrap();
+            (entity, sprite.clone(), *transform)
+        }
+
+        let (first, sprite, transform) = overlay(&mut app);
+        assert_eq!(sprite.image, image);
+        assert_eq!(sprite.color, Color::WHITE);
+        assert_eq!(sprite.rect, Some(frozen_frame_rect(0)));
+        assert_eq!(sprite.custom_size, Some(Vec2::splat(GRID_BLOCK_SIZE)));
+        assert_eq!(
+            transform.translation,
+            cell_center(PLAYER_STARTS[0]).extend(0.9)
+        );
+
+        move_player_to(&mut app, PlayerId::One, IVec2::new(4, 3));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(FROZEN_FRAME_DURATION);
+        app.update();
+        let (_, sprite, transform) = overlay(&mut app);
+        assert_eq!(sprite.rect, Some(frozen_frame_rect(1)));
+        assert_eq!(
+            transform.translation,
+            cell_center(IVec2::new(4, 3)).extend(0.9)
+        );
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(5));
+        app.update();
+        assert_eq!(overlay(&mut app).1.rect, Some(frozen_frame_rect(5)));
+        app.world_mut()
+            .resource_mut::<TurnState>()
+            .pending_effects
+            .frozen_players[0] = 0;
+        app.update();
+        assert!(app.world().get_entity(first).is_err());
+        app.world_mut().resource_mut::<TurnState>().frozen_turns[0] = 2;
+        app.update();
+        let (next, sprite, _) = overlay(&mut app);
+        assert_ne!(first, next);
+        assert_eq!(sprite.rect, Some(frozen_frame_rect(0)));
+    }
+
+    #[test]
+    fn frozen_player_overlay_waits_for_freeze_effect_before_animating() {
+        let mut app = App::new();
+        app.init_resource::<FrozenSheet>()
+            .init_resource::<Time>()
+            .init_resource::<Board>()
+            .init_resource::<TurnState>()
+            .init_resource::<effects::Effects>()
+            .add_systems(Startup, |mut commands: Commands| {
+                spawn_players(&mut commands, Handle::default());
+            })
+            .add_systems(
+                Update,
+                (effects::advance, effects::capture, update_frozen_tiles).chain(),
+            );
+        app.update();
+        app.world_mut().resource_mut::<TurnState>().frozen_turns[0] = 2;
+        app.world_mut().spawn(effects::EffectSignal(
+            PLAYER_STARTS[0],
+            effects::Effect::Freeze,
+        ));
+        app.update();
+        {
+            let world = app.world_mut();
+            let mut query = world.query_filtered::<(&Sprite, &Visibility), With<FrostImpact>>();
+            let (sprite, visibility) = query.single(world).unwrap();
+            assert_eq!(sprite.rect, Some(frozen_frame_rect(0)));
+            assert_eq!(*visibility, Visibility::Hidden);
+        }
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(1));
+        app.update();
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<(&Sprite, &Visibility), With<FrostImpact>>();
+        let (sprite, visibility) = query.single(world).unwrap();
+        assert_eq!(sprite.rect, Some(frozen_frame_rect(0)));
+        assert_eq!(*visibility, Visibility::Inherited);
+    }
+
+    #[test]
     fn new_match_resets_board_players_and_temporary_entities() {
         let mut app = App::new();
         app.add_plugins(EntropyPlugin::<WyRand>::with_seed([7; 8]))
@@ -7326,6 +7561,7 @@ mod tests {
             .init_resource::<Board>()
             .init_resource::<PlayerHealth>()
             .init_resource::<Time>()
+            .init_resource::<FrozenSheet>()
             .init_resource::<SerpentSheet>()
             .init_resource::<AquaticSheet>()
             .insert_resource(Weather {
