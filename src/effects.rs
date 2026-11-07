@@ -7,7 +7,7 @@ use bevy::{
 
 use crate::{
     Board, COLUMNS, ElectricFlash, FireFlash, GRID_BLOCK_SIZE, Ground, ROWS, SteamFlash,
-    TerrainGrowthKind, TurnState, board_cell, cell_center,
+    TerrainGrowthKind, TurnState, board_cell, cell_center, sound,
 };
 
 const FRAME_SECONDS: f32 = 0.15;
@@ -202,6 +202,7 @@ pub(crate) fn capture(
     mut effects: ResMut<Effects>,
     flashes: Query<FlashQuery, FlashFilter>,
     signals: Query<(Entity, &EffectSignal)>,
+    mut sounds: Option<ResMut<sound::SoundCues>>,
 ) {
     let current: Vec<_> = cells()
         .map(|cell| TileState::read(&board, &turn, cell))
@@ -238,6 +239,15 @@ pub(crate) fn capture(
     for (index, cell) in cells().enumerate() {
         let old = previous[index];
         let new = current[index];
+        if old.frozen && !new.frozen {
+            sound::request(&mut sounds, sound::Cue::Ice);
+        }
+        if !old.healing && new.healing {
+            sound::request(&mut sounds, sound::Cue::Chime);
+        }
+        if old.thorns != new.thorns {
+            sound::request(&mut sounds, sound::Cue::Organic);
+        }
         match (old.ground, new.ground) {
             (_, Ground::Water) if old.ground != Ground::Water => {
                 requested.entry((cell, Effect::Water)).or_insert(1);
@@ -326,6 +336,11 @@ pub(crate) fn capture(
             let delay = predecessors()
                 .map(|playing| playing.delay - playing.elapsed + overlap_delay(FRAMES))
                 .fold(0.0_f32, f32::max);
+            if delay == 0.0
+                && let Some(cue) = sound::effect_cue(effect)
+            {
+                sound::request(&mut sounds, cue);
+            }
             let layer = predecessors()
                 .map(|playing| playing.layer + 0.0001)
                 .fold(1.7 + effect.row() as f32 * 0.001, f32::max);
@@ -365,12 +380,20 @@ pub(crate) fn advance(
     mut turn: ResMut<TurnState>,
     mut effects: ResMut<Effects>,
     mut sprites: Query<(&mut Sprite, &mut Visibility)>,
+    mut sounds: Option<ResMut<sound::SoundCues>>,
 ) {
     if effects.playing.is_empty() {
         return;
     }
     effects.playing.retain_mut(|playing| {
+        let previous_elapsed = playing.elapsed;
         playing.elapsed += time.delta_secs();
+        if previous_elapsed < playing.delay
+            && playing.elapsed >= playing.delay
+            && let Some(cue) = sound::effect_cue(playing.effect)
+        {
+            sound::request(&mut sounds, cue);
+        }
         let elapsed = playing.elapsed - playing.delay;
         if elapsed >= DURATION {
             commands.entity(playing.entity).despawn();
@@ -443,6 +466,46 @@ mod tests {
         app.world_mut()
             .resource_mut::<Time>()
             .advance_by(std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn sound_follows_effect_start_and_coalesces_multiple_tiles() {
+        let mut app = app();
+        app.init_resource::<sound::SoundCues>();
+        let first = IVec2::new(4, 3);
+        let second = IVec2::new(5, 3);
+        app.world_mut().resource_mut::<Board>().make_water(first);
+        app.world_mut().resource_mut::<Board>().make_water(second);
+        app.update();
+        let mut sounds = app.world_mut().resource_mut::<sound::SoundCues>();
+        assert!(sounds.take(sound::Cue::Water));
+        assert!(!sounds.take(sound::Cue::Water));
+    }
+
+    #[test]
+    fn delayed_terrain_sound_waits_for_explosion_animation() {
+        let mut app = app();
+        app.init_resource::<sound::SoundCues>();
+        let cell = IVec2::new(4, 3);
+        app.world_mut()
+            .resource_mut::<Board>()
+            .set(cell, Ground::Hole);
+        app.world_mut().spawn((
+            FireFlash(Timer::from_seconds(1.0, TimerMode::Once)),
+            Transform::from_translation(cell_center(cell).extend(0.0)),
+        ));
+        app.update();
+        {
+            let mut sounds = app.world_mut().resource_mut::<sound::SoundCues>();
+            assert!(sounds.take(sound::Cue::Explosion));
+            assert!(!sounds.take(sound::Cue::Stone));
+        }
+        tick(&mut app, overlap_delay(FRAMES));
+        assert!(
+            app.world_mut()
+                .resource_mut::<sound::SoundCues>()
+                .take(sound::Cue::Stone)
+        );
     }
 
     #[test]

@@ -275,6 +275,7 @@ fn handle_frontend(
     mut frontend: ResMut<Frontend>,
     mut buttons: Query<(Ref<Hovered>, &MenuAction, &mut BackgroundColor), With<Button>>,
     pressed_buttons: Query<&MenuAction, Added<Pressed>>,
+    mut sounds: Option<ResMut<crate::sound::SoundCues>>,
 ) {
     if frontend.screen == Screen::Game {
         return;
@@ -286,6 +287,7 @@ fn handle_frontend(
             || keyboard.just_pressed(KeyCode::Escape)
         {
             frontend.show(Screen::Title);
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         } else if frontend.timer.tick(time.delta()).is_finished() {
             let next = if frontend.screen == Screen::BevySplash {
                 Screen::StudioSplash
@@ -304,6 +306,7 @@ fn handle_frontend(
     if matches!(frontend.screen, Screen::Title | Screen::Paused) {
         if frontend.screen == Screen::Paused && keyboard.just_pressed(KeyCode::Escape) {
             frontend.activate(MenuAction::Resume);
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
             return;
         }
         let actions = frontend.actions();
@@ -317,22 +320,28 @@ fn handle_frontend(
         }
         if keyboard.just_pressed(KeyCode::ArrowDown) {
             frontend.selected = (frontend.selected + 1) % actions.len();
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         } else if keyboard.just_pressed(KeyCode::ArrowUp) {
             frontend.selected = (frontend.selected + actions.len() - 1) % actions.len();
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         }
         if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
             let action = actions[frontend.selected].0;
             frontend.activate(action);
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
             return;
         }
     } else if keyboard.just_pressed(KeyCode::Escape) {
         frontend.activate(MenuAction::Back);
+        crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         return;
     } else if frontend.screen == Screen::Rulebook {
         if keyboard.just_pressed(KeyCode::ArrowLeft) {
             frontend.activate(MenuAction::Previous);
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         } else if keyboard.just_pressed(KeyCode::ArrowRight) {
             frontend.activate(MenuAction::Next);
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         }
     }
 
@@ -351,6 +360,7 @@ fn handle_frontend(
     }
     if let Some(action) = pressed_buttons.iter().next() {
         frontend.activate(*action);
+        crate::sound::request(&mut sounds, crate::sound::Cue::Select);
     }
 }
 

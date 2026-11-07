@@ -8,6 +8,7 @@ bevy = "0.20.0"
 bevy_aspect_ratio_mask = "0.6.0"
 bevy_rand = { version = "0.16", features = ["wyrand"] }
 rand = "0.10"
+rodio = { version = "0.22.2", default-features = false }
 
 [target.'cfg(all(target_family = "wasm", any(target_os = "unknown", target_os = "none")))'.dependencies]
 bevy_rand = { version = "0.16", features = ["wasm_js"] }

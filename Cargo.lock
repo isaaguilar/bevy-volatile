@@ -450,6 +450,7 @@ dependencies = [
  "bevy_aspect_ratio_mask",
  "bevy_rand",
  "rand",
+ "rodio",
 ]
 
 [[package]]

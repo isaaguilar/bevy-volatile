@@ -18,7 +18,9 @@ mod ground_art;
 mod help;
 mod history;
 mod menu;
+mod music;
 mod serpent;
+mod sound;
 mod thorn;
 mod void;
 
@@ -1299,6 +1301,8 @@ fn main() {
         .add_plugins(ground_art::plugin)
         .add_plugins(history::plugin)
         .add_plugins(menu::plugin)
+        .add_plugins(sound::plugin)
+        .add_plugins(music::plugin)
         .add_systems(
             Startup,
             (
@@ -1360,7 +1364,12 @@ fn main() {
                 highlight_inventory_hover,
                 queue_weather,
                 advance_weather,
-                effects::capture,
+                (
+                    effects::capture,
+                    sound::health_changes,
+                    sound::aquatic_growth,
+                )
+                    .chain(),
                 update_cell_feedback,
                 (
                     update_inventory_counts,
@@ -1414,6 +1423,7 @@ struct MatchReset<'w, 's> {
     hover: ResMut<'w, InventoryHover>,
     cursor: ResMut<'w, BoardCursor>,
     effects: Option<ResMut<'w, effects::Effects>>,
+    sounds: Option<ResMut<'w, sound::SoundCues>>,
     images: Res<'w, InventoryImages>,
     rng: Single<'w, 's, &'static mut WyRand, With<GlobalRng>>,
     players: Query<'w, 's, (&'static Player, &'static mut Transform)>,
@@ -1429,6 +1439,9 @@ fn reset_match(mut commands: Commands, mut state: MatchReset) {
     state.help.reset(&mut commands);
     if let Some(effects) = &mut state.effects {
         effects.reset();
+    }
+    if let Some(sounds) = &mut state.sounds {
+        sounds.reset_match();
     }
     if let Some(SelectedAction::Item { icon, .. }) = state.selection.0.take() {
         commands.entity(icon).despawn();
@@ -2557,9 +2570,13 @@ fn undo_action(
     board: Res<Board>,
     mut selection: ResMut<Selection>,
     mut players: Query<(&Player, &mut Transform)>,
-    mut feedback: Query<&mut Text, With<DropFeedback>>,
+    output: (
+        Query<&mut Text, With<DropFeedback>>,
+        Option<ResMut<sound::SoundCues>>,
+    ),
 ) {
     let (mouse, cursor, bot) = input;
+    let (mut feedback, mut sounds) = output;
     if bot.as_ref().is_some_and(|bot| bot.bot_turn)
         || !mouse.just_pressed(MouseButton::Left)
         || turn.acted_this_frame
@@ -2576,6 +2593,7 @@ fn undo_action(
     };
     let Some(undo) = turn.undo.take() else {
         feedback.0 = "No action available to undo".into();
+        sound::request(&mut sounds, sound::Cue::Reject);
         return;
     };
     clear_selection(&mut commands, &mut selection);
@@ -2648,6 +2666,7 @@ fn undo_action(
     turn.free_action = false;
     turn.terrain_rejection = None;
     feedback.0 = "Action undone - choose an action".into();
+    sound::request(&mut sounds, sound::Cue::Pop);
 }
 
 fn finalize_undo(mut commands: Commands, mut turn: ResMut<TurnState>) {
@@ -2674,6 +2693,13 @@ fn finalize_undo(mut commands: Commands, mut turn: ResMut<TurnState>) {
     }
 }
 
+#[derive(SystemParam)]
+struct ActionOutput<'w, 's> {
+    feedback: Query<'w, 's, &'static mut Text, With<DropFeedback>>,
+    history: Option<ResMut<'w, history::ComputerHistory>>,
+    sounds: Option<ResMut<'w, sound::SoundCues>>,
+}
+
 fn handle_actions(
     mut commands: Commands,
     input: (
@@ -2685,14 +2711,15 @@ fn handle_actions(
     mut selection: ResMut<Selection>,
     players: Query<(&Player, &Transform)>,
     collectibles: Query<(Entity, &Collectible, Option<&Visibility>)>,
-    output: (
-        Query<&mut Text, With<DropFeedback>>,
-        Option<ResMut<history::ComputerHistory>>,
-    ),
+    output: ActionOutput,
 ) {
     let (mouse, cursor, bot) = input;
     let (mut turn, mut board, mut health) = game;
-    let (mut feedback, mut history) = output;
+    let ActionOutput {
+        mut feedback,
+        mut history,
+        mut sounds,
+    } = output;
     if turn.acted_this_frame
         || turn.animation_active()
         || turn.pending_placement.as_ref().is_some_and(|p| p.ready)
@@ -2735,8 +2762,10 @@ fn handle_actions(
             feedback.0 = "Selection cancelled".into();
         } else if turn.actions_used >= 2 {
             feedback.0 = "Both actions have been used".into();
+            sound::request(&mut sounds, sound::Cue::Reject);
         } else if turn.is_frozen(turn.active) {
             feedback.0 = "Frozen in place - use an item, pick up, or rest".into();
+            sound::request(&mut sounds, sound::Cue::Reject);
         } else if let Some(opponent) = players.iter().find_map(|(player, transform)| {
             (player.0 == turn.active.other()).then_some(transform.translation.truncate())
         }) {
@@ -2750,6 +2779,7 @@ fn handle_actions(
                 turn.magic[index],
             ));
             feedback.0 = "Green: walk | yellow: jump (1 energy) | click Move to cancel".into();
+            sound::request(&mut sounds, sound::Cue::Select);
         }
         return;
     }
@@ -2759,18 +2789,22 @@ fn handle_actions(
                 .is_some_and(|cell| !board.ground(cell).is_some_and(Ground::walkable))
             {
                 feedback.0 = "Land on safe ground before turning hover off".into();
+                sound::request(&mut sounds, sound::Cue::Reject);
                 return;
             }
             turn.hovering[index] = false;
         } else if turn.is_frozen(turn.active) {
             feedback.0 = "Frozen players cannot start hovering".into();
+            sound::request(&mut sounds, sound::Cue::Reject);
             return;
         } else if turn.magic[index] > 0 {
             turn.hovering[index] = true;
         } else {
             feedback.0 = "No magic - complete a turn to recover".into();
+            sound::request(&mut sounds, sound::Cue::Reject);
             return;
         }
+        sound::request(&mut sounds, sound::Cue::Whoosh);
         if matches!(selection.0, Some(SelectedAction::Movement { .. }))
             && let Some(opponent) = players.iter().find_map(|(player, transform)| {
                 (player.0 == turn.active.other()).then_some(transform.translation.truncate())
@@ -2803,17 +2837,23 @@ fn handle_actions(
                 }
                 clear_selection(&mut commands, &mut selection);
                 feedback.0 = "Rested - next player's turn".into();
+                sound::request(&mut sounds, sound::Cue::Chime);
             }
-            Err(message) => feedback.0 = message.into(),
+            Err(message) => {
+                feedback.0 = message.into();
+                sound::request(&mut sounds, sound::Cue::Reject);
+            }
         }
         return;
     }
     if turn.actions_used >= 2 {
         feedback.0 = "Both actions have been used".into();
+        sound::request(&mut sounds, sound::Cue::Reject);
         return;
     }
     if must_land(&turn, &board, position) {
         feedback.0 = "Land on safe ground before magic runs out".into();
+        sound::request(&mut sounds, sound::Cue::Reject);
         return;
     }
     let Some(cell) = board_cell(position) else {
@@ -2846,6 +2886,7 @@ fn handle_actions(
     }
     if picked_up.is_empty() {
         feedback.0 = "No collectible ingredient on this tile".into();
+        sound::request(&mut sounds, sound::Cue::Reject);
         return;
     }
     if bot_turn && let Some(history) = &mut history {
@@ -2873,6 +2914,7 @@ fn handle_actions(
         turn.finish_action(&mut board, &mut health, positions, TurnEffects::default());
     }
     feedback.0 = format!("Picked up {}", picked_up.join(", "));
+    sound::request(&mut sounds, sound::Cue::Pop);
 }
 
 fn apply_terrain_changes(
@@ -3105,11 +3147,12 @@ fn respawn_ingredients(
     mut commands: Commands,
     mut turn: ResMut<TurnState>,
     board: Res<Board>,
-    images: Res<InventoryImages>,
+    assets: (Res<InventoryImages>, Option<ResMut<sound::SoundCues>>),
     players: Query<(&Player, &Transform)>,
     collectibles: Query<&Collectible>,
     mut rng: Single<&mut WyRand, With<GlobalRng>>,
 ) {
+    let (images, mut sounds) = assets;
     if !turn.completed_turn {
         return;
     }
@@ -3151,6 +3194,7 @@ fn respawn_ingredients(
         };
         let cell = candidates.swap_remove(rng.random_range(0..candidates.len()));
         spawn_collectible(&mut commands, &images, index, cell);
+        sound::request(&mut sounds, sound::Cue::Pop);
     }
 }
 
@@ -3244,6 +3288,7 @@ fn advance_item_flight(
     mut commands: Commands,
     mut turn: ResMut<TurnState>,
     mut sprites: Query<&mut Transform, Without<Player>>,
+    mut sounds: Option<ResMut<sound::SoundCues>>,
 ) {
     let Some(flight) = &mut turn.item_flight else {
         return;
@@ -3253,6 +3298,7 @@ fn advance_item_flight(
     if progress >= 1.0 {
         commands.entity(flight.entity).despawn();
         turn.item_flight = None;
+        sound::request(&mut sounds, sound::Cue::Pop);
         return;
     }
     let mut transform = sprites
@@ -3589,12 +3635,13 @@ fn handle_selection(
     mut selection: ResMut<Selection>,
     mut turn: ResMut<TurnState>,
     actors: SelectionActors,
-    output: (
-        Query<&mut Text, With<DropFeedback>>,
-        Option<ResMut<history::ComputerHistory>>,
-    ),
+    output: ActionOutput,
 ) {
-    let (mut feedback, mut history) = output;
+    let ActionOutput {
+        mut feedback,
+        mut history,
+        mut sounds,
+    } = output;
     if turn.animation_active() {
         return;
     }
@@ -3707,6 +3754,7 @@ fn handle_selection(
                 false,
             );
             feedback.0 = format!("{message} - first item resolved; choose another action or rest");
+            sound::request(&mut sounds, sound::Cue::Reject);
             return;
         }
         target = Some(pending.target.clone());
@@ -3737,10 +3785,13 @@ fn handle_selection(
                 feedback.0 = "Selection cancelled".into();
             } else if turn.actions_used >= 2 {
                 feedback.0 = "Both actions have been used".into();
+                sound::request(&mut sounds, sound::Cue::Reject);
             } else if must_land(&turn, &board, player) {
                 feedback.0 = "Land on safe ground before magic runs out".into();
+                sound::request(&mut sounds, sound::Cue::Reject);
             } else if !is_unlimited(index) && turn.inventory[turn.active.index()][index] == 0 {
                 feedback.0 = "No ingredients remaining - pick one up".into();
+                sound::request(&mut sounds, sound::Cue::Reject);
             } else {
                 let highlight = commands
                     .spawn((
@@ -3766,6 +3817,7 @@ fn handle_selection(
                     highlight,
                 });
                 feedback.0 = format!("{} selected - click a board cell", INVENTORY_ITEMS[index].0);
+                sound::request(&mut sounds, sound::Cue::Select);
             }
             return;
         }
@@ -3839,6 +3891,7 @@ fn handle_selection(
                         .ready = true;
                     clear_selection(&mut commands, &mut selection);
                     feedback.0 = "Resolving both items".into();
+                    sound::request(&mut sounds, sound::Cue::Pop);
                     return;
                 }
                 let mut health_changes = HealthChanges::default();
@@ -4034,6 +4087,7 @@ fn handle_selection(
                         "Cannot create terrain: 60% ridge and hole limit"
                     }
                     .into();
+                    sound::request(&mut sounds, sound::Cue::Reject);
                     return;
                 }
                 turn.terrain_rejection = None;
@@ -4123,6 +4177,7 @@ fn handle_selection(
                             destination,
                             elapsed: 0.0,
                         });
+                        sound::request(&mut sounds, sound::Cue::Whoosh);
                         pending.landed = true;
                         turn.pending_placement = Some(pending);
                         return;
@@ -4166,6 +4221,7 @@ fn handle_selection(
                         "Resolving placement"
                     }
                     .into();
+                    sound::request(&mut sounds, sound::Cue::Pop);
                     return;
                 }
                 if bot_turn && let Some(history) = &mut history {
@@ -5040,6 +5096,9 @@ fn handle_selection(
             }
             _ => {}
         }
+        if human_click && cell.is_some() && active_selection.is_some() {
+            sound::request(&mut sounds, sound::Cue::Reject);
+        }
     }
 
     match &selection.0 {
@@ -5159,6 +5218,7 @@ fn advance_serpent_animation(
     time: Res<Time>,
     mut turn: ResMut<TurnState>,
     mut health: ResMut<PlayerHealth>,
+    mut sounds: Option<ResMut<sound::SoundCues>>,
 ) {
     if turn.aquatic_animation.is_some() || turn.effects_active {
         return;
@@ -5170,6 +5230,9 @@ fn advance_serpent_animation(
         return;
     }
     if let Some(frame) = animation.frames.pop_front() {
+        if frame.hit.is_none() && !frame.visuals.is_empty() {
+            sound::request(&mut sounds, sound::Cue::Organic);
+        }
         animation.visuals = frame.visuals;
         animation.impact = frame.impact;
         if let Some((player, remaining)) = frame.hit {
@@ -5193,6 +5256,7 @@ fn advance_aquatic_animation(
     mut commands: Commands,
     mut turn: ResMut<TurnState>,
     items: Query<(Entity, &Collectible)>,
+    mut sounds: Option<ResMut<sound::SoundCues>>,
 ) {
     if turn.effects_active {
         return;
@@ -5204,6 +5268,13 @@ fn advance_aquatic_animation(
         return;
     }
     if let Some(frame) = animation.frames.pop_front() {
+        if frame
+            .creatures
+            .iter()
+            .any(|creature| creature.sweep_frame == Some(3))
+        {
+            sound::request(&mut sounds, sound::Cue::Whoosh);
+        }
         animation.visuals = frame.visuals;
         animation.creatures = frame.creatures;
         for cell in frame.flattened {
@@ -5263,6 +5334,7 @@ fn queue_weather(
 struct WeatherVisuals<'w, 's> {
     overlays: Query<'w, 's, &'static mut Sprite, With<RainOverlay>>,
     feedback: Query<'w, 's, &'static mut Text, With<DropFeedback>>,
+    sounds: Option<ResMut<'w, sound::SoundCues>>,
 }
 
 fn advance_weather(
@@ -5278,6 +5350,7 @@ fn advance_weather(
     let WeatherVisuals {
         mut overlays,
         mut feedback,
+        mut sounds,
     } = visuals;
     let Some(mut animation) = turn.weather_animation.take() else {
         return;
@@ -5289,6 +5362,13 @@ fn advance_weather(
     let kind = match &mut animation.phase {
         WeatherPhase::Waiting => {
             let kind = animation.pending.pop_front().expect("queued weather event");
+            sound::request(
+                &mut sounds,
+                match kind {
+                    WeatherKind::Rain => sound::Cue::Water,
+                    WeatherKind::Earthquake => sound::Cue::Explosion,
+                },
+            );
             let overlay = if kind == WeatherKind::Rain {
                 Some(
                     commands
@@ -6138,19 +6218,29 @@ fn rest(
     mut board: ResMut<Board>,
     mut health: ResMut<PlayerHealth>,
     players: Query<(&Player, &Transform)>,
-    mut feedback: Query<&mut Text, With<DropFeedback>>,
+    output: (
+        Query<&mut Text, With<DropFeedback>>,
+        Option<ResMut<sound::SoundCues>>,
+    ),
 ) {
     let (keyboard, bot) = input;
+    let (mut feedback, mut sounds) = output;
     if !bot.as_ref().is_some_and(|bot| bot.bot_turn)
         && keyboard.just_pressed(KeyCode::KeyR)
         && !turn.acted_this_frame
         && !turn.animation_active()
         && !turn.pending_placement.as_ref().is_some_and(|p| p.ready)
         && selection.0.is_none()
-        && let Err(message) = finish_rest(&mut turn, &mut board, &mut health, &players)
-        && let Ok(mut feedback) = feedback.single_mut()
     {
-        feedback.0 = message.into();
+        match finish_rest(&mut turn, &mut board, &mut health, &players) {
+            Ok(()) => sound::request(&mut sounds, sound::Cue::Chime),
+            Err(message) => {
+                if let Ok(mut feedback) = feedback.single_mut() {
+                    feedback.0 = message.into();
+                }
+                sound::request(&mut sounds, sound::Cue::Reject);
+            }
+        }
     }
 }
 
@@ -7357,6 +7447,34 @@ mod tests {
             .resource_mut::<TurnState>()
             .spawned_ingredients[SUNSTONE_ITEM_INDEX] = INGREDIENT_POOL_SIZE as u8;
         app
+    }
+
+    #[test]
+    fn interaction_sounds_follow_success_and_rejection() {
+        let mut app = interaction_app();
+        app.init_resource::<sound::SoundCues>();
+        app.update();
+        let invalid = IVec2::new(5, 3);
+        app.world_mut().resource_mut::<Board>().make_water(invalid);
+        click_part(&mut app, p1_item(WATER_ITEM_INDEX));
+        assert!(
+            app.world_mut()
+                .resource_mut::<sound::SoundCues>()
+                .take(sound::Cue::Select)
+        );
+        click_part(&mut app, cell_center(invalid));
+        assert!(
+            app.world_mut()
+                .resource_mut::<sound::SoundCues>()
+                .take(sound::Cue::Reject)
+        );
+        click_part(&mut app, cell_center(IVec2::new(6, 3)));
+        assert!(
+            app.world_mut()
+                .resource_mut::<sound::SoundCues>()
+                .take(sound::Cue::Pop)
+        );
+        assert_eq!(app.world().resource::<TurnState>().actions_used, 1);
     }
 
     fn computer_app() -> App {
