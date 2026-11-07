@@ -54,7 +54,7 @@ const EARTHQUAKE_INTERVAL: std::ops::RangeInclusive<u16> = 20..=30;
 const EARTHQUAKE_TILES: usize = 2;
 const SERPENT_STEP_SECONDS: f32 = 0.35;
 const SERPENT_IMPACT_SECONDS: f32 = 0.6;
-const AQUATIC_STEP_SECONDS: f32 = 0.2;
+const AQUATIC_STEP_SECONDS: f32 = 0.25;
 const ITEM_FLIGHT_SECONDS: f32 = 0.45;
 const ITEM_FLIGHT_HEIGHT: f32 = GRID_BLOCK_SIZE * 0.8;
 const ITEM_CORNER_OFFSET: f32 = 15.0;
@@ -229,12 +229,14 @@ struct SerpentAnimation {
 
 struct AquaticAnimationFrame {
     visuals: Vec<IVec2>,
+    creatures: Vec<aquatic::AquaticVisual>,
     swept: Vec<IVec2>,
     flattened: Vec<IVec2>,
 }
 
 struct AquaticAnimation {
     visuals: Vec<IVec2>,
+    creatures: Vec<aquatic::AquaticVisual>,
     frames: std::collections::VecDeque<AquaticAnimationFrame>,
     swept: std::collections::HashSet<IVec2>,
     unflattened: std::collections::HashSet<IVec2>,
@@ -372,6 +374,19 @@ impl TurnState {
             })
             .collect();
         let initial = visuals.iter().flatten().flatten().copied().collect();
+        let mut creatures: Vec<_> = impacts
+            .iter()
+            .map(|impact| {
+                impact.as_ref().map(|impact| {
+                    if impact.frames.is_empty() {
+                        impact.final_visual.clone()
+                    } else {
+                        impact.initial_visual.clone()
+                    }
+                })
+            })
+            .collect();
+        let initial_creatures = creatures.iter().flatten().cloned().collect();
         let mut frames = std::collections::VecDeque::new();
         let mut swept = std::collections::HashSet::new();
         let mut unflattened = std::collections::HashSet::new();
@@ -379,19 +394,26 @@ impl TurnState {
             if let Some(impact) = impact {
                 for frame in &impact.frames {
                     visuals[index] = Some(frame.cells.clone());
+                    creatures[index] = Some(frame.visual.clone());
                     swept.extend(frame.swept.iter().copied());
                     unflattened.extend(frame.flattened.iter().copied());
                     frames.push_back(AquaticAnimationFrame {
                         visuals: visuals.iter().flatten().flatten().copied().collect(),
+                        creatures: creatures.iter().flatten().cloned().collect(),
                         swept: frame.swept.clone(),
                         flattened: frame.flattened.clone(),
                     });
+                }
+                if !impact.frames.is_empty() {
+                    creatures[index] = None;
+                    visuals[index] = None;
                 }
             }
         }
         if !frames.is_empty() {
             self.aquatic_animation = Some(AquaticAnimation {
                 visuals: initial,
+                creatures: initial_creatures,
                 frames,
                 swept,
                 unflattened,
@@ -947,8 +969,16 @@ struct SerpentPart;
 #[derive(Resource, Default)]
 struct SerpentSheet(Handle<Image>);
 
+#[derive(Resource, Default)]
+struct AquaticSheet(Handle<Image>);
+
 #[derive(Component)]
-struct AquaticTile(IVec2);
+struct AquaticTile {
+    id: u64,
+    part: usize,
+    frame: usize,
+    timer: Timer,
+}
 
 #[derive(SystemParam)]
 struct SelectionInput<'w, 's> {
@@ -1544,6 +1574,13 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, hud: Res<Hud>) 
         })
         .load("quezacuatl-Sheet.png");
     commands.insert_resource(SerpentSheet(serpent_sheet));
+    let aquatic_sheet = asset_server
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::nearest();
+        })
+        .load("aquatic2-Sheet.png");
+    commands.insert_resource(AquaticSheet(aquatic_sheet));
 }
 
 fn spawn_players(commands: &mut Commands, sheet: Handle<Image>) {
@@ -5106,6 +5143,7 @@ fn advance_aquatic_animation(
     }
     if let Some(frame) = animation.frames.pop_front() {
         animation.visuals = frame.visuals;
+        animation.creatures = frame.creatures;
         for cell in frame.flattened {
             animation.unflattened.remove(&cell);
         }
@@ -5911,38 +5949,126 @@ fn update_thorn_visuals(
     }
 }
 
+fn aquatic_sprite(
+    visual: &aquatic::AquaticVisual,
+    part: usize,
+    frame: usize,
+    image: Handle<Image>,
+) -> (Sprite, Transform) {
+    let turns = if part == 0 { 0 } else { part % 4 };
+    let rotate = |mut point: IVec2| {
+        for _ in 0..turns {
+            point = IVec2::new(-point.y, point.x);
+        }
+        point
+    };
+    let mut min = IVec2::splat(6);
+    let mut max = IVec2::ZERO;
+    for y in 0..7 {
+        for x in 0..7 {
+            let source = IVec2::new(x, y);
+            let cell = visual.origin + rotate(source - IVec2::splat(3));
+            if (0..COLUMNS as i32).contains(&cell.x) && (0..ROWS as i32).contains(&cell.y) {
+                min = min.min(source);
+                max = max.max(source);
+            }
+        }
+    }
+    let slot = match frame {
+        0..=8 => frame,
+        9 => 5,
+        10..=33 => frame - 1,
+        34 => 23,
+        _ => frame - 2,
+    };
+    let sheet_origin = Vec2::new((slot % 7) as f32 * 224.0, (slot / 7) as f32 * 224.0);
+    let rect_min = sheet_origin + min.as_vec2() * 32.0;
+    let rect_max = sheet_origin + (max + IVec2::ONE).as_vec2() * 32.0;
+    let mut offset = (min.as_vec2() + max.as_vec2()) / 2.0 - Vec2::splat(3.0);
+    for _ in 0..turns {
+        offset = Vec2::new(-offset.y, offset.x);
+    }
+    let center = cell_center(visual.origin) + Vec2::new(offset.x, -offset.y) * GRID_BLOCK_SIZE;
+    (
+        Sprite {
+            image,
+            rect: Some(Rect::from_corners(rect_min, rect_max)),
+            custom_size: Some((rect_max - rect_min) * (GRID_BLOCK_SIZE / 32.0)),
+            ..default()
+        },
+        Transform::from_xyz(center.x, center.y, if part == 0 { -0.18 } else { -0.2 })
+            .with_rotation(Quat::from_rotation_z(
+                -(turns as f32) * std::f32::consts::FRAC_PI_2,
+            )),
+    )
+}
+
+fn aquatic_arm_frame(visual: &aquatic::AquaticVisual, part: usize) -> usize {
+    let length = visual.lengths[part - 1];
+    visual
+        .sweep_frame
+        .map_or(14 + length - 1, |step| [0, 34, 24, 14][length] + step)
+}
+
 fn update_aquatic_visuals(
     mut commands: Commands,
     board: Res<Board>,
     turn: Res<TurnState>,
-    tiles: Query<(Entity, &AquaticTile)>,
+    time: Res<Time>,
+    sheet: Res<AquaticSheet>,
+    mut tiles: Query<(Entity, &mut AquaticTile, &mut Sprite, &mut Transform)>,
 ) {
-    let cells: Vec<_> = if let Some(animation) = &turn.aquatic_animation {
-        animation.visuals.clone()
+    let creatures: Vec<_> = if let Some(animation) = &turn.aquatic_animation {
+        animation.creatures.clone()
     } else {
-        board.aquatic_cells().collect()
+        board.aquatic_visuals().collect()
     };
     let mut displayed = Vec::new();
-    for (entity, tile) in &tiles {
-        if cells.contains(&tile.0) {
-            displayed.push(tile.0);
-        } else {
+    for (entity, mut tile, mut sprite, mut transform) in &mut tiles {
+        let Some(visual) = creatures.iter().find(|visual| visual.id == tile.id) else {
             commands.entity(entity).despawn();
+            continue;
+        };
+        if tile.part > 0 && visual.lengths[tile.part - 1] == 0 {
+            commands.entity(entity).despawn();
+            continue;
         }
+        if tile.part == 0 {
+            tile.timer.tick(time.delta());
+            for _ in 0..tile.timer.times_finished_this_tick() {
+                tile.frame = if tile.frame == 13 { 3 } else { tile.frame + 1 };
+            }
+        }
+        let frame = if tile.part == 0 {
+            tile.frame
+        } else {
+            aquatic_arm_frame(visual, tile.part)
+        };
+        (*sprite, *transform) = aquatic_sprite(visual, tile.part, frame, sheet.0.clone());
+        displayed.push((tile.id, tile.part));
     }
-    for cell in cells {
-        if !displayed.contains(&cell) {
-            let center = cell_center(cell);
+    for visual in &creatures {
+        for part in 0..=4 {
+            if (part > 0 && visual.lengths[part - 1] == 0) || displayed.contains(&(visual.id, part))
+            {
+                continue;
+            }
+            let frame = if part == 0 {
+                0
+            } else {
+                aquatic_arm_frame(visual, part)
+            };
+            let (sprite, transform) = aquatic_sprite(visual, part, frame, sheet.0.clone());
             commands.spawn((
-                AquaticTile(cell),
-                Sprite {
-                    color: Color::srgba(0.08, 0.63, 0.75, 0.85),
-                    custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE - 16.0)),
-                    ..default()
+                AquaticTile {
+                    id: visual.id,
+                    part,
+                    frame: 0,
+                    timer: Timer::from_seconds(AQUATIC_STEP_SECONDS, TimerMode::Repeating),
                 },
-                Transform::from_xyz(center.x, center.y, -0.2),
+                sprite,
+                transform,
             ));
-            displayed.push(cell);
         }
     }
 }
@@ -6009,6 +6135,133 @@ fn finish_rest(
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    #[test]
+    fn aquatic_sprites_rotate_and_clip_to_board_without_shifting_the_origin() {
+        for origin in [IVec2::new(4, 3), IVec2::ZERO, IVec2::new(9, 6)] {
+            let visual = aquatic::AquaticVisual {
+                id: 0,
+                origin,
+                lengths: [3; 4],
+                sweep_frame: Some(7),
+            };
+            for part in 0..=4 {
+                let (sprite, transform) = aquatic_sprite(&visual, part, 21, Handle::default());
+                let expected_direction =
+                    [Vec2::Y, Vec2::X, Vec2::NEG_Y, Vec2::NEG_X, Vec2::Y][part];
+                assert!(
+                    (transform.rotation * Vec3::Y)
+                        .truncate()
+                        .distance(expected_direction)
+                        < 0.001
+                );
+                let rect = sprite.rect.unwrap();
+                let frame_origin = Vec2::new(1344.0, 448.0);
+                let source_origin = Vec2::splat(112.0) - (rect.min - frame_origin);
+                let local = Vec2::new(
+                    source_origin.x - rect.width() / 2.0,
+                    rect.height() / 2.0 - source_origin.y,
+                ) * (GRID_BLOCK_SIZE / 32.0);
+                let world = transform.translation + transform.rotation * local.extend(0.0);
+                assert!(world.truncate().distance(cell_center(origin)) < 0.001);
+                for x in [-0.5, 0.5] {
+                    for y in [-0.5, 0.5] {
+                        let corner = transform.translation
+                            + transform.rotation
+                                * (sprite.custom_size.unwrap() * Vec2::new(x, y)).extend(0.0);
+                        assert!(corner.x >= BOARD_LEFT - 0.001 && corner.x <= BOARD_RIGHT + 0.001);
+                        assert!(corner.y >= BOARD_BOTTOM - 0.001 && corner.y <= BOARD_TOP + 0.001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aquatic_animation_uses_growth_and_each_length_sweep_frames() {
+        let mut app = interaction_app();
+        let origin = IVec2::new(4, 3);
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.make_water(origin);
+            board.set(origin + IVec2::new(2, 0), Ground::Ridge);
+            board.set(origin + IVec2::new(0, 3), Ground::Ridge);
+            board.set(origin + IVec2::NEG_X, Ground::Ridge);
+            board.activate_aquatic(origin);
+        }
+        for step in 0..3 {
+            app.world_mut()
+                .resource_mut::<Board>()
+                .finish_aquatic_turn();
+            app.update();
+            let world = app.world_mut();
+            let mut query = world.query::<(&AquaticTile, &Sprite)>();
+            let sprites: Vec<_> = query.iter(world).collect();
+            assert_eq!(sprites.len(), 4);
+            for (tile, sprite) in sprites {
+                if tile.part == 0 {
+                    continue;
+                }
+                let length = [0, 1, 2, 0, 3][tile.part].min(step + 1);
+                let frame = 14 + length - 1;
+                let slot = frame - 1;
+                assert_eq!(
+                    sprite.rect.unwrap().min,
+                    Vec2::new((slot % 7) as f32 * 224.0, (slot / 7) as f32 * 224.0)
+                );
+            }
+        }
+        press_key(&mut app, KeyCode::KeyR);
+        for step in 3..=9 {
+            tick_coatl_animation(&mut app, AQUATIC_STEP_SECONDS + 0.01);
+            let world = app.world_mut();
+            let mut query = world.query::<(&AquaticTile, &Sprite)>();
+            let sprites: Vec<_> = query.iter(world).collect();
+            assert_eq!(sprites.len(), 4);
+            for (tile, sprite) in sprites {
+                if tile.part == 0 {
+                    continue;
+                }
+                let frame = [0, 34, 24, 0, 14][tile.part] + step;
+                let slot = if frame == 34 {
+                    23
+                } else if frame > 34 {
+                    frame - 2
+                } else {
+                    frame - 1
+                };
+                assert_eq!(
+                    sprite.rect.unwrap().min,
+                    Vec2::new((slot % 7) as f32 * 224.0, (slot / 7) as f32 * 224.0)
+                );
+            }
+        }
+        finish_aquatic_animation(&mut app);
+        let world = app.world_mut();
+        assert_eq!(world.query::<&AquaticTile>().iter(world).count(), 0);
+    }
+
+    #[test]
+    fn aquatic_center_emerges_once_then_loops_emerged_frames() {
+        let mut app = interaction_app();
+        let origin = IVec2::new(4, 3);
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.make_water(origin);
+            board.activate_aquatic(origin);
+            board.finish_aquatic_turn();
+        }
+        app.update();
+        for expected in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 3] {
+            let world = app.world_mut();
+            let mut query = world.query::<&AquaticTile>();
+            assert_eq!(
+                query.iter(world).find(|tile| tile.part == 0).unwrap().frame,
+                expected
+            );
+            tick_coatl_animation(&mut app, AQUATIC_STEP_SECONDS);
+        }
+    }
 
     #[test]
     fn serpent_sprites_align_head_body_and_tail_for_all_orientations() {
@@ -6805,6 +7058,7 @@ mod tests {
             .init_resource::<PlayerHealth>()
             .init_resource::<Time>()
             .init_resource::<SerpentSheet>()
+            .init_resource::<AquaticSheet>()
             .insert_resource(Weather {
                 rain: u16::MAX,
                 earthquake: u16::MAX,
@@ -8884,12 +9138,19 @@ mod tests {
                 0
             );
             assert_eq!(world.query::<&AquaticTile>().iter(world).count(), 5);
-            for _ in 0..4 {
+            for _ in 0..2 {
                 press_key(&mut app, KeyCode::KeyR);
                 finish_aquatic_animation(&mut app);
             }
             assert!(app.world().resource::<Board>().aquatic_cells().count() > 0);
             press_key(&mut app, KeyCode::KeyR);
+            assert!(
+                app.world()
+                    .resource::<TurnState>()
+                    .aquatic_animation
+                    .is_some()
+            );
+            finish_aquatic_animation(&mut app);
             assert_eq!(app.world().resource::<Board>().aquatic_cells().count(), 0);
             let world = app.world_mut();
             assert_eq!(world.query::<&AquaticTile>().iter(world).count(), 0);
@@ -8948,6 +9209,9 @@ mod tests {
             press_key(&mut app, KeyCode::KeyR);
             assert_eq!(app.world().resource::<PlayerHealth>().0, [expected, 10]);
         }
+        press_key(&mut app, KeyCode::KeyR);
+        assert_eq!(app.world().resource::<PlayerHealth>().0, [1, 7]);
+        finish_aquatic_animation(&mut app);
         press_key(&mut app, KeyCode::KeyR);
         assert_eq!(app.world().resource::<PlayerHealth>().0, [1, 7]);
     }
@@ -9059,7 +9323,7 @@ mod tests {
         assert_eq!(app.world().resource::<TurnState>().active, PlayerId::Two);
         assert!(app.world().resource::<Selection>().0.is_none());
 
-        tick_coatl_animation(&mut app, 0.21);
+        tick_coatl_animation(&mut app, AQUATIC_STEP_SECONDS + 0.01);
         let animation = app
             .world()
             .resource::<TurnState>()
@@ -9079,7 +9343,7 @@ mod tests {
             app.world().get::<Sprite>(ridge).unwrap().color,
             Ground::Ridge.color()
         );
-        tick_coatl_animation(&mut app, 0.21);
+        tick_coatl_animation(&mut app, AQUATIC_STEP_SECONDS + 0.01);
         assert!(app.world().get_entity(intermediate_item).is_err());
         assert_eq!(
             app.world().get::<Sprite>(ridge).unwrap().color,
@@ -9105,6 +9369,94 @@ mod tests {
         assert!(respawns.contains(&(SUNSTONE_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)));
         assert!(respawns.contains(&(FROST_CRYSTAL_ITEM_INDEX, INGREDIENT_RESPAWN_DELAY)));
         assert!(respawns.iter().all(|&(index, _)| !is_unlimited(index)));
+    }
+
+    #[test]
+    fn aquatic_sweep_collects_outer_segment_before_middle_segment_finishes() {
+        let mut app = interaction_app();
+        let origin = IVec2::new(4, 3);
+        {
+            let mut board = app.world_mut().resource_mut::<Board>();
+            board.make_water(origin);
+            board.activate_aquatic(origin);
+            for _ in 0..3 {
+                board.finish_aquatic_turn();
+            }
+        }
+        let outer = origin + IVec2::new(3, 1);
+        let middle = origin + IVec2::new(2, 2);
+        let next_outer = origin + IVec2::new(3, 2);
+        app.world_mut()
+            .resource_mut::<Board>()
+            .set(middle, Ground::Ridge);
+        let outer_item = app
+            .world_mut()
+            .spawn((
+                BoardItem,
+                Collectible {
+                    index: SUNSTONE_ITEM_INDEX,
+                    cell: outer,
+                },
+            ))
+            .id();
+        let middle_item = app
+            .world_mut()
+            .spawn((
+                BoardItem,
+                Collectible {
+                    index: FROST_CRYSTAL_ITEM_INDEX,
+                    cell: middle,
+                },
+            ))
+            .id();
+        let next_outer_item = app
+            .world_mut()
+            .spawn((
+                BoardItem,
+                Collectible {
+                    index: SUNSTONE_ITEM_INDEX,
+                    cell: next_outer,
+                },
+            ))
+            .id();
+        press_key(&mut app, KeyCode::KeyR);
+        for _ in 0..2 {
+            tick_coatl_animation(&mut app, AQUATIC_STEP_SECONDS + 0.01);
+        }
+        assert!(app.world().get_entity(outer_item).is_ok());
+        assert!(app.world().get_entity(middle_item).is_ok());
+        tick_coatl_animation(&mut app, AQUATIC_STEP_SECONDS + 0.01);
+        assert!(app.world().get_entity(outer_item).is_err());
+        assert!(app.world().get_entity(middle_item).is_ok());
+        assert!(app.world().get_entity(next_outer_item).is_ok());
+        tick_coatl_animation(&mut app, AQUATIC_STEP_SECONDS + 0.01);
+        assert!(app.world().get_entity(middle_item).is_err());
+        assert!(app.world().get_entity(next_outer_item).is_err());
+        assert!(
+            app.world()
+                .resource::<TurnState>()
+                .aquatic_animation
+                .as_ref()
+                .unwrap()
+                .unflattened
+                .is_empty()
+        );
+        finish_aquatic_animation(&mut app);
+        let respawns = &app.world().resource::<TurnState>().ingredient_respawns;
+        assert_eq!(
+            respawns
+                .iter()
+                .filter(|&&(item, _)| item == SUNSTONE_ITEM_INDEX)
+                .count(),
+            2
+        );
+        assert_eq!(
+            respawns
+                .iter()
+                .filter(|&&(item, _)| item == FROST_CRYSTAL_ITEM_INDEX)
+                .count(),
+            1
+        );
     }
 
     #[test]

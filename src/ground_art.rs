@@ -606,6 +606,7 @@ mod tests {
         let before = border_rect(&board, &turn, cell, Side::Top);
         turn.aquatic_animation = Some(crate::AquaticAnimation {
             visuals: Vec::new(),
+            creatures: Vec::new(),
             frames: Default::default(),
             swept: Default::default(),
             unflattened: [ridge].into_iter().collect(),

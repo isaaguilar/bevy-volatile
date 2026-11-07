@@ -62,6 +62,7 @@ pub struct Board {
     acid: [Option<Acid>; COLUMNS * ROWS],
     thorns: ThornGarden,
     aquatic_creatures: Vec<AquaticCreature>,
+    next_aquatic_id: u64,
     terrain_growth: Vec<(TerrainGrowthKind, VoidGrowth)>,
     new_holes: Vec<IVec2>,
     new_unsafe: Vec<IVec2>,
@@ -97,6 +98,7 @@ impl Default for Board {
             acid: [None; COLUMNS * ROWS],
             thorns: ThornGarden::default(),
             aquatic_creatures: Vec::new(),
+            next_aquatic_id: 0,
             terrain_growth: Vec::new(),
             new_holes: Vec::new(),
             new_unsafe: Vec::new(),
@@ -256,13 +258,21 @@ impl Board {
 
     pub fn activate_aquatic(&mut self, cell: IVec2) {
         assert!(self.is_water(cell), "aquatic creature requires water");
-        self.aquatic_creatures.push(AquaticCreature::new(cell));
+        self.aquatic_creatures
+            .push(AquaticCreature::new(cell, self.next_aquatic_id));
+        self.next_aquatic_id += 1;
     }
 
     pub fn aquatic_cells(&self) -> impl Iterator<Item = IVec2> + '_ {
         self.aquatic_creatures
             .iter()
             .flat_map(AquaticCreature::cells)
+    }
+
+    pub fn aquatic_visuals(&self) -> impl Iterator<Item = crate::aquatic::AquaticVisual> + '_ {
+        self.aquatic_creatures
+            .iter()
+            .map(|creature| creature.visual(None))
     }
 
     pub fn aquatic_contacts(&self, cell: IVec2) -> impl Iterator<Item = usize> + '_ {
@@ -279,7 +289,7 @@ impl Board {
         let mut impacts = Vec::with_capacity(creatures.len());
         creatures.retain_mut(|creature| {
             let impact = creature.advance(self);
-            let active = impact.is_some();
+            let active = !creature.finished();
             impacts.push(impact);
             active
         });
