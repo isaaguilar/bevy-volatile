@@ -18,9 +18,10 @@ pub(crate) enum Cue {
     Stone,
     Organic,
     Impact,
+    MenuOption,
 }
 
-const CUES: [(Cue, &str); 13] = [
+const CUES: [(Cue, &str); 14] = [
     (Cue::Select, "sfx/select.ogg"),
     (Cue::Reject, "sfx/reject.ogg"),
     (Cue::Pop, "sfx/pop.ogg"),
@@ -34,6 +35,7 @@ const CUES: [(Cue, &str); 13] = [
     (Cue::Stone, "sfx/stonerumble-01.ogg"),
     (Cue::Organic, "sfx/organic-01.ogg"),
     (Cue::Impact, "sfx/impact-01.ogg"),
+    (Cue::MenuOption, "sfx/menuoption.ogg"),
 ];
 
 #[derive(Resource, Default)]
@@ -80,6 +82,9 @@ pub(crate) fn effect_cue(effect: Effect) -> Option<Cue> {
 #[derive(Resource)]
 struct SoundAssets([Handle<AudioSource>; CUES.len()]);
 
+#[derive(Component)]
+struct SoundPlayback;
+
 pub(crate) fn plugin(app: &mut App) {
     app.init_resource::<SoundCues>()
         .add_systems(Startup, load)
@@ -94,15 +99,26 @@ fn play(
     mut commands: Commands,
     assets: Res<SoundAssets>,
     mut cues: ResMut<SoundCues>,
+    settings: Res<crate::audio_settings::AudioSettings>,
+    playing: Query<Entity, With<SoundPlayback>>,
     time: Res<Time>,
     mut last_played: Local<[Option<f64>; CUES.len()]>,
 ) {
+    if !settings.sfx {
+        cues.pending.fill(false);
+        for entity in &playing {
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
     let now = time.elapsed_secs_f64();
     for (index, pending) in cues.pending.iter_mut().enumerate() {
         if !std::mem::take(pending) {
             continue;
         }
-        if last_played[index].is_some_and(|last| now - last < 0.2) {
+        if CUES[index].0 != Cue::MenuOption
+            && last_played[index].is_some_and(|last| now - last < 0.2)
+        {
             continue;
         }
         last_played[index] = Some(now);
@@ -116,6 +132,7 @@ fn play(
         commands.spawn((
             AudioPlayer::new(assets.0[index].clone()),
             PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume)),
+            SoundPlayback,
         ));
     }
 }
@@ -159,6 +176,98 @@ pub(crate) fn aquatic_growth(board: Res<Board>, mut cues: ResMut<SoundCues>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_option_sounds_play_on_rapid_changes_and_respect_mute() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<SoundCues>()
+            .init_resource::<crate::audio_settings::AudioSettings>()
+            .insert_resource(SoundAssets(std::array::from_fn(|_| Handle::default())))
+            .add_systems(Update, play);
+        for _ in 0..2 {
+            app.world_mut()
+                .resource_mut::<SoundCues>()
+                .request(Cue::MenuOption);
+            app.update();
+        }
+        assert_eq!(
+            app.world_mut()
+                .query::<&SoundPlayback>()
+                .iter(app.world())
+                .count(),
+            2
+        );
+        app.world_mut()
+            .resource_mut::<crate::audio_settings::AudioSettings>()
+            .sfx = false;
+        app.world_mut()
+            .resource_mut::<SoundCues>()
+            .request(Cue::MenuOption);
+        app.update();
+        assert_eq!(
+            app.world_mut()
+                .query::<&SoundPlayback>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+        assert!(
+            !app.world_mut()
+                .resource_mut::<SoundCues>()
+                .take(Cue::MenuOption)
+        );
+    }
+
+    #[test]
+    fn disabling_sfx_stops_active_sounds_and_discards_muted_cues() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<SoundCues>()
+            .init_resource::<crate::audio_settings::AudioSettings>()
+            .insert_resource(SoundAssets(std::array::from_fn(|_| Handle::default())))
+            .add_systems(Update, play);
+        app.world_mut()
+            .resource_mut::<SoundCues>()
+            .request(Cue::Water);
+        app.update();
+        assert_eq!(
+            app.world_mut()
+                .query::<&SoundPlayback>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+        app.world_mut()
+            .resource_mut::<crate::audio_settings::AudioSettings>()
+            .sfx = false;
+        app.world_mut()
+            .resource_mut::<SoundCues>()
+            .request(Cue::Ice);
+        app.update();
+        assert_eq!(
+            app.world_mut()
+                .query::<&SoundPlayback>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+        assert!(!app.world_mut().resource_mut::<SoundCues>().take(Cue::Ice));
+        app.world_mut()
+            .resource_mut::<crate::audio_settings::AudioSettings>()
+            .sfx = true;
+        app.world_mut()
+            .resource_mut::<SoundCues>()
+            .request(Cue::Ice);
+        app.update();
+        assert_eq!(
+            app.world_mut()
+                .query::<&SoundPlayback>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn reactions_use_shared_sounds_without_sizzling_ember() {

@@ -2,20 +2,32 @@ use std::{io::Cursor, sync::Arc, time::Duration};
 
 use bevy::{
     asset::LoadState,
-    audio::{AddAudioSource, ChannelCount, Decodable, Sample, SampleRate, Source, Volume},
+    audio::{
+        AddAudioSource, AudioSinkPlayback, ChannelCount, Decodable, Sample, SampleRate, Source,
+        Volume,
+    },
     prelude::*,
     tasks::{AsyncComputeTaskPool, Task, futures::check_ready, futures_lite::future::yield_now},
 };
 
 const INTRO_PATH: &str = "sfx/TlalocRock_intro.ogg";
 const LOOP_PATH: &str = "sfx/TlalocRock_loop.ogg";
+const MUSIC_VOLUME: f32 = 0.3;
 
 /// Register after Bevy's default plugins. Playback is independent of game states.
 pub fn plugin(app: &mut App) {
     app.add_audio_source::<Music>()
         .add_systems(Startup, load_music)
-        .add_systems(Update, prepare_music);
+        .add_systems(
+            Update,
+            (prepare_music, sync_music_volume)
+                .chain()
+                .after(crate::menu::FrontendSystems),
+        );
 }
+
+#[derive(Component)]
+struct MusicPlayback;
 
 #[derive(Resource)]
 struct MusicLoading {
@@ -44,6 +56,7 @@ fn prepare_music(
     tracks: Res<Assets<AudioSource>>,
     mut music_assets: ResMut<Assets<Music>>,
     mut loading: ResMut<MusicLoading>,
+    settings: Res<crate::audio_settings::AudioSettings>,
 ) {
     if let Some(task) = &mut loading.task {
         if let Some(result) = check_ready(task) {
@@ -52,7 +65,12 @@ fn prepare_music(
                 Ok(music) => {
                     commands.spawn((
                         AudioPlayer(music_assets.add(music)),
-                        PlaybackSettings::ONCE.with_volume(Volume::Linear(0.3)),
+                        PlaybackSettings::ONCE.with_volume(Volume::Linear(if settings.music {
+                            MUSIC_VOLUME
+                        } else {
+                            0.0
+                        })),
+                        MusicPlayback,
                     ));
                 }
                 Err(error) => error!("Failed to prepare music: {error}"),
@@ -91,6 +109,18 @@ fn prepare_music(
             let loop_track = decode(loop_track, LOOP_PATH).await?;
             Music::new(intro, loop_track)
         }));
+    }
+}
+
+fn sync_music_volume(
+    settings: Res<crate::audio_settings::AudioSettings>,
+    mut sinks: Query<&mut AudioSink, With<MusicPlayback>>,
+) {
+    for mut sink in &mut sinks {
+        let volume = if settings.music { MUSIC_VOLUME } else { 0.0 };
+        if sink.volume().to_linear() != volume {
+            sink.set_volume(Volume::Linear(volume));
+        }
     }
 }
 
@@ -218,6 +248,67 @@ impl Source for MusicSamples {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn music_volume_tracks_settings_including_new_sinks() {
+        let mut app = App::new();
+        app.init_resource::<crate::audio_settings::AudioSettings>()
+            .add_systems(Update, sync_music_volume);
+        let (player, _output) = rodio::Player::new();
+        let entity = app
+            .world_mut()
+            .spawn((AudioSink::new(player), MusicPlayback))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<AudioSink>(entity)
+                .unwrap()
+                .volume()
+                .to_linear(),
+            MUSIC_VOLUME
+        );
+        app.world_mut()
+            .resource_mut::<crate::audio_settings::AudioSettings>()
+            .music = false;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<AudioSink>(entity)
+                .unwrap()
+                .volume()
+                .to_linear(),
+            0.0
+        );
+        let (player, _output2) = rodio::Player::new();
+        let second = app
+            .world_mut()
+            .spawn((AudioSink::new(player), MusicPlayback))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<AudioSink>(second)
+                .unwrap()
+                .volume()
+                .to_linear(),
+            0.0
+        );
+        app.world_mut()
+            .resource_mut::<crate::audio_settings::AudioSettings>()
+            .music = true;
+        app.update();
+        for id in [entity, second] {
+            assert_eq!(
+                app.world()
+                    .get::<AudioSink>(id)
+                    .unwrap()
+                    .volume()
+                    .to_linear(),
+                MUSIC_VOLUME
+            );
+        }
+    }
 
     fn track(samples: &[f32], channels: u16, rate: u32) -> Track {
         Track {

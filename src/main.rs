@@ -13,6 +13,7 @@ use rand::{Rng, RngExt};
 
 mod ai;
 mod aquatic;
+mod audio_settings;
 mod board;
 mod effects;
 mod ground_art;
@@ -1495,6 +1496,7 @@ fn main() {
         .add_plugins(ground_art::plugin)
         .add_plugins(history::plugin)
         .add_plugins(menu::plugin)
+        .add_plugins(audio_settings::plugin)
         .add_plugins(sound::plugin)
         .add_plugins(music::plugin)
         .add_systems(

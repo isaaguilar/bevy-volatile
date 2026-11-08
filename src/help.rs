@@ -456,6 +456,20 @@ pub(crate) struct Help {
 }
 
 impl Help {
+    pub(crate) fn is_open(&self) -> bool {
+        self.item.is_some()
+    }
+
+    pub(crate) fn open(&mut self, index: usize) {
+        self.item = Some(index);
+        self.dirty = true;
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.item = None;
+        self.dirty = true;
+    }
+
     pub(crate) fn reset(&mut self, commands: &mut Commands) {
         if let Some(root) = self.root.take() {
             commands.entity(root).despawn();
@@ -474,13 +488,13 @@ impl Help {
 struct HelpTarget;
 
 #[derive(Component)]
-struct HelpClose;
+pub(crate) struct HelpClose;
 
 #[derive(Component)]
-struct HelpViewport;
+pub(crate) struct HelpViewport;
 
 #[derive(Component)]
-struct HelpScrollbar;
+pub(crate) struct HelpScrollbar;
 
 #[derive(Component)]
 struct ReactionIcon;
@@ -601,7 +615,7 @@ fn update_target(
     }
 }
 
-fn render(
+pub(crate) fn render(
     mut commands: Commands,
     hud: Res<Hud>,
     images: Res<InventoryImages>,
@@ -630,7 +644,7 @@ fn render(
                 ..default()
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.70)),
-            GlobalZIndex(90),
+            GlobalZIndex(150),
         ))
         .id();
     commands.entity(hud.0).add_child(root);

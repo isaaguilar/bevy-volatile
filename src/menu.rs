@@ -1,10 +1,28 @@
-use bevy::{picking::hover::Hovered, prelude::*, ui::Pressed, ui_widgets::Button};
+use bevy::{
+    picking::hover::Hovered,
+    prelude::*,
+    ui::Pressed,
+    ui_widgets::{Button, ControlOrientation, Scrollbar, ScrollbarThumb},
+};
 use bevy_aspect_ratio_mask::Hud;
 
-use crate::{PlayerHealth, RESOLUTION_HEIGHT, RESOLUTION_WIDTH};
+use crate::{
+    INVENTORY_ITEMS, INVENTORY_ORDER, InventoryImages, PlayerHealth, RESOLUTION_HEIGHT,
+    RESOLUTION_WIDTH,
+    audio_settings::{AudioChannel, AudioSettings},
+    help, history,
+};
 
 const SPLASH_SECONDS: f32 = 1.5;
-const RULE_PAGE_CHARS: usize = 750;
+const RULEBOOK_BASICS: &str = concat!(
+    "GOAL: Reduce the computer's health to zero. If both players reach zero together, it is a draw.\n\n",
+    "TURNS: Take two actions: move, place an ingredient, or pick up. UNDO reverses your first action. REST ends the turn and restores energy; press R or click REST.\n\n",
+    "MOVE: Click MOVE, then a highlighted destination. Walk one tile for free or jump two tiles for one energy; both use one action. Use PICK UP to collect eligible ingredients on your tile.\n\n",
+    "INGREDIENTS: Select an item, then a target tile. Your tile and adjacent tiles cost no energy; farther placements cost distance minus one. Distance counts diagonals. A first placement waits until the turn ends, so you can combine two items. Invalid placements do not cost an action, energy, or items.\n\n",
+    "ENERGY: Free moves, nearby placements, and pickups restore one energy at the end of a two-action turn. Resting before acting restores all energy; after one action it restores two. Energy is capped at five.\n\n",
+    "HOVER: Toggle HOVER without using an action. Hovering uses one magic per turn if you hover or move while hovering; otherwise magic recovers. Hovering avoids some ground effects but not all damage. Ridges and holes require enough magic and safe exits.\n\n",
+    "ITEMS AND TERRAIN: Water, Void Dust, and Stone Dust are unlimited. Other items can be collected and return after use. Rain and earthquakes change the board. Select an ingredient below to see its effects and reactions; during a match, select an item and click ? for the same guide."
+);
 const GOLD: Color = Color::srgb(0.86, 0.68, 0.32);
 const TEXT: Color = Color::srgb(1.0, 0.94, 0.78);
 const BUTTON_TEXT: Color = Color::srgb(0.08, 0.08, 0.08);
@@ -16,6 +34,9 @@ fn button_rect(selected: bool) -> Rect {
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GameplaySystems;
+
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FrontendSystems;
 
 pub(crate) fn plugin(app: &mut App) {
     app.init_resource::<Frontend>()
@@ -35,8 +56,27 @@ pub(crate) fn plugin(app: &mut App) {
                 fade_splash,
             )
                 .chain()
+                .after(crate::audio_settings::AudioHudInput)
+                .in_set(FrontendSystems)
                 .after(crate::history::HistorySystems),
+        )
+        .add_systems(
+            Update,
+            (
+                help::render,
+                history::scroll::<help::HelpViewport>,
+                history::update_scrollbar::<help::HelpViewport, help::HelpScrollbar>,
+                history::scroll::<RulebookViewport>,
+                history::update_scrollbar::<RulebookViewport, RulebookScrollbar>,
+            )
+                .chain()
+                .after(FrontendSystems)
+                .run_if(in_rulebook),
         );
+}
+
+fn in_rulebook(frontend: Res<Frontend>) -> bool {
+    frontend.screen == Screen::Rulebook
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +84,7 @@ enum Screen {
     BevySplash,
     StudioSplash,
     Title,
+    Options,
     Credits,
     Rulebook,
     Game,
@@ -75,8 +116,7 @@ pub(crate) struct Frontend {
     restart_requested: bool,
     timer: Timer,
     selected: usize,
-    page: usize,
-    pages: Vec<String>,
+    rulebook_selected: usize,
     root: Option<Entity>,
     dirty: bool,
 }
@@ -92,8 +132,7 @@ impl Default for Frontend {
             restart_requested: false,
             timer: Timer::from_seconds(SPLASH_SECONDS, TimerMode::Once),
             selected: 0,
-            page: 0,
-            pages: rulebook_pages(include_str!("../RULEBOOK.md")),
+            rulebook_selected: 0,
             root: None,
             dirty: true,
         }
@@ -101,6 +140,10 @@ impl Default for Frontend {
 }
 
 impl Frontend {
+    pub(crate) fn audio_controls_visible(&self) -> bool {
+        !matches!(self.screen, Screen::BevySplash | Screen::StudioSplash)
+    }
+
     pub(crate) fn computer_game(&self) -> bool {
         self.screen == Screen::Game && self.mode == Some(GameMode::Computer)
     }
@@ -114,7 +157,7 @@ impl Frontend {
 
     fn show(&mut self, screen: Screen) {
         self.screen = screen;
-        if matches!(screen, Screen::Title | Screen::Paused) {
+        if matches!(screen, Screen::Title | Screen::Paused | Screen::Options) {
             self.selected = 0;
         }
         self.timer.reset();
@@ -126,6 +169,7 @@ impl Frontend {
             Screen::Title if self.match_in_progress => &ACTIVE_TITLE_ACTIONS,
             Screen::Title => &TITLE_ACTIONS,
             Screen::Paused => &PAUSE_ACTIONS,
+            Screen::Options => &OPTIONS_ACTIONS,
             _ => &[],
         }
     }
@@ -149,20 +193,13 @@ impl Frontend {
             MenuAction::Resume if self.match_in_progress => self.show(Screen::Game),
             MenuAction::Resume => {}
             MenuAction::Credits => self.show(Screen::Credits),
+            MenuAction::Options => self.show(Screen::Options),
             MenuAction::Rulebook => {
-                self.page = 0;
+                self.rulebook_selected = 0;
                 self.show(Screen::Rulebook);
             }
             MenuAction::Back => self.show(Screen::Title),
-            MenuAction::Previous if self.page > 0 => {
-                self.page -= 1;
-                self.dirty = true;
-            }
-            MenuAction::Next if self.page + 1 < self.pages.len() => {
-                self.page += 1;
-                self.dirty = true;
-            }
-            MenuAction::Previous | MenuAction::Next => {}
+            MenuAction::RulebookItem(_) | MenuAction::Music | MenuAction::Sfx => {}
         }
     }
 
@@ -177,6 +214,12 @@ struct SplashImage;
 #[derive(Component)]
 struct MenuButtonArt;
 
+#[derive(Component)]
+struct RulebookViewport;
+
+#[derive(Component)]
+struct RulebookScrollbar;
+
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAction {
     Computer,
@@ -184,23 +227,33 @@ enum MenuAction {
     #[allow(dead_code)]
     TwoPlayer,
     Credits,
+    Options,
+    Music,
+    Sfx,
     Rulebook,
     Back,
-    Previous,
-    Next,
+    RulebookItem(usize),
 }
 
-const TITLE_ACTIONS: [(MenuAction, &str); 3] = [
+const TITLE_ACTIONS: [(MenuAction, &str); 4] = [
     (MenuAction::Computer, "PLAY VS COMPUTER"),
     (MenuAction::Credits, "CREDITS"),
     (MenuAction::Rulebook, "RULEBOOK"),
+    (MenuAction::Options, "OPTIONS"),
 ];
 
-const ACTIVE_TITLE_ACTIONS: [(MenuAction, &str); 4] = [
+const ACTIVE_TITLE_ACTIONS: [(MenuAction, &str); 5] = [
     (MenuAction::Resume, "RESUME"),
     (MenuAction::Computer, "START NEW GAME"),
     (MenuAction::Credits, "CREDITS"),
     (MenuAction::Rulebook, "RULEBOOK"),
+    (MenuAction::Options, "OPTIONS"),
+];
+
+const OPTIONS_ACTIONS: [(MenuAction, &str); 3] = [
+    (MenuAction::Music, "MUSIC"),
+    (MenuAction::Sfx, "SFX"),
+    (MenuAction::Back, "BACK"),
 ];
 
 const PAUSE_ACTIONS: [(MenuAction, &str); 2] = [
@@ -251,33 +304,6 @@ pub(crate) fn in_game(frontend: Res<Frontend>) -> bool {
     frontend.screen == Screen::Game
 }
 
-fn rulebook_pages(rulebook: &str) -> Vec<String> {
-    let text = rulebook.replace("**", "");
-    let mut pages = Vec::new();
-    let mut page = String::new();
-    for line in text
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with("# "))
-    {
-        let mut first_sentence = true;
-        for sentence in line.split_inclusive(". ") {
-            let sentence = sentence.trim();
-            if !page.is_empty() && page.len() + 2 + sentence.len() > RULE_PAGE_CHARS {
-                pages.push(std::mem::take(&mut page));
-            }
-            if !page.is_empty() {
-                page.push_str(if first_sentence { "\n\n" } else { " " });
-            }
-            page.push_str(sentence);
-            first_sentence = false;
-        }
-    }
-    if !page.is_empty() {
-        pages.push(page);
-    }
-    pages
-}
-
 type MenuButton = (
     Ref<'static, Hovered>,
     &'static MenuAction,
@@ -286,15 +312,25 @@ type MenuButton = (
 );
 
 fn handle_frontend(
-    time: Res<Time>,
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut frontend: ResMut<Frontend>,
+    input: (Res<Time>, Res<ButtonInput<KeyCode>>),
+    state: (ResMut<Frontend>, ResMut<AudioSettings>, ResMut<help::Help>),
     mut buttons: Query<MenuButton, With<Button>>,
     mut button_art: Query<&mut ImageNode, With<MenuButtonArt>>,
     pressed_buttons: Query<&MenuAction, Added<Pressed>>,
+    help_close: Query<(), (With<help::HelpClose>, Added<Pressed>)>,
     mut sounds: Option<ResMut<crate::sound::SoundCues>>,
 ) {
+    let (time, keyboard) = input;
+    let (mut frontend, mut audio, mut help) = state;
     if frontend.screen == Screen::Game {
+        return;
+    }
+
+    if frontend.screen == Screen::Rulebook && help.is_open() {
+        if keyboard.just_pressed(KeyCode::Escape) || !help_close.is_empty() {
+            help.close();
+            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
+        }
         return;
     }
 
@@ -320,13 +356,24 @@ fn handle_frontend(
         return;
     }
 
-    if matches!(frontend.screen, Screen::Title | Screen::Paused) {
-        if frontend.screen == Screen::Paused && keyboard.just_pressed(KeyCode::Escape) {
-            frontend.activate(MenuAction::Resume);
+    if matches!(
+        frontend.screen,
+        Screen::Title | Screen::Paused | Screen::Options
+    ) {
+        if matches!(frontend.screen, Screen::Paused | Screen::Options)
+            && keyboard.just_pressed(KeyCode::Escape)
+        {
+            let action = if frontend.screen == Screen::Paused {
+                MenuAction::Resume
+            } else {
+                MenuAction::Back
+            };
+            frontend.activate(action);
             crate::sound::request(&mut sounds, crate::sound::Cue::Select);
             return;
         }
         let actions = frontend.actions();
+        let previous_selection = frontend.selected;
         for (hovered, action, _, _) in &mut buttons {
             if hovered.is_changed()
                 && hovered.0
@@ -337,14 +384,15 @@ fn handle_frontend(
         }
         if keyboard.just_pressed(KeyCode::ArrowDown) {
             frontend.selected = (frontend.selected + 1) % actions.len();
-            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         } else if keyboard.just_pressed(KeyCode::ArrowUp) {
             frontend.selected = (frontend.selected + actions.len() - 1) % actions.len();
-            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
+        }
+        if frontend.selected != previous_selection {
+            crate::sound::request(&mut sounds, crate::sound::Cue::MenuOption);
         }
         if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
             let action = actions[frontend.selected].0;
-            frontend.activate(action);
+            activate_action(&mut frontend, &mut audio, &mut help, action);
             crate::sound::request(&mut sounds, crate::sound::Cue::Select);
             return;
         }
@@ -353,18 +401,45 @@ fn handle_frontend(
         crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         return;
     } else if frontend.screen == Screen::Rulebook {
+        let previous_selection = frontend.rulebook_selected;
+        for (hovered, action, _, _) in &mut buttons {
+            if hovered.is_changed()
+                && hovered.0
+                && let MenuAction::RulebookItem(item) = action
+                && let Some(index) = INVENTORY_ORDER
+                    .iter()
+                    .position(|candidate| candidate == item)
+            {
+                frontend.rulebook_selected = index;
+            }
+        }
+        let count = INVENTORY_ORDER.len();
         if keyboard.just_pressed(KeyCode::ArrowLeft) {
-            frontend.activate(MenuAction::Previous);
-            crate::sound::request(&mut sounds, crate::sound::Cue::Select);
+            frontend.rulebook_selected = (frontend.rulebook_selected + count - 1) % count;
         } else if keyboard.just_pressed(KeyCode::ArrowRight) {
-            frontend.activate(MenuAction::Next);
+            frontend.rulebook_selected = (frontend.rulebook_selected + 1) % count;
+        } else if keyboard.just_pressed(KeyCode::ArrowUp)
+            || keyboard.just_pressed(KeyCode::ArrowDown)
+        {
+            frontend.rulebook_selected = (frontend.rulebook_selected + count / 2) % count;
+        }
+        if frontend.rulebook_selected != previous_selection {
+            crate::sound::request(&mut sounds, crate::sound::Cue::MenuOption);
+        }
+        if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
+            help.open(INVENTORY_ORDER[frontend.rulebook_selected]);
             crate::sound::request(&mut sounds, crate::sound::Cue::Select);
+            return;
         }
     }
 
     for (hovered, action, mut background, children) in &mut buttons {
         let actions = frontend.actions();
-        let highlighted = if actions.is_empty() {
+        let highlighted = if frontend.screen == Screen::Rulebook
+            && let MenuAction::RulebookItem(item) = action
+        {
+            INVENTORY_ORDER[frontend.rulebook_selected] == *item
+        } else if actions.is_empty() {
             hovered.0
         } else {
             actions[frontend.selected].0 == *action
@@ -387,8 +462,22 @@ fn handle_frontend(
         };
     }
     if let Some(action) = pressed_buttons.iter().next() {
-        frontend.activate(*action);
+        activate_action(&mut frontend, &mut audio, &mut help, *action);
         crate::sound::request(&mut sounds, crate::sound::Cue::Select);
+    }
+}
+
+fn activate_action(
+    frontend: &mut Frontend,
+    audio: &mut AudioSettings,
+    help: &mut help::Help,
+    action: MenuAction,
+) {
+    match action {
+        MenuAction::Music => audio.toggle(AudioChannel::Music),
+        MenuAction::Sfx => audio.toggle(AudioChannel::Sfx),
+        MenuAction::RulebookItem(index) => help.open(index),
+        _ => frontend.activate(action),
     }
 }
 
@@ -396,9 +485,11 @@ fn render_screen(
     mut commands: Commands,
     hud: Res<Hud>,
     asset_server: Res<AssetServer>,
+    images: Res<InventoryImages>,
     mut frontend: ResMut<Frontend>,
+    audio: Res<AudioSettings>,
 ) {
-    if !frontend.dirty {
+    if !frontend.dirty && !(frontend.screen == Screen::Options && audio.is_changed()) {
         return;
     }
     frontend.dirty = false;
@@ -451,8 +542,9 @@ fn render_screen(
                 ));
             }
             Screen::Title => title_screen(parent, &asset_server, frontend.actions()),
+            Screen::Options => options_screen(parent, &asset_server, &frontend, &audio),
             Screen::Credits => credits_screen(parent, &asset_server),
-            Screen::Rulebook => rulebook_screen(parent, &asset_server, &frontend),
+            Screen::Rulebook => rulebook_screen(parent, &asset_server, &frontend, &images),
             Screen::Paused => pause_screen(parent, &asset_server),
             Screen::GameOver => game_over_screen(
                 parent,
@@ -499,7 +591,7 @@ fn title_screen(
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::FlexEnd,
             align_items: AlignItems::Center,
-            padding: UiRect::bottom(Val::Px(if actions.len() > 3 { 24.0 } else { 52.0 })),
+            padding: UiRect::bottom(Val::Px(24.0)),
             ..default()
         })
         .with_children(|screen| {
@@ -513,9 +605,45 @@ fn title_screen(
                 })
                 .with_children(|options| {
                     for (index, &(action, label)) in actions.iter().enumerate() {
-                        button(options, assets, action, label, 54.0, index == 0);
+                        let height = if actions.len() > 4 { 44.0 } else { 52.0 };
+                        button(options, assets, action, label, height, index == 0);
                     }
                 });
+        });
+}
+
+fn options_screen(
+    parent: &mut ChildSpawnerCommands,
+    assets: &AssetServer,
+    frontend: &Frontend,
+    audio: &AudioSettings,
+) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            row_gap: Val::Px(18.0),
+            ..default()
+        })
+        .with_children(|content| {
+            text(content, "OPTIONS", 42.0, GOLD);
+            for (index, (action, label)) in OPTIONS_ACTIONS.into_iter().enumerate() {
+                let label = match action {
+                    MenuAction::Music => {
+                        format!("{label}: {}", if audio.music { "ON" } else { "OFF" })
+                    }
+                    MenuAction::Sfx => format!("{label}: {}", if audio.sfx { "ON" } else { "OFF" }),
+                    _ => label.to_owned(),
+                };
+                button(
+                    content,
+                    assets,
+                    action,
+                    &label,
+                    46.0,
+                    index == frontend.selected,
+                );
+            }
         });
 }
 
@@ -592,18 +720,27 @@ fn credits_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
         .spawn(Node {
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Center,
-            row_gap: Val::Px(24.0),
+            row_gap: Val::Px(14.0),
             ..default()
         })
         .with_children(|content| {
             text(content, "CREDITS", 42.0, GOLD);
-            text(content, "Isa-Metric Games", 26.0, TEXT);
-            text(content, "Made with Bevy", 21.0, TEXT);
+            text(content, "Made with Bevy", 26.0, TEXT);
+            text(content, "ART, MUSIC, SFX", 22.0, GOLD);
+            text(content, "Isa Aguilar", 21.0, TEXT);
+            text(content, "ENGINEERING", 22.0, GOLD);
+            text(content, "AI Assisted", 21.0, TEXT);
+            text(content, "Isa Aguilar", 21.0, TEXT);
             button(content, assets, MenuAction::Back, "BACK", 42.0, false);
         });
 }
 
-fn rulebook_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer, frontend: &Frontend) {
+fn rulebook_screen(
+    parent: &mut ChildSpawnerCommands,
+    assets: &AssetServer,
+    frontend: &Frontend,
+    images: &InventoryImages,
+) {
     parent
         .spawn(Node {
             width: Val::Px(RESOLUTION_WIDTH - 100.0),
@@ -611,7 +748,7 @@ fn rulebook_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer, fron
             padding: UiRect::all(Val::Px(22.0)),
             border: UiRect::all(Val::Px(2.0)),
             flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(16.0),
+            row_gap: Val::Px(8.0),
             ..default()
         })
         .insert((
@@ -620,21 +757,105 @@ fn rulebook_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer, fron
         ))
         .with_children(|content| {
             text(content, "RULEBOOK", 30.0, GOLD);
-            text(
-                content,
-                &format!("Page {} / {}", frontend.page + 1, frontend.pages.len()),
-                14.0,
-                GOLD,
-            );
             content
                 .spawn(Node {
                     width: Val::Percent(100.0),
                     flex_grow: 1.0,
+                    min_height: Val::Px(0.0),
+                    column_gap: Val::Px(5.0),
                     ..default()
                 })
-                .with_children(|body| {
-                    text(body, &frontend.pages[frontend.page], 16.0, TEXT);
+                .with_children(|row| {
+                    let viewport = row
+                        .spawn((
+                            RulebookViewport,
+                            Hovered::default(),
+                            ScrollPosition::default(),
+                            Node {
+                                flex_grow: 1.0,
+                                min_width: Val::Px(0.0),
+                                height: Val::Percent(100.0),
+                                flex_direction: FlexDirection::Column,
+                                overflow: Overflow::scroll_y(),
+                                ..default()
+                            },
+                        ))
+                        .with_children(|body| text(body, RULEBOOK_BASICS, 15.0, TEXT))
+                        .id();
+                    row.spawn((
+                        RulebookScrollbar,
+                        Visibility::Hidden,
+                        Node {
+                            width: Val::Px(10.0),
+                            height: Val::Percent(100.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.4, 0.3, 0.18, 0.6)),
+                        Scrollbar {
+                            orientation: ControlOrientation::Vertical,
+                            target: viewport,
+                            min_thumb_length: 12.0,
+                        },
+                    ))
+                    .with_children(|bar| {
+                        bar.spawn((
+                            Hovered::default(),
+                            BackgroundColor(GOLD),
+                            ScrollbarThumb {
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                border: UiRect::ZERO,
+                            },
+                        ));
+                    });
                 });
+            text(content, "INGREDIENTS AND REACTIONS", 15.0, GOLD);
+            for (row_index, row_items) in INVENTORY_ORDER.chunks(7).enumerate() {
+                content
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        column_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        for (column, &item) in row_items.iter().enumerate() {
+                            let selected = frontend.rulebook_selected == row_index * 7 + column;
+                            row.spawn((
+                                Button,
+                                Hovered::default(),
+                                MenuAction::RulebookItem(item),
+                                Node {
+                                    flex_grow: 1.0,
+                                    flex_basis: Val::Px(0.0),
+                                    min_width: Val::Px(0.0),
+                                    height: Val::Px(58.0),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    flex_direction: FlexDirection::Column,
+                                    justify_content: JustifyContent::Center,
+                                    align_items: AlignItems::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(if selected {
+                                    Color::srgb(0.40, 0.28, 0.14)
+                                } else {
+                                    Color::srgba(0.08, 0.06, 0.05, 0.94)
+                                }),
+                                BorderColor::all(GOLD),
+                            ))
+                            .with_children(|entry| {
+                                entry.spawn((
+                                    images.icon(item),
+                                    Node {
+                                        width: Val::Px(30.0),
+                                        height: Val::Px(30.0),
+                                        ..default()
+                                    },
+                                    Pickable::IGNORE,
+                                ));
+                                text(entry, INVENTORY_ITEMS[item].0, 10.0, TEXT);
+                            });
+                        }
+                    });
+            }
             content
                 .spawn(Node {
                     height: Val::Px(42.0),
@@ -643,12 +864,6 @@ fn rulebook_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer, fron
                 })
                 .with_children(|row| {
                     button(row, assets, MenuAction::Back, "BACK", 42.0, false);
-                    if frontend.page > 0 {
-                        button(row, assets, MenuAction::Previous, "PREVIOUS", 42.0, false);
-                    }
-                    if frontend.page + 1 < frontend.pages.len() {
-                        button(row, assets, MenuAction::Next, "NEXT", 42.0, false);
-                    }
                 });
         });
 }
@@ -734,12 +949,120 @@ mod tests {
     }
 
     #[test]
+    fn options_support_keyboard_pointer_and_shared_settings_across_screens() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
+            .init_resource::<InventoryImages>();
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud))
+            .add_systems(Update, (handle_frontend, render_screen).chain());
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .show(Screen::Options);
+        app.update();
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.world().resource::<AudioSettings>().music);
+        let world = app.world_mut();
+        assert!(
+            world
+                .query::<&Text>()
+                .iter(world)
+                .any(|text| text.0 == "MUSIC: OFF")
+        );
+
+        let world = app.world_mut();
+        let mut buttons = world.query_filtered::<(Entity, &MenuAction), With<Button>>();
+        let sfx = buttons
+            .iter(world)
+            .find_map(|(entity, action)| (*action == MenuAction::Sfx).then_some(entity))
+            .unwrap();
+        world.entity_mut(sfx).insert(Pressed);
+        app.update();
+        assert!(!app.world().resource::<AudioSettings>().sfx);
+        let world = app.world_mut();
+        assert!(
+            world
+                .query::<&Text>()
+                .iter(world)
+                .any(|text| text.0 == "SFX: OFF")
+        );
+
+        app.world_mut().resource_mut::<AudioSettings>().music = true;
+        app.update();
+        let world = app.world_mut();
+        assert!(
+            world
+                .query::<&Text>()
+                .iter(world)
+                .any(|text| text.0 == "MUSIC: ON")
+        );
+        tap(&mut app, KeyCode::ArrowDown);
+        assert_eq!(app.world().resource::<Frontend>().selected, 1);
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.world().resource::<AudioSettings>().sfx);
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.world().resource::<AudioSettings>().sfx);
+        tap(&mut app, KeyCode::Escape);
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Title);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .activate(MenuAction::Credits);
+        app.update();
+        let world = app.world_mut();
+        let mut query = world.query::<&Text>();
+        let credits: Vec<_> = query.iter(world).map(|text| text.0.as_str()).collect();
+        assert_eq!(
+            credits
+                .iter()
+                .filter(|&&text| text == "Made with Bevy")
+                .count(),
+            1
+        );
+        assert!(!credits.contains(&"Isa-Metric Games"));
+        assert!(credits.contains(&"ART, MUSIC, SFX"));
+        assert!(credits.contains(&"ENGINEERING"));
+        assert!(credits.contains(&"AI Assisted"));
+        assert_eq!(
+            credits
+                .iter()
+                .filter(|&&text| text == "Isa Aguilar")
+                .count(),
+            2
+        );
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .activate(MenuAction::Back);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .activate(MenuAction::Computer);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .show(Screen::Paused);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .activate(MenuAction::Back);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .activate(MenuAction::Computer);
+        assert!(app.world().resource::<AudioSettings>().music);
+        assert!(!app.world().resource::<AudioSettings>().sfx);
+    }
+
+    #[test]
     fn title_uses_cover_and_compact_buttons_with_selection_art() {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_asset::<Image>()
             .init_resource::<ButtonInput<KeyCode>>()
-            .init_resource::<Frontend>();
+            .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
+            .init_resource::<InventoryImages>();
         let hud = app.world_mut().spawn(Node::default()).id();
         app.insert_resource(Hud(hud))
             .add_systems(Update, (handle_frontend, render_screen).chain());
@@ -762,9 +1085,9 @@ mod tests {
         assert_eq!(cover_node.height, Val::Percent(100.0));
         let mut buttons = world.query_filtered::<(&MenuAction, &Node, &Children), With<Button>>();
         let buttons: Vec<_> = buttons.iter(world).collect();
-        assert_eq!(buttons.len(), 3);
+        assert_eq!(buttons.len(), 4);
         for (action, node, children) in buttons {
-            assert_eq!(node.height, Val::Px(54.0));
+            assert_eq!(node.height, Val::Px(52.0));
             let image = children
                 .iter()
                 .find_map(|child| world.get::<ImageNode>(child))
@@ -818,9 +1141,9 @@ mod tests {
         let world = app.world_mut();
         let mut buttons = world.query_filtered::<(&MenuAction, &Node, &Children), With<Button>>();
         let buttons: Vec<_> = buttons.iter(world).collect();
-        assert_eq!(buttons.len(), 4);
+        assert_eq!(buttons.len(), 5);
         for (action, node, children) in buttons {
-            assert_eq!(node.height, Val::Px(54.0));
+            assert_eq!(node.height, Val::Px(44.0));
             let image = children
                 .iter()
                 .find_map(|child| world.get::<ImageNode>(child))
@@ -836,6 +1159,8 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(frontend)
             .init_resource::<Time>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
             .init_resource::<ButtonInput<KeyCode>>()
             .insert_resource(PlayerHealth([7, 4]))
             .init_resource::<GameTicks>()
@@ -996,34 +1321,107 @@ mod tests {
     }
 
     #[test]
-    fn rulebook_pages_preserve_all_words_and_navigation_is_bounded() {
-        let source = include_str!("../RULEBOOK.md").replace("**", "");
-        let source = source
-            .lines()
-            .filter(|line| !line.starts_with("# "))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let pages = rulebook_pages(include_str!("../RULEBOOK.md"));
-        assert!(pages.len() > 1);
-        assert!(pages.iter().all(|page| page.len() <= RULE_PAGE_CHARS));
-        assert_eq!(
-            pages
-                .join(" ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-            source.split_whitespace().collect::<Vec<_>>().join(" ")
+    fn rulebook_opens_reaction_guides_and_returns_to_basics() {
+        use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+        use bevy::input::touch::TouchPhase;
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .add_message::<MouseWheel>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<InventoryImages>()
+            .init_resource::<PlayerHealth>()
+            .insert_resource(crate::SerpentSheet(Handle::default()));
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud))
+            .add_plugins((help::plugin, plugin));
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .activate(MenuAction::Rulebook);
+        app.update();
+        let world = app.world_mut();
+        assert!(
+            world
+                .query::<&Text>()
+                .iter(world)
+                .any(|text| text.0 == RULEBOOK_BASICS)
         );
-        let mut frontend = Frontend::default();
-        frontend.activate(MenuAction::Rulebook);
-        frontend.activate(MenuAction::Previous);
-        assert_eq!(frontend.page, 0);
-        for _ in 0..frontend.pages.len() + 1 {
-            frontend.activate(MenuAction::Next);
-        }
-        assert_eq!(frontend.page, frontend.pages.len() - 1);
-        frontend.activate(MenuAction::Back);
-        assert_eq!(frontend.screen, Screen::Title);
+        let mut buttons = world.query::<&MenuAction>();
+        assert_eq!(
+            buttons
+                .iter(world)
+                .filter(|action| matches!(action, MenuAction::RulebookItem(_)))
+                .count(),
+            INVENTORY_ORDER.len()
+        );
+        let viewport = world
+            .query_filtered::<Entity, With<RulebookViewport>>()
+            .single(world)
+            .unwrap();
+        world.entity_mut(viewport).insert((
+            Hovered(true),
+            ComputedNode {
+                size: Vec2::new(100.0, 100.0),
+                content_size: Vec2::new(100.0, 200.0),
+                inverse_scale_factor: 1.0,
+                ..default()
+            },
+        ));
+        world.write_message(MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: -2.0,
+            window: Entity::PLACEHOLDER,
+            phase: TouchPhase::Moved,
+        });
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(viewport).unwrap().y, 48.0);
+
+        tap(&mut app, KeyCode::ArrowRight);
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.world().resource::<help::Help>().item(),
+            Some(INVENTORY_ORDER[1])
+        );
+        let world = app.world_mut();
+        assert!(
+            world
+                .query::<&Text>()
+                .iter(world)
+                .any(|text| text.0.starts_with("Tlexochtli Ember +"))
+        );
+        tap(&mut app, KeyCode::Escape);
+        assert!(!app.world().resource::<help::Help>().is_open());
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Rulebook);
+        let world = app.world_mut();
+        let mut buttons = world.query_filtered::<(Entity, &MenuAction), With<Button>>();
+        let water = buttons
+            .iter(world)
+            .find_map(|(entity, action)| {
+                (*action == MenuAction::RulebookItem(INVENTORY_ORDER[0])).then_some(entity)
+            })
+            .unwrap();
+        world.entity_mut(water).insert(Pressed);
+        app.update();
+        assert_eq!(
+            app.world().resource::<help::Help>().item(),
+            Some(INVENTORY_ORDER[0])
+        );
+        let world = app.world_mut();
+        let close = world
+            .query_filtered::<Entity, With<help::HelpClose>>()
+            .single(world)
+            .unwrap();
+        world.entity_mut(close).insert(Pressed);
+        app.update();
+        assert!(!app.world().resource::<help::Help>().is_open());
+        assert_eq!(app.world().get::<ScrollPosition>(viewport).unwrap().y, 48.0);
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Rulebook);
+        tap(&mut app, KeyCode::Escape);
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Title);
     }
 
     #[test]
@@ -1032,6 +1430,8 @@ mod tests {
         app.init_resource::<Time>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
             .add_systems(Update, handle_frontend);
         app.world_mut()
             .resource_mut::<Time>()
@@ -1060,11 +1460,54 @@ mod tests {
     }
 
     #[test]
+    fn audio_toggles_appear_when_splashes_end() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Frontend>()
+            .init_resource::<help::Help>();
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud))
+            .add_plugins(crate::audio_settings::plugin)
+            .add_systems(Update, handle_frontend.in_set(FrontendSystems));
+        app.update();
+        let world = app.world_mut();
+        let row = world
+            .query_filtered::<Entity, With<crate::audio_settings::AudioToggleRow>>()
+            .single(world)
+            .unwrap();
+        assert_eq!(*world.get::<Visibility>(row).unwrap(), Visibility::Hidden);
+        world.resource_mut::<Frontend>().show(Screen::StudioSplash);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(row).unwrap(),
+            Visibility::Hidden
+        );
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(app.world().resource::<Frontend>().screen, Screen::Title);
+        assert_eq!(
+            *app.world().get::<Visibility>(row).unwrap(),
+            Visibility::Inherited
+        );
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .show(Screen::Game);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(row).unwrap(),
+            Visibility::Inherited
+        );
+    }
+
+    #[test]
     fn hover_selection_persists_after_exit_and_keyboard_continues_from_it() {
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
             .add_systems(Update, handle_frontend);
         app.world_mut()
             .resource_mut::<Frontend>()
@@ -1105,11 +1548,96 @@ mod tests {
     }
 
     #[test]
+    fn selection_changes_use_menu_option_sound_for_keyboard_and_pointer() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
+            .init_resource::<crate::sound::SoundCues>()
+            .add_systems(Update, handle_frontend);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .show(Screen::Title);
+        let credits = app
+            .world_mut()
+            .spawn((
+                Button,
+                Hovered(false),
+                MenuAction::Credits,
+                BackgroundColor(Color::BLACK),
+            ))
+            .id();
+        app.update();
+        assert!(
+            !app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::MenuOption)
+        );
+        tap(&mut app, KeyCode::ArrowDown);
+        assert!(
+            app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::MenuOption)
+        );
+        assert!(
+            !app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::Select)
+        );
+        app.world_mut().entity_mut(credits).insert(Hovered(true));
+        app.update();
+        assert!(
+            !app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::MenuOption)
+        );
+        tap(&mut app, KeyCode::ArrowDown);
+        assert!(
+            app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::MenuOption)
+        );
+        app.world_mut().entity_mut(credits).insert(Hovered(false));
+        app.update();
+        app.world_mut().entity_mut(credits).insert(Hovered(true));
+        app.update();
+        assert!(
+            app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::MenuOption)
+        );
+        tap(&mut app, KeyCode::Enter);
+        assert!(
+            app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::Select)
+        );
+        assert!(
+            !app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::MenuOption)
+        );
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .activate(MenuAction::Rulebook);
+        tap(&mut app, KeyCode::ArrowRight);
+        assert!(
+            app.world_mut()
+                .resource_mut::<crate::sound::SoundCues>()
+                .take(crate::sound::Cue::MenuOption)
+        );
+    }
+
+    #[test]
     fn keyboard_selection_is_not_overridden_by_stationary_hover() {
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
             .add_systems(Update, handle_frontend);
         app.world_mut()
             .resource_mut::<Frontend>()
@@ -1175,6 +1703,8 @@ mod tests {
             .init_resource::<Time>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<help::Help>()
             .add_systems(Update, handle_frontend);
         app.world_mut()
             .resource_mut::<Frontend>()
@@ -1235,6 +1765,8 @@ mod tests {
                 .init_resource::<Time>()
                 .init_resource::<ButtonInput<KeyCode>>()
                 .init_resource::<Frontend>()
+                .init_resource::<AudioSettings>()
+                .init_resource::<help::Help>()
                 .add_systems(Update, handle_frontend);
             app.world_mut()
                 .resource_mut::<Frontend>()
