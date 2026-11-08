@@ -47,8 +47,6 @@
         <div id="status" role="status">Loading VolaTile...</div>
     </div>
     <script type="module">
-        import init from "./volatile.js";
-
         const contexts = [];
         if (window.AudioContext) {
             window.AudioContext = new Proxy(window.AudioContext, {
@@ -59,7 +57,10 @@
                 },
             });
         }
-        for (const event of ["pointerdown", "keydown"]) {
+        for (const event of [
+            "pointerdown", "pointerup", "mousedown", "mouseup", "click",
+            "touchend", "keydown", "keyup", "contextmenu", "auxclick", "dblclick",
+        ]) {
             document.addEventListener(event, () => {
                 for (const context of contexts) {
                     if (context.state === "suspended") {
@@ -71,6 +72,7 @@
 
         const status = document.getElementById("status");
         try {
+            const { default: init } = await import("./volatile.js");
             await init();
             status.textContent = "";
         } catch (error) {
