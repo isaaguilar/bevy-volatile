@@ -7,6 +7,12 @@ const SPLASH_SECONDS: f32 = 1.5;
 const RULE_PAGE_CHARS: usize = 750;
 const GOLD: Color = Color::srgb(0.86, 0.68, 0.32);
 const TEXT: Color = Color::srgb(1.0, 0.94, 0.78);
+const BUTTON_TEXT: Color = Color::srgb(0.08, 0.08, 0.08);
+
+fn button_rect(selected: bool) -> Rect {
+    let top = if selected { 302.0 } else { 0.0 };
+    Rect::new(0.0, top, 755.0, top + 302.0)
+}
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GameplaySystems;
@@ -168,6 +174,9 @@ impl Frontend {
 #[derive(Component)]
 struct SplashImage;
 
+#[derive(Component)]
+struct MenuButtonArt;
+
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAction {
     Computer,
@@ -269,11 +278,19 @@ fn rulebook_pages(rulebook: &str) -> Vec<String> {
     pages
 }
 
+type MenuButton = (
+    Ref<'static, Hovered>,
+    &'static MenuAction,
+    &'static mut BackgroundColor,
+    Option<&'static Children>,
+);
+
 fn handle_frontend(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut frontend: ResMut<Frontend>,
-    mut buttons: Query<(Ref<Hovered>, &MenuAction, &mut BackgroundColor), With<Button>>,
+    mut buttons: Query<MenuButton, With<Button>>,
+    mut button_art: Query<&mut ImageNode, With<MenuButtonArt>>,
     pressed_buttons: Query<&MenuAction, Added<Pressed>>,
     mut sounds: Option<ResMut<crate::sound::SoundCues>>,
 ) {
@@ -310,7 +327,7 @@ fn handle_frontend(
             return;
         }
         let actions = frontend.actions();
-        for (hovered, action, _) in &mut buttons {
+        for (hovered, action, _, _) in &mut buttons {
             if hovered.is_changed()
                 && hovered.0
                 && let Some(index) = actions.iter().position(|(item, _)| item == action)
@@ -345,14 +362,25 @@ fn handle_frontend(
         }
     }
 
-    for (hovered, action, mut background) in &mut buttons {
+    for (hovered, action, mut background, children) in &mut buttons {
         let actions = frontend.actions();
         let highlighted = if actions.is_empty() {
             hovered.0
         } else {
             actions[frontend.selected].0 == *action
         };
-        background.0 = if highlighted {
+        let mut styled = false;
+        if let Some(children) = children {
+            for child in children.iter() {
+                if let Ok(mut image) = button_art.get_mut(child) {
+                    image.rect = Some(button_rect(highlighted));
+                    styled = true;
+                }
+            }
+        }
+        background.0 = if styled {
+            Color::NONE
+        } else if highlighted {
             Color::srgb(0.40, 0.28, 0.14)
         } else {
             Color::srgba(0.08, 0.06, 0.05, 0.94)
@@ -423,12 +451,14 @@ fn render_screen(
                 ));
             }
             Screen::Title => title_screen(parent, &asset_server, frontend.actions()),
-            Screen::Credits => credits_screen(parent),
-            Screen::Rulebook => rulebook_screen(parent, &frontend),
-            Screen::Paused => pause_screen(parent),
-            Screen::GameOver => {
-                game_over_screen(parent, frontend.outcome.expect("game has an outcome"))
-            }
+            Screen::Credits => credits_screen(parent, &asset_server),
+            Screen::Rulebook => rulebook_screen(parent, &asset_server, &frontend),
+            Screen::Paused => pause_screen(parent, &asset_server),
+            Screen::GameOver => game_over_screen(
+                parent,
+                &asset_server,
+                frontend.outcome.expect("game has an outcome"),
+            ),
             Screen::Game => unreachable!(),
         });
     frontend.root = Some(root);
@@ -452,10 +482,8 @@ fn title_screen(
     assets: &AssetServer,
     actions: &[(MenuAction, &str)],
 ) {
-    let mut background = ImageNode::new(assets.load("backgroundboard.png"));
-    background.color = Color::srgb(0.19, 0.16, 0.12);
     parent.spawn((
-        background,
+        ImageNode::new(assets.load("volatile.png")),
         Node {
             position_type: PositionType::Absolute,
             width: Val::Percent(100.0),
@@ -468,38 +496,30 @@ fn title_screen(
         .spawn(Node {
             width: Val::Percent(100.0),
             height: Val::Percent(100.0),
-            justify_content: JustifyContent::SpaceEvenly,
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::FlexEnd,
             align_items: AlignItems::Center,
+            padding: UiRect::bottom(Val::Px(if actions.len() > 3 { 24.0 } else { 52.0 })),
             ..default()
         })
-        .with_children(|row| {
-            row.spawn(Node {
-                width: Val::Px(430.0),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                ..default()
-            })
-            .with_children(|left| {
-                text(left, "ISA-METRIC GAMES", 19.0, GOLD);
-                text(left, "BEVY JAM 8", 52.0, TEXT);
-                text(left, "A game of elements and alchemy", 17.0, TEXT);
-            });
-            row.spawn(Node {
-                width: Val::Px(320.0),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Stretch,
-                row_gap: Val::Px(12.0),
-                ..default()
-            })
-            .with_children(|options| {
-                for &(action, label) in actions {
-                    button(options, action, label, 46.0);
-                }
-            });
+        .with_children(|screen| {
+            screen
+                .spawn(Node {
+                    width: Val::Px(276.0),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Stretch,
+                    row_gap: Val::Px(4.0),
+                    ..default()
+                })
+                .with_children(|options| {
+                    for (index, &(action, label)) in actions.iter().enumerate() {
+                        button(options, assets, action, label, 54.0, index == 0);
+                    }
+                });
         });
 }
 
-fn pause_screen(parent: &mut ChildSpawnerCommands) {
+fn pause_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
     parent
         .spawn((
             Node {
@@ -516,13 +536,13 @@ fn pause_screen(parent: &mut ChildSpawnerCommands) {
         ))
         .with_children(|content| {
             text(content, "PAUSED", 52.0, GOLD);
-            for (action, label) in PAUSE_ACTIONS {
-                button(content, action, label, 46.0);
+            for (index, (action, label)) in PAUSE_ACTIONS.into_iter().enumerate() {
+                button(content, assets, action, label, 46.0, index == 0);
             }
         });
 }
 
-fn game_over_screen(parent: &mut ChildSpawnerCommands, outcome: Outcome) {
+fn game_over_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer, outcome: Outcome) {
     parent
         .spawn((
             Node {
@@ -548,12 +568,26 @@ fn game_over_screen(parent: &mut ChildSpawnerCommands, outcome: Outcome) {
                 52.0,
                 GOLD,
             );
-            button(content, MenuAction::Computer, "NEW GAME", 46.0);
-            button(content, MenuAction::Back, "BACK TO MENU", 46.0);
+            button(
+                content,
+                assets,
+                MenuAction::Computer,
+                "NEW GAME",
+                46.0,
+                false,
+            );
+            button(
+                content,
+                assets,
+                MenuAction::Back,
+                "BACK TO MENU",
+                46.0,
+                false,
+            );
         });
 }
 
-fn credits_screen(parent: &mut ChildSpawnerCommands) {
+fn credits_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
     parent
         .spawn(Node {
             flex_direction: FlexDirection::Column,
@@ -565,11 +599,11 @@ fn credits_screen(parent: &mut ChildSpawnerCommands) {
             text(content, "CREDITS", 42.0, GOLD);
             text(content, "Isa-Metric Games", 26.0, TEXT);
             text(content, "Made with Bevy", 21.0, TEXT);
-            button(content, MenuAction::Back, "BACK", 42.0);
+            button(content, assets, MenuAction::Back, "BACK", 42.0, false);
         });
 }
 
-fn rulebook_screen(parent: &mut ChildSpawnerCommands, frontend: &Frontend) {
+fn rulebook_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer, frontend: &Frontend) {
     parent
         .spawn(Node {
             width: Val::Px(RESOLUTION_WIDTH - 100.0),
@@ -608,12 +642,12 @@ fn rulebook_screen(parent: &mut ChildSpawnerCommands, frontend: &Frontend) {
                     ..default()
                 })
                 .with_children(|row| {
-                    button(row, MenuAction::Back, "BACK", 42.0);
+                    button(row, assets, MenuAction::Back, "BACK", 42.0, false);
                     if frontend.page > 0 {
-                        button(row, MenuAction::Previous, "PREVIOUS", 42.0);
+                        button(row, assets, MenuAction::Previous, "PREVIOUS", 42.0, false);
                     }
                     if frontend.page + 1 < frontend.pages.len() {
-                        button(row, MenuAction::Next, "NEXT", 42.0);
+                        button(row, assets, MenuAction::Next, "NEXT", 42.0, false);
                     }
                 });
         });
@@ -631,30 +665,55 @@ fn text(parent: &mut ChildSpawnerCommands, value: &str, size: f32, color: Color)
     ));
 }
 
-fn button(parent: &mut ChildSpawnerCommands, action: MenuAction, label: &str, height: f32) {
+fn button(
+    parent: &mut ChildSpawnerCommands,
+    assets: &AssetServer,
+    action: MenuAction,
+    label: &str,
+    height: f32,
+    selected: bool,
+) {
     parent
         .spawn((
             Button,
             Hovered::default(),
             action,
             Node {
-                min_width: Val::Px(150.0),
+                min_width: Val::Px(210.0),
                 height: Val::Px(height),
                 padding: UiRect::horizontal(Val::Px(14.0)),
-                border: UiRect::all(Val::Px(2.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.08, 0.06, 0.05, 0.94)),
-            BorderColor::all(GOLD),
+            BackgroundColor(Color::NONE),
         ))
-        .with_children(|button| text(button, label, 17.0, TEXT));
+        .with_children(|button| {
+            button.spawn((
+                MenuButtonArt,
+                ImageNode {
+                    image: assets.load("button.png"),
+                    rect: Some(button_rect(selected)),
+                    ..default()
+                },
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Percent(-13.0),
+                    top: Val::Px(-height * 85.0 / 115.0),
+                    width: Val::Percent(129.0),
+                    height: Val::Px(height * 302.0 / 115.0),
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ));
+            text(button, label, 19.0, BUTTON_TEXT);
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::asset::{AssetApp, AssetPlugin};
     use std::time::Duration;
 
     #[derive(Resource, Default)]
@@ -672,6 +731,102 @@ mod tests {
         let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
         keys.release(key);
         keys.clear();
+    }
+
+    #[test]
+    fn title_uses_cover_and_compact_buttons_with_selection_art() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Frontend>();
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud))
+            .add_systems(Update, (handle_frontend, render_screen).chain());
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .show(Screen::Title);
+        app.update();
+
+        let world = app.world_mut();
+        let assets = world.resource::<AssetServer>();
+        let cover: Handle<Image> = assets.load("volatile.png");
+        let button_sheet: Handle<Image> = assets.load("button.png");
+        let mut images = world.query::<(&ImageNode, &Node)>();
+        let cover_node = images
+            .iter(world)
+            .find(|(image, _)| image.image == cover)
+            .unwrap()
+            .1;
+        assert_eq!(cover_node.width, Val::Percent(100.0));
+        assert_eq!(cover_node.height, Val::Percent(100.0));
+        let mut buttons = world.query_filtered::<(&MenuAction, &Node, &Children), With<Button>>();
+        let buttons: Vec<_> = buttons.iter(world).collect();
+        assert_eq!(buttons.len(), 3);
+        for (action, node, children) in buttons {
+            assert_eq!(node.height, Val::Px(54.0));
+            let image = children
+                .iter()
+                .find_map(|child| world.get::<ImageNode>(child))
+                .unwrap();
+            assert_eq!(image.image, button_sheet);
+            assert_eq!(
+                image.rect,
+                Some(button_rect(*action == MenuAction::Computer))
+            );
+        }
+
+        tap(&mut app, KeyCode::ArrowDown);
+        let world = app.world_mut();
+        let mut buttons = world.query_filtered::<(&MenuAction, &Children), With<Button>>();
+        for (action, children) in buttons.iter(world) {
+            let image = children
+                .iter()
+                .find_map(|child| world.get::<ImageNode>(child))
+                .unwrap();
+            assert_eq!(
+                image.rect,
+                Some(button_rect(*action == MenuAction::Credits))
+            );
+        }
+        let rulebook = world
+            .query_filtered::<(Entity, &MenuAction), With<Button>>()
+            .iter(world)
+            .find_map(|(entity, action)| (*action == MenuAction::Rulebook).then_some(entity))
+            .unwrap();
+        world.entity_mut(rulebook).insert(Hovered(true));
+        app.update();
+        let world = app.world_mut();
+        let mut buttons = world.query_filtered::<(&MenuAction, &Children), With<Button>>();
+        for (action, children) in buttons.iter(world) {
+            let image = children
+                .iter()
+                .find_map(|child| world.get::<ImageNode>(child))
+                .unwrap();
+            assert_eq!(
+                image.rect,
+                Some(button_rect(*action == MenuAction::Rulebook))
+            );
+        }
+
+        {
+            let mut frontend = app.world_mut().resource_mut::<Frontend>();
+            frontend.match_in_progress = true;
+            frontend.show(Screen::Title);
+        }
+        app.update();
+        let world = app.world_mut();
+        let mut buttons = world.query_filtered::<(&MenuAction, &Node, &Children), With<Button>>();
+        let buttons: Vec<_> = buttons.iter(world).collect();
+        assert_eq!(buttons.len(), 4);
+        for (action, node, children) in buttons {
+            assert_eq!(node.height, Val::Px(54.0));
+            let image = children
+                .iter()
+                .find_map(|child| world.get::<ImageNode>(child))
+                .unwrap();
+            assert_eq!(image.rect, Some(button_rect(*action == MenuAction::Resume)));
+        }
     }
 
     #[test]
