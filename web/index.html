@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VolaTile</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            background: #000;
+        }
+        body {
+            display: grid;
+            place-items: center;
+            overflow: hidden;
+        }
+        #game-container {
+            position: relative;
+            width: min(100vw, calc(100vh * 16 / 9));
+            aspect-ratio: 16 / 9;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            outline: none;
+        }
+        #status {
+            position: absolute;
+            inset: 0;
+            display: grid;
+            place-items: center;
+            color: #fff;
+            font: 16px sans-serif;
+            pointer-events: none;
+        }
+        #status:empty {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="game"></canvas>
+        <div id="status" role="status">Loading VolaTile...</div>
+    </div>
+    <script type="module">
+        import init from "./volatile.js";
+
+        const contexts = [];
+        if (window.AudioContext) {
+            window.AudioContext = new Proxy(window.AudioContext, {
+                construct(target, args) {
+                    const context = new target(...args);
+                    contexts.push(context);
+                    return context;
+                },
+            });
+        }
+        for (const event of ["pointerdown", "keydown"]) {
+            document.addEventListener(event, () => {
+                for (const context of contexts) {
+                    if (context.state === "suspended") {
+                        context.resume().catch(error => console.error("Could not resume audio:", error));
+                    }
+                }
+            });
+        }
+
+        const status = document.getElementById("status");
+        try {
+            await init();
+            status.textContent = "";
+        } catch (error) {
+            if (error instanceof Error && error.message.startsWith("Using exceptions for control flow")) {
+                status.textContent = "";
+            } else {
+                status.textContent = "Could not load VolaTile. Check the browser console for details.";
+                console.error("Could not load VolaTile:", error);
+            }
+        }
+    </script>
+</body>
+</html>

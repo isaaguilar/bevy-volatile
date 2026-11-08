@@ -1,5 +1,6 @@
 use bevy::ecs::system::RunSystemOnce;
 use bevy::{
+    asset::{AssetMetaCheck, AssetPlugin},
     camera::ScalingMode,
     ecs::system::SystemParam,
     image::{ImageLoaderSettings, ImageSampler},
@@ -1468,14 +1469,27 @@ fn must_land(turn: &TurnState, board: &Board, position: Vec2) -> bool {
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Bevy Jam 8".into(),
-                resolution: WindowResolution::new(1280, 720),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "VolaTile".into(),
+                        resolution: WindowResolution::new(1280, 720),
+                        canvas: Some("#game".into()),
+                        fit_canvas_to_parent: true,
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(AssetPlugin {
+                    meta_check: if cfg!(target_family = "wasm") {
+                        AssetMetaCheck::Never
+                    } else {
+                        AssetMetaCheck::default()
+                    },
+                    ..default()
+                }),
+        )
         .add_plugins(AspectRatioPlugin {
             resolution: Resolution {
                 width: RESOLUTION_WIDTH,
