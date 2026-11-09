@@ -30,26 +30,55 @@
         #status {
             position: absolute;
             inset: 0;
-            display: grid;
-            place-items: center;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            background: #070d1d url("./assets/cover.gif") center / cover no-repeat;
             color: #fff;
             font: 16px sans-serif;
-            pointer-events: none;
+            text-shadow: 0 1px 3px #000;
         }
-        #status:empty {
+        #status[hidden], [hidden] {
             display: none;
+        }
+        #loading-bar {
+            width: min(50%, 400px);
+            height: 20px;
+            border: 2px solid #fff;
+            border-radius: 4px;
+            overflow: hidden;
+            appearance: none;
+            background: #20170d;
+        }
+        #loading-bar::-webkit-progress-bar { background: #20170d; }
+        #loading-bar::-webkit-progress-value { background: #ed850d; }
+        #loading-bar::-moz-progress-bar { background: #ed850d; }
+        #loading-percent {
+            font-weight: bold;
         }
     </style>
 </head>
 <body>
     <div id="game-container">
         <canvas id="game"></canvas>
-        <div id="status" role="status">Loading VolaTile...</div>
+        <div id="status">
+            <div id="status-message" role="status" aria-live="polite">Loading VolaTile...</div>
+            <progress id="loading-bar" aria-label="Downloading game" value="0" max="1"></progress>
+            <div id="loading-percent" aria-hidden="true">0%</div>
+        </div>
     </div>
     <script type="module">
+        const status = document.getElementById("status");
+        const message = document.getElementById("status-message");
+        const loadingBar = document.getElementById("loading-bar");
+        const loadingPercent = document.getElementById("loading-percent");
         const contexts = [];
-        if (window.AudioContext) {
-            window.AudioContext = new Proxy(window.AudioContext, {
+
+        function trackAudioContext(name) {
+            if (!window[name]) return;
+            window[name] = new Proxy(window[name], {
                 construct(target, args) {
                     const context = new target(...args);
                     contexts.push(context);
@@ -57,29 +86,48 @@
                 },
             });
         }
-        for (const event of [
-            "pointerdown", "pointerup", "mousedown", "mouseup", "click",
-            "touchend", "keydown", "keyup", "contextmenu", "auxclick", "dblclick",
-        ]) {
-            document.addEventListener(event, () => {
-                for (const context of contexts) {
-                    if (context.state === "suspended") {
-                        context.resume().catch(error => console.error("Could not resume audio:", error));
-                    }
-                }
-            });
+        trackAudioContext("AudioContext");
+        trackAudioContext("webkitAudioContext");
+
+        function resumeAudio() {
+            return contexts
+                .filter(context => context.state === "suspended" || context.state === "interrupted")
+                .map(context => context.resume());
         }
 
-        const status = document.getElementById("status");
+        for (const event of [
+            "pointerdown", "mousedown", "touchend", "keydown",
+        ]) {
+            document.addEventListener(event, () => {
+                for (const attempt of resumeAudio()) {
+                    attempt.catch(error => console.error("Could not resume audio:", error));
+                }
+            }, { capture: true, passive: true });
+        }
+
+        function ready() {
+            status.hidden = true;
+        }
+
         try {
-            const { default: init } = await import("./volatile.js");
-            await init();
-            status.textContent = "";
+            const [{ default: init }, { fetchWasm }] = await Promise.all([
+                import("./volatile.js"),
+                import("./loading.mjs"),
+            ]);
+            const wasm = await fetchWasm((loaded, total) => {
+                loadingBar.value = loaded / total;
+                loadingPercent.textContent = `${Math.floor(100 * loaded / total)}%`;
+                if (loaded === total) message.textContent = "Preparing game...";
+            });
+            await init({ module_or_path: wasm });
+            ready();
         } catch (error) {
             if (error instanceof Error && error.message.startsWith("Using exceptions for control flow")) {
-                status.textContent = "";
+                ready();
             } else {
-                status.textContent = "Could not load VolaTile. Check the browser console for details.";
+                loadingBar.hidden = true;
+                loadingPercent.hidden = true;
+                message.textContent = "Could not load VolaTile. Check the browser console for details.";
                 console.error("Could not load VolaTile:", error);
             }
         }

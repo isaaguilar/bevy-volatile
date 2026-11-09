@@ -20,11 +20,13 @@ wasm-build:
 	mkdir -p $(WEB_DIR)
 	$(WASM_BINDGEN) --no-typescript --target web --out-name volatile --out-dir $(WEB_DIR) $(WASM_FILE)
 	cp web/index.html $(WEB_DIR)/index.html
+	cp web/loading.mjs $(WEB_DIR)/loading.mjs
+	printf '{"bytes":%s}\n' "$$(wc -c < $(WEB_DIR)/volatile_bg.wasm | tr -d '[:space:]')" > $(WEB_DIR)/wasm-size.json
 	cp -R assets $(WEB_DIR)/assets
 
 wasm-zip: wasm-build
 	rm -f target/volatile.zip
-	cd $(WEB_DIR) && zip -rq ../volatile.zip index.html volatile.js volatile_bg.wasm assets -x '*/.DS_Store'
+	cd $(WEB_DIR) && zip -rq ../volatile.zip index.html loading.mjs wasm-size.json volatile.js volatile_bg.wasm assets -x '*/.DS_Store'
 	mv target/volatile.zip game.zip
 	@echo "Created game.zip for itch.io"
 
