@@ -4,7 +4,15 @@ WASM_FILE := target/$(WASM_TARGET)/release/volatile.wasm
 WASM_BINDGEN ?= $(if $(wildcard target/volatile-tools/bin/wasm-bindgen),target/volatile-tools/bin/wasm-bindgen,wasm-bindgen)
 PORT ?= 8000
 
-.PHONY: wasm-build wasm-zip wasm-run
+-include .env.local
+ifdef VOLATILE_SERVER_URL
+export VOLATILE_SERVER_URL
+endif
+
+.PHONY: wasm-build wasm-zip wasm-run build-server
+
+build-server:
+	docker build --file server/Dockerfile --output type=local,dest=server/target/x86_64-unknown-linux-gnu/release .
 
 wasm-build:
 	cargo build --locked --release --target $(WASM_TARGET)
@@ -21,5 +29,5 @@ wasm-zip: wasm-build
 	@echo "Created game.zip for itch.io"
 
 wasm-run: wasm-build
-	@echo "Serving VolaTile at http://localhost:$(PORT)"
+	@echo "Serving VolaTile at http://127.0.0.1:$(PORT)"
 	python3 -m http.server $(PORT) --bind 127.0.0.1 --directory $(WEB_DIR)

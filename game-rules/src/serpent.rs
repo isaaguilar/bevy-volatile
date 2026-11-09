@@ -28,6 +28,25 @@ pub struct SerpentStep {
 }
 
 impl Serpent {
+    pub fn from_visual(visual: &SerpentVisual) -> Result<Self, &'static str> {
+        if visual.cells.is_empty()
+            || visual.cells.len() > LENGTH
+            || visual.cells.iter().any(|cell| {
+                cell.x < 0
+                    || cell.y < 0
+                    || cell.x >= crate::board::COLUMNS as i32
+                    || cell.y >= crate::board::ROWS as i32
+            })
+        {
+            return Err("Invalid serpent");
+        }
+        Ok(Self {
+            body: visual.cells.clone(),
+            poison_age: visual.venomous.then_some(0),
+            straight_frame: visual.straight_frame,
+        })
+    }
+
     pub fn new(origin: IVec2, board: &Board, players: [Option<IVec2>; 2], health: [u8; 2]) -> Self {
         let safe = |cell| {
             board
@@ -81,7 +100,7 @@ impl Serpent {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cells(&self) -> impl Iterator<Item = IVec2> + '_ {
         self.body.iter().copied()
     }

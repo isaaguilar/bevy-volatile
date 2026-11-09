@@ -1,3 +1,8 @@
 /target
+/server/target
+/game-rules/target
+/online-protocol/target
+/game-rules/Cargo.lock
 /game.zip
+/.env.local
 .DS_Store

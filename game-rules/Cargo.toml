@@ -1,0 +1,12 @@
+[package]
+name = "volatile-game-rules"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+test-support = []
+
+[dependencies]
+bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_color"] }
+bevy_rand = { version = "0.16", features = ["wyrand"] }
+rand = "0.10"

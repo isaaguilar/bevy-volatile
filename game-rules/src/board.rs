@@ -13,7 +13,7 @@ pub const MAX_UNSAFE_TILES: usize = COLUMNS * ROWS * 60 / 100;
 pub const PLAYER_STARTS: [IVec2; 2] = [IVec2::new(2, 3), IVec2::new(7, 3)];
 const RIDGE_COUNT: usize = 6;
 const WATER_COUNT: usize = 10;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const WATER_TURNS: u8 = 5;
 const POISON_TURNS: u8 = 2;
 const LIFE_ESSENCE_TURNS: u8 = 3;
@@ -32,6 +32,20 @@ pub enum Ground {
 pub enum TerrainGrowthKind {
     Void,
     Stone,
+}
+
+#[derive(Clone)]
+pub struct VisualTile {
+    pub ground: Ground,
+    pub wet: u8,
+    pub oil: bool,
+    pub frozen: bool,
+    pub poison: bool,
+    pub acid: bool,
+    pub electrified: bool,
+    pub life: bool,
+    pub thorns: bool,
+    pub growth: Option<TerrainGrowthKind>,
 }
 
 impl Ground {
@@ -68,6 +82,8 @@ pub struct Board {
     new_holes: Vec<IVec2>,
     new_unsafe: Vec<IVec2>,
     terrain_limit_hit: bool,
+    visual_thorns: Option<[bool; COLUMNS * ROWS]>,
+    visual_growth: Option<[Option<TerrainGrowthKind>; COLUMNS * ROWS]>,
 }
 
 #[derive(Clone, Copy)]
@@ -106,11 +122,59 @@ impl Default for Board {
             new_holes: Vec::new(),
             new_unsafe: Vec::new(),
             terrain_limit_hit: false,
+            visual_thorns: None,
+            visual_growth: None,
         }
     }
 }
 
 impl Board {
+    pub fn from_visual(
+        tiles: &[VisualTile],
+        aquatic: &[crate::aquatic::AquaticVisual],
+    ) -> Result<Self, &'static str> {
+        if tiles.len() != COLUMNS * ROWS {
+            return Err("Invalid board size");
+        }
+        if aquatic.iter().any(|visual| {
+            Self::index(visual.origin).is_none() || visual.lengths.iter().any(|length| *length > 3)
+        }) {
+            return Err("Invalid aquatic creature");
+        }
+        let mut board = Self::default();
+        let mut thorns = [false; COLUMNS * ROWS];
+        let mut growth = [None; COLUMNS * ROWS];
+        for (index, tile) in tiles.iter().enumerate() {
+            if tile.wet > 100 || tile.wet % 20 != 0 || (tile.electrified && !tile.acid) {
+                return Err("Invalid tile state");
+            }
+            board.tiles[index] = tile.ground;
+            board.wet[index] = tile.wet / 20;
+            board.oil[index] = tile.oil;
+            board.frozen[index] = tile.frozen;
+            board.life_essence[index] = u8::from(tile.life);
+            if tile.acid {
+                board.acid[index] = Some(Acid {
+                    permanent: true,
+                    turns: 0,
+                    fresh: false,
+                    electric_turns: u8::from(tile.electrified),
+                    electric_fresh: false,
+                });
+            }
+            if tile.poison {
+                let cell = IVec2::new((index % COLUMNS) as i32, (index / COLUMNS) as i32);
+                board.add_poison(cell);
+            }
+            thorns[index] = tile.thorns;
+            growth[index] = tile.growth;
+        }
+        board.visual_thorns = Some(thorns);
+        board.visual_growth = Some(growth);
+        board.aquatic_creatures = aquatic.iter().map(AquaticCreature::from_visual).collect();
+        Ok(board)
+    }
+
     pub fn generate(rng: &mut impl Rng) -> Self {
         let mut board = Self::default();
         let mut candidates: Vec<_> = (0..ROWS)
@@ -160,7 +224,7 @@ impl Board {
         self.wet[Self::index(cell).expect("board cell must be in bounds")] * 20
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn make_wet(&mut self, cell: IVec2) {
         self.wet[Self::index(cell).expect("board cell must be in bounds")] = WATER_TURNS;
     }
@@ -263,7 +327,10 @@ impl Board {
     }
 
     pub fn has_thorns(&self, cell: IVec2) -> bool {
-        self.thorns.contains(cell)
+        self.visual_thorns
+            .as_ref()
+            .and_then(|thorns| Self::index(cell).map(|index| thorns[index]))
+            .unwrap_or_else(|| self.thorns.contains(cell))
     }
 
     pub fn activate_aquatic(&mut self, cell: IVec2) {
@@ -432,12 +499,22 @@ impl Board {
         self.terrain_growth
             .iter()
             .flat_map(|(_, growth)| growth.cells())
+            .chain(self.visual_growth.iter().flat_map(|growth| {
+                growth.iter().enumerate().filter_map(|(index, kind)| {
+                    kind.map(|_| IVec2::new((index % COLUMNS) as i32, (index / COLUMNS) as i32))
+                })
+            }))
     }
 
     pub fn terrain_growth_kind_at(&self, cell: IVec2) -> Option<TerrainGrowthKind> {
         self.terrain_growth
             .iter()
             .find_map(|(kind, growth)| growth.cells().any(|part| part == cell).then_some(*kind))
+            .or_else(|| {
+                self.visual_growth
+                    .as_ref()
+                    .and_then(|growth| Self::index(cell).and_then(|index| growth[index]))
+            })
     }
 
     pub fn advance_terrain_growth(&mut self) {

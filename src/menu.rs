@@ -7,11 +7,13 @@ use bevy::{
 use bevy_aspect_ratio_mask::Hud;
 
 use crate::{
-    INVENTORY_ITEMS, INVENTORY_ORDER, InventoryImages, PlayerHealth, RESOLUTION_HEIGHT,
-    RESOLUTION_WIDTH,
+    GRID_BLOCK_SIZE, INVENTORY_ITEMS, INVENTORY_ORDER, InventoryImages, PlayerHealth,
+    RESOLUTION_HEIGHT, RESOLUTION_WIDTH,
     audio_settings::{AudioChannel, AudioSettings},
     help, history,
+    online::{Connection, Online},
 };
+use volatile_online_protocol::{ClientMessage, Seat};
 
 const SPLASH_SECONDS: f32 = 1.5;
 const RULEBOOK_BASICS: &str = concat!(
@@ -26,6 +28,7 @@ const RULEBOOK_BASICS: &str = concat!(
 const GOLD: Color = Color::srgb(0.86, 0.68, 0.32);
 const TEXT: Color = Color::srgb(1.0, 0.94, 0.78);
 const BUTTON_TEXT: Color = Color::srgb(0.08, 0.08, 0.08);
+const LOBBY_BACKGROUND: Color = Color::srgb(0.025, 0.045, 0.11);
 
 fn button_rect(selected: bool) -> Rect {
     let top = if selected { 302.0 } else { 0.0 };
@@ -72,7 +75,21 @@ pub(crate) fn plugin(app: &mut App) {
                 .chain()
                 .after(FrontendSystems)
                 .run_if(in_rulebook),
+        )
+        .add_systems(
+            Update,
+            (
+                history::scroll::<LobbyViewport>,
+                history::update_scrollbar::<LobbyViewport, LobbyScrollbar>,
+            )
+                .chain()
+                .after(FrontendSystems)
+                .run_if(in_lobby),
         );
+}
+
+fn in_lobby(frontend: Res<Frontend>) -> bool {
+    frontend.screen == Screen::Lobby
 }
 
 fn in_rulebook(frontend: Res<Frontend>) -> bool {
@@ -87,6 +104,9 @@ enum Screen {
     Options,
     Credits,
     Rulebook,
+    Lobby,
+    Room,
+    Pin,
     Game,
     Paused,
     GameOver,
@@ -104,6 +124,7 @@ enum GameMode {
     Computer,
     #[allow(dead_code)]
     TwoPlayer,
+    Online,
 }
 
 #[derive(Resource)]
@@ -148,6 +169,37 @@ impl Frontend {
         self.screen == Screen::Game && self.mode == Some(GameMode::Computer)
     }
 
+    pub(crate) fn online_game(&self) -> bool {
+        self.mode == Some(GameMode::Online) && self.screen == Screen::Game
+    }
+
+    pub(crate) fn online_history_visible(&self) -> bool {
+        self.mode == Some(GameMode::Online)
+            && matches!(self.screen, Screen::Game | Screen::GameOver)
+    }
+
+    pub(crate) fn online_game_over(&self) -> bool {
+        self.mode == Some(GameMode::Online) && self.screen == Screen::GameOver
+    }
+
+    pub(crate) fn has_online_match(&self) -> bool {
+        self.mode == Some(GameMode::Online)
+    }
+
+    pub(crate) fn enter_online_match(&mut self) {
+        self.mode = Some(GameMode::Online);
+        self.outcome = None;
+        self.match_in_progress = true;
+        self.restart_requested = false;
+        self.show(Screen::Game);
+    }
+
+    pub(crate) fn end_online_match(&mut self, in_room: bool) {
+        self.mode = None;
+        self.match_in_progress = false;
+        self.show(if in_room { Screen::Room } else { Screen::Lobby });
+    }
+
     #[cfg(test)]
     pub(crate) fn computer_match() -> Self {
         let mut frontend = Self::default();
@@ -168,6 +220,7 @@ impl Frontend {
         match self.screen {
             Screen::Title if self.match_in_progress => &ACTIVE_TITLE_ACTIONS,
             Screen::Title => &TITLE_ACTIONS,
+            Screen::Paused if self.has_online_match() => &ONLINE_PAUSE_ACTIONS,
             Screen::Paused => &PAUSE_ACTIONS,
             Screen::Options => &OPTIONS_ACTIONS,
             _ => &[],
@@ -198,8 +251,19 @@ impl Frontend {
                 self.rulebook_selected = 0;
                 self.show(Screen::Rulebook);
             }
+            MenuAction::Online => self.show(Screen::Lobby),
             MenuAction::Back => self.show(Screen::Title),
-            MenuAction::RulebookItem(_) | MenuAction::Music | MenuAction::Sfx => {}
+            MenuAction::RulebookItem(_)
+            | MenuAction::Music
+            | MenuAction::Sfx
+            | MenuAction::CreateRoom
+            | MenuAction::JoinRoom(_)
+            | MenuAction::PinDigit(_)
+            | MenuAction::PinClear
+            | MenuAction::PinSubmit
+            | MenuAction::LeaveRoom
+            | MenuAction::StartOnlineGame
+            | MenuAction::Connect => {}
         }
     }
 
@@ -220,6 +284,12 @@ struct RulebookViewport;
 #[derive(Component)]
 struct RulebookScrollbar;
 
+#[derive(Component)]
+struct LobbyViewport;
+
+#[derive(Component)]
+struct LobbyScrollbar;
+
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAction {
     Computer,
@@ -231,23 +301,34 @@ enum MenuAction {
     Music,
     Sfx,
     Rulebook,
+    Online,
+    CreateRoom,
+    JoinRoom(u128),
+    PinDigit(u8),
+    PinClear,
+    PinSubmit,
+    LeaveRoom,
+    StartOnlineGame,
+    Connect,
     Back,
     RulebookItem(usize),
 }
 
-const TITLE_ACTIONS: [(MenuAction, &str); 4] = [
+const TITLE_ACTIONS: [(MenuAction, &str); 5] = [
     (MenuAction::Computer, "PLAY VS COMPUTER"),
     (MenuAction::Credits, "CREDITS"),
     (MenuAction::Rulebook, "RULEBOOK"),
     (MenuAction::Options, "OPTIONS"),
+    (MenuAction::Online, "PLAY ONLINE"),
 ];
 
-const ACTIVE_TITLE_ACTIONS: [(MenuAction, &str); 5] = [
+const ACTIVE_TITLE_ACTIONS: [(MenuAction, &str); 6] = [
     (MenuAction::Resume, "RESUME"),
     (MenuAction::Computer, "START NEW GAME"),
     (MenuAction::Credits, "CREDITS"),
     (MenuAction::Rulebook, "RULEBOOK"),
     (MenuAction::Options, "OPTIONS"),
+    (MenuAction::Online, "PLAY ONLINE"),
 ];
 
 const OPTIONS_ACTIONS: [(MenuAction, &str); 3] = [
@@ -260,13 +341,17 @@ const PAUSE_ACTIONS: [(MenuAction, &str); 2] = [
     (MenuAction::Resume, "RESUME"),
     (MenuAction::Back, "BACK TO MENU"),
 ];
+const ONLINE_PAUSE_ACTIONS: [(MenuAction, &str); 2] = [
+    (MenuAction::Resume, "RESUME"),
+    (MenuAction::LeaveRoom, "LEAVE ROOM"),
+];
 
 pub(crate) fn pause_match(
     keyboard: Res<ButtonInput<KeyCode>>,
     help: Option<Res<crate::help::Help>>,
     mut frontend: ResMut<Frontend>,
 ) {
-    if frontend.computer_game()
+    if (frontend.computer_game() || frontend.online_game())
         && keyboard.just_pressed(KeyCode::Escape)
         && help.is_none_or(crate::help::closed)
     {
@@ -278,6 +363,7 @@ pub(crate) fn pause_match(
 pub(crate) fn detect_game_over(
     health: Res<PlayerHealth>,
     turn: Option<Res<crate::TurnState>>,
+    online: Option<Res<Online>>,
     mut frontend: ResMut<Frontend>,
 ) {
     if frontend.screen != Screen::Game
@@ -287,7 +373,14 @@ pub(crate) fn detect_game_over(
     {
         return;
     }
-    let outcome = match health.0 {
+    let health = if frontend.has_online_match()
+        && online.as_ref().and_then(|online| online.seat) == Some(Seat::Guest)
+    {
+        [health.0[1], health.0[0]]
+    } else {
+        health.0
+    };
+    let outcome = match health {
         [0, 0] => Some(Outcome::Draw),
         [0, _] => Some(Outcome::Lose),
         [_, 0] => Some(Outcome::Win),
@@ -304,6 +397,18 @@ pub(crate) fn in_game(frontend: Res<Frontend>) -> bool {
     frontend.screen == Screen::Game
 }
 
+pub(crate) fn in_game_or_online_game_over(frontend: Res<Frontend>) -> bool {
+    frontend.screen == Screen::Game || frontend.online_game_over()
+}
+
+pub(crate) fn in_online_game(frontend: Res<Frontend>) -> bool {
+    frontend.online_game()
+}
+
+pub(crate) fn in_local_game(frontend: Res<Frontend>) -> bool {
+    frontend.screen == Screen::Game && !frontend.has_online_match()
+}
+
 type MenuButton = (
     Ref<'static, Hovered>,
     &'static MenuAction,
@@ -318,10 +423,14 @@ fn handle_frontend(
     mut button_art: Query<&mut ImageNode, With<MenuButtonArt>>,
     pressed_buttons: Query<&MenuAction, Added<Pressed>>,
     help_close: Query<(), (With<help::HelpClose>, Added<Pressed>)>,
-    mut sounds: Option<ResMut<crate::sound::SoundCues>>,
+    services: (
+        Option<ResMut<crate::sound::SoundCues>>,
+        Option<ResMut<Online>>,
+    ),
 ) {
     let (time, keyboard) = input;
     let (mut frontend, mut audio, mut help) = state;
+    let (mut sounds, mut online) = services;
     if frontend.screen == Screen::Game {
         return;
     }
@@ -392,12 +501,32 @@ fn handle_frontend(
         }
         if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
             let action = actions[frontend.selected].0;
-            activate_action(&mut frontend, &mut audio, &mut help, action);
+            activate_action(
+                &mut frontend,
+                &mut audio,
+                &mut help,
+                online.as_deref_mut(),
+                action,
+            );
             crate::sound::request(&mut sounds, crate::sound::Cue::Select);
             return;
         }
     } else if keyboard.just_pressed(KeyCode::Escape) {
-        frontend.activate(MenuAction::Back);
+        let action = if frontend.screen == Screen::Room {
+            MenuAction::LeaveRoom
+        } else if frontend.screen == Screen::Pin {
+            frontend.show(Screen::Lobby);
+            return;
+        } else {
+            MenuAction::Back
+        };
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            online.as_deref_mut(),
+            action,
+        );
         crate::sound::request(&mut sounds, crate::sound::Cue::Select);
         return;
     } else if frontend.screen == Screen::Rulebook {
@@ -462,7 +591,24 @@ fn handle_frontend(
         };
     }
     if let Some(action) = pressed_buttons.iter().next() {
-        activate_action(&mut frontend, &mut audio, &mut help, *action);
+        if frontend.screen == Screen::Pin
+            && !matches!(
+                action,
+                MenuAction::PinDigit(_)
+                    | MenuAction::PinClear
+                    | MenuAction::PinSubmit
+                    | MenuAction::Back
+            )
+        {
+            return;
+        }
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            online.as_deref_mut(),
+            *action,
+        );
         crate::sound::request(&mut sounds, crate::sound::Cue::Select);
     }
 }
@@ -471,12 +617,82 @@ fn activate_action(
     frontend: &mut Frontend,
     audio: &mut AudioSettings,
     help: &mut help::Help,
+    online: Option<&mut Online>,
     action: MenuAction,
 ) {
+    if let Some(online) = online {
+        match action {
+            MenuAction::Online | MenuAction::Connect => {
+                if online.connection == Connection::Disconnected {
+                    if cfg!(target_family = "wasm") {
+                        online.connect_requested = true;
+                    } else {
+                        online.status = "Online lobby is available in the browser build".into();
+                    }
+                }
+            }
+            MenuAction::CreateRoom
+                if online.connection == Connection::Connected && !online.pending =>
+            {
+                online.pin.clear();
+                online.pin_room = None;
+                online.status.clear();
+                frontend.show(Screen::Pin);
+            }
+            MenuAction::JoinRoom(id)
+                if online.connection == Connection::Connected && !online.pending =>
+            {
+                let room_id = format!("{id:032x}");
+                if let Some(room) = online.rooms.iter().find(|room| room.id == room_id) {
+                    if room.locked {
+                        online.pin.clear();
+                        online.pin_room = Some(room_id);
+                        online.status = "Enter the room PIN".into();
+                        frontend.show(Screen::Pin);
+                    } else {
+                        online.send(ClientMessage::JoinRoom { room_id, pin: None });
+                    }
+                }
+            }
+            MenuAction::PinDigit(digit) if online.pin.len() < 3 => {
+                online.pin.push(char::from(b'0' + digit));
+            }
+            MenuAction::PinClear => {
+                online.pin.clear();
+            }
+            MenuAction::PinSubmit
+                if online.pin.len() == 3
+                    || (online.pin.is_empty() && online.pin_room.is_none()) =>
+            {
+                let pin = (!online.pin.is_empty()).then(|| online.pin.clone());
+                if let Some(room_id) = online.pin_room.clone() {
+                    online.send(ClientMessage::JoinRoom { room_id, pin });
+                } else {
+                    online.send(ClientMessage::CreateRoom { pin });
+                }
+            }
+            MenuAction::PinSubmit => online.status = "Enter three digits".into(),
+            MenuAction::LeaveRoom => {
+                if online.connection == Connection::Connected {
+                    online.send(ClientMessage::LeaveRoom);
+                } else {
+                    online.clear_room();
+                    online.status = "Left room".into();
+                }
+            }
+            MenuAction::StartOnlineGame
+                if frontend.screen == Screen::Room && can_start_online_game(online) =>
+            {
+                online.send(ClientMessage::StartMatch);
+            }
+            _ => {}
+        }
+    }
     match action {
         MenuAction::Music => audio.toggle(AudioChannel::Music),
         MenuAction::Sfx => audio.toggle(AudioChannel::Sfx),
         MenuAction::RulebookItem(index) => help.open(index),
+        MenuAction::Back if frontend.screen == Screen::Pin => frontend.show(Screen::Lobby),
         _ => frontend.activate(action),
     }
 }
@@ -487,9 +703,30 @@ fn render_screen(
     asset_server: Res<AssetServer>,
     images: Res<InventoryImages>,
     mut frontend: ResMut<Frontend>,
-    audio: Res<AudioSettings>,
+    ui: (
+        Res<AudioSettings>,
+        Query<&ScrollPosition, With<LobbyViewport>>,
+    ),
+    online: Option<Res<Online>>,
 ) {
-    if !frontend.dirty && !(frontend.screen == Screen::Options && audio.is_changed()) {
+    let (audio, lobby_scroll) = ui;
+    let scroll_position = lobby_scroll
+        .single()
+        .map(|position| position.y)
+        .unwrap_or_default();
+    let online_changed = online.as_ref().is_some_and(|online| online.is_changed())
+        && matches!(frontend.screen, Screen::Lobby | Screen::Room | Screen::Pin);
+    if let Some(online) = online.as_deref() {
+        if online.room_id.is_some() && matches!(frontend.screen, Screen::Lobby | Screen::Pin) {
+            frontend.show(Screen::Room);
+        } else if online.room_id.is_none() && frontend.screen == Screen::Room {
+            frontend.show(Screen::Lobby);
+        }
+    }
+    if !frontend.dirty
+        && !online_changed
+        && !(frontend.screen == Screen::Options && audio.is_changed())
+    {
         return;
     }
     frontend.dirty = false;
@@ -513,6 +750,8 @@ fn render_screen(
             BackgroundColor(
                 if matches!(frontend.screen, Screen::GameOver | Screen::Paused) {
                     Color::srgba(0.0, 0.0, 0.0, 0.65)
+                } else if matches!(frontend.screen, Screen::Lobby | Screen::Room | Screen::Pin) {
+                    LOBBY_BACKGROUND
                 } else {
                     Color::BLACK
                 },
@@ -545,7 +784,16 @@ fn render_screen(
             Screen::Options => options_screen(parent, &asset_server, &frontend, &audio),
             Screen::Credits => credits_screen(parent, &asset_server),
             Screen::Rulebook => rulebook_screen(parent, &asset_server, &frontend, &images),
-            Screen::Paused => pause_screen(parent, &asset_server),
+            Screen::Lobby => lobby_screen(parent, online.as_deref(), scroll_position),
+            Screen::Room => room_screen(parent, online.as_deref()),
+            Screen::Pin => {
+                lobby_screen(parent, online.as_deref(), scroll_position);
+                pin_screen(parent, online.as_deref());
+            }
+            Screen::Paused => pause_screen(parent, &asset_server, frontend.actions()),
+            Screen::GameOver if frontend.has_online_match() => {
+                online_game_over_screen(parent, frontend.outcome.expect("game has an outcome"))
+            }
             Screen::GameOver => game_over_screen(
                 parent,
                 &asset_server,
@@ -612,6 +860,466 @@ fn title_screen(
         });
 }
 
+fn lobby_screen(parent: &mut ChildSpawnerCommands, online: Option<&Online>, scroll_position: f32) {
+    parent
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            width: Val::Px(RESOLUTION_WIDTH),
+            height: Val::Px(RESOLUTION_HEIGHT),
+            ..default()
+        })
+        .with_children(|content| {
+            content
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Percent(100.0),
+                    height: Val::Px(GRID_BLOCK_SIZE),
+                    padding: UiRect::all(Val::Px(10.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|header| text(header, "ONLINE LOBBY", 32.0, GOLD));
+
+            content
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(GRID_BLOCK_SIZE),
+                    left: Val::Px(0.0),
+                    width: Val::Px(3.0 * GRID_BLOCK_SIZE),
+                    height: Val::Px(7.0 * GRID_BLOCK_SIZE),
+                    padding: UiRect::all(Val::Px(10.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(12.0),
+                    ..default()
+                })
+                .with_children(|sidebar| {
+                    if let Some(online) = online {
+                        if online.connection == Connection::Disconnected {
+                            lobby_button(sidebar, MenuAction::Connect, "CONNECT", 160.0, true);
+                        } else {
+                            lobby_button(
+                                sidebar,
+                                MenuAction::CreateRoom,
+                                "CREATE GAME",
+                                160.0,
+                                online.connection == Connection::Connected && !online.pending,
+                            );
+                        }
+                    }
+                });
+
+            content
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(GRID_BLOCK_SIZE),
+                    left: Val::Px(3.0 * GRID_BLOCK_SIZE),
+                    width: Val::Px(13.0 * GRID_BLOCK_SIZE),
+                    height: Val::Px(7.0 * GRID_BLOCK_SIZE),
+                    padding: UiRect::all(Val::Px(10.0)),
+                    column_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|list| {
+                    let viewport = list
+                        .spawn((
+                            LobbyViewport,
+                            Hovered::default(),
+                            ScrollPosition(Vec2::new(0.0, scroll_position)),
+                            Node {
+                                flex_grow: 1.0,
+                                min_width: Val::Px(0.0),
+                                height: Val::Percent(100.0),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(8.0),
+                                overflow: Overflow::scroll_y(),
+                                ..default()
+                            },
+                        ))
+                        .with_children(|rows| {
+                            if let Some(online) = online {
+                                if online.rooms.is_empty() {
+                                    text(rows, "No games available", 18.0, TEXT);
+                                }
+                                for room in &online.rooms {
+                                    if room.id.len() != 32 || !room.id.is_ascii() {
+                                        continue;
+                                    }
+                                    let Ok(id) = u128::from_str_radix(&room.id, 16) else {
+                                        continue;
+                                    };
+                                    rows.spawn((
+                                        Button,
+                                        Hovered::default(),
+                                        MenuAction::JoinRoom(id),
+                                        Node {
+                                            width: Val::Percent(100.0),
+                                            height: Val::Px(50.0),
+                                            flex_shrink: 0.0,
+                                            padding: UiRect::horizontal(Val::Px(14.0)),
+                                            column_gap: Val::Px(12.0),
+                                            align_items: AlignItems::Center,
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.08, 0.06, 0.05)),
+                                    ))
+                                    .with_children(|entry| {
+                                        if room.locked {
+                                            lock_icon(entry);
+                                        }
+                                        entry
+                                            .spawn(Node {
+                                                flex_grow: 1.0,
+                                                min_width: Val::Px(0.0),
+                                                ..default()
+                                            })
+                                            .with_children(|name| {
+                                                text(name, &room.name, 19.0, TEXT)
+                                            });
+                                        if room.locked {
+                                            text(entry, "LOCKED", 14.0, GOLD);
+                                        }
+                                        text(
+                                            entry,
+                                            if room.occupancy < 2 {
+                                                "Waiting for opponent"
+                                            } else {
+                                                "Game in progress"
+                                            },
+                                            15.0,
+                                            TEXT,
+                                        );
+                                    });
+                                }
+                            }
+                        })
+                        .id();
+                    list.spawn((
+                        LobbyScrollbar,
+                        Visibility::Hidden,
+                        Node {
+                            width: Val::Px(10.0),
+                            height: Val::Percent(100.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.4, 0.3, 0.18, 0.6)),
+                        Scrollbar {
+                            orientation: ControlOrientation::Vertical,
+                            target: viewport,
+                            min_thumb_length: 12.0,
+                        },
+                    ))
+                    .with_children(|bar| {
+                        bar.spawn((
+                            Hovered::default(),
+                            BackgroundColor(GOLD),
+                            ScrollbarThumb {
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                border: UiRect::ZERO,
+                            },
+                        ));
+                    });
+                });
+
+            content
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    top: Val::Px(8.0 * GRID_BLOCK_SIZE),
+                    width: Val::Px(3.0 * GRID_BLOCK_SIZE),
+                    height: Val::Px(GRID_BLOCK_SIZE),
+                    padding: UiRect::all(Val::Px(10.0)),
+                    ..default()
+                })
+                .with_children(|footer| {
+                    lobby_button(footer, MenuAction::Back, "BACK", 160.0, true)
+                });
+
+            content
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(3.0 * GRID_BLOCK_SIZE),
+                    top: Val::Px(8.0 * GRID_BLOCK_SIZE),
+                    width: Val::Px(10.0 * GRID_BLOCK_SIZE),
+                    height: Val::Px(GRID_BLOCK_SIZE),
+                    padding: UiRect::all(Val::Px(10.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|footer| {
+                    text(
+                        footer,
+                        online.map_or("Online services unavailable", |online| &online.status),
+                        14.0,
+                        TEXT,
+                    );
+                });
+        });
+}
+
+fn lobby_button(
+    parent: &mut ChildSpawnerCommands,
+    action: MenuAction,
+    label: &str,
+    width: f32,
+    enabled: bool,
+) {
+    let mut button = parent.spawn((
+        Node {
+            width: Val::Px(width),
+            height: Val::Px(40.0),
+            border: UiRect::all(Val::Px(1.0)),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BackgroundColor(if enabled {
+            Color::srgb(0.08, 0.06, 0.05)
+        } else {
+            Color::srgb(0.13, 0.14, 0.17)
+        }),
+        BorderColor::all(if enabled {
+            GOLD
+        } else {
+            Color::srgb(0.3, 0.3, 0.3)
+        }),
+    ));
+    if enabled {
+        button.insert((Button, Hovered::default(), action));
+    } else {
+        button.insert(Pickable::IGNORE);
+    }
+    button.with_children(|content| {
+        text(
+            content,
+            label,
+            16.0,
+            if enabled {
+                TEXT
+            } else {
+                Color::srgb(0.5, 0.5, 0.5)
+            },
+        )
+    });
+}
+
+fn lock_icon(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn((
+            Node {
+                width: Val::Px(20.0),
+                height: Val::Px(24.0),
+                ..default()
+            },
+            Pickable::IGNORE,
+        ))
+        .with_children(|icon| {
+            icon.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(4.0),
+                    top: Val::Px(0.0),
+                    width: Val::Px(12.0),
+                    height: Val::Px(15.0),
+                    border: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BorderColor::all(GOLD),
+                Pickable::IGNORE,
+            ));
+            icon.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(1.0),
+                    top: Val::Px(10.0),
+                    width: Val::Px(18.0),
+                    height: Val::Px(13.0),
+                    border_radius: BorderRadius::all(Val::Px(2.0)),
+                    ..default()
+                },
+                BackgroundColor(GOLD),
+                Pickable::IGNORE,
+            ));
+        });
+}
+
+fn can_start_online_game(online: &Online) -> bool {
+    online.seat == Some(Seat::Host)
+        && online.room_id.is_some()
+        && online.connection == Connection::Connected
+        && !online.pending
+        && online.occupancy == 2
+        && online.opponent_online
+}
+
+fn room_screen(parent: &mut ChildSpawnerCommands, online: Option<&Online>) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            row_gap: Val::Px(16.0),
+            ..default()
+        })
+        .with_children(|content| {
+            text(content, "ONLINE ROOM", 32.0, GOLD);
+            if let Some(online) = online {
+                if let Some(name) = &online.room_name {
+                    text(content, name, 25.0, GOLD);
+                }
+                text(content, &online.status, 18.0, TEXT);
+                text(
+                    content,
+                    &format!("Players: {}/2", online.occupancy),
+                    20.0,
+                    TEXT,
+                );
+                text(
+                    content,
+                    if online.opponent_online {
+                        "Opponent online"
+                    } else {
+                        "Opponent offline"
+                    },
+                    20.0,
+                    TEXT,
+                );
+                if online.seat == Some(Seat::Host) {
+                    lobby_button(
+                        content,
+                        MenuAction::StartOnlineGame,
+                        "START GAME",
+                        160.0,
+                        can_start_online_game(online),
+                    );
+                }
+            }
+            lobby_button(content, MenuAction::LeaveRoom, "LEAVE ROOM", 160.0, true);
+        });
+}
+
+fn pin_screen(parent: &mut ChildSpawnerCommands, online: Option<&Online>) {
+    parent
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+            ZIndex(2),
+        ))
+        .with_children(|overlay| {
+            overlay
+                .spawn((
+                    Node {
+                        width: Val::Px(580.0),
+                        padding: UiRect::all(Val::Px(20.0)),
+                        border: UiRect::all(Val::Px(2.0)),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        row_gap: Val::Px(10.0),
+                        ..default()
+                    },
+                    BackgroundColor(LOBBY_BACKGROUND),
+                    BorderColor::all(GOLD),
+                ))
+                .with_children(|content| {
+                    let joining = online.is_some_and(|online| online.pin_room.is_some());
+                    text(
+                        content,
+                        if joining {
+                            "ENTER ROOM PIN"
+                        } else {
+                            "CREATE GAME"
+                        },
+                        28.0,
+                        GOLD,
+                    );
+                    if !joining {
+                        text(
+                            content,
+                            "No PIN: open game. Three-digit PIN: locked game.",
+                            16.0,
+                            TEXT,
+                        );
+                    }
+                    if let Some(online) = online {
+                        text(
+                            content,
+                            &format!(
+                                "{}{}",
+                                "*".repeat(online.pin.len()),
+                                "_".repeat(3 - online.pin.len())
+                            ),
+                            24.0,
+                            TEXT,
+                        );
+                        text(content, &online.status, 16.0, TEXT);
+                    }
+                    for digits in [0..5, 5..10] {
+                        content
+                            .spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                column_gap: Val::Px(4.0),
+                                ..default()
+                            })
+                            .with_children(|row| {
+                                for digit in digits {
+                                    row.spawn((
+                                        Button,
+                                        Hovered::default(),
+                                        MenuAction::PinDigit(digit),
+                                        Node {
+                                            width: Val::Px(60.0),
+                                            height: Val::Px(36.0),
+                                            justify_content: JustifyContent::Center,
+                                            align_items: AlignItems::Center,
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.08, 0.06, 0.05)),
+                                    ))
+                                    .with_children(
+                                        |digit_button| {
+                                            text(digit_button, &digit.to_string(), 20.0, TEXT)
+                                        },
+                                    );
+                                }
+                            });
+                    }
+                    content
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(10.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            lobby_button(row, MenuAction::PinClear, "CLEAR", 140.0, true);
+                            let enabled = online.is_some_and(|online| {
+                                !online.pending
+                                    && online.connection == Connection::Connected
+                                    && (online.pin.len() == 3
+                                        || (!joining && online.pin.is_empty()))
+                            });
+                            let label = if joining {
+                                "JOIN GAME"
+                            } else if online.is_some_and(|online| online.pin.is_empty()) {
+                                "OPEN GAME"
+                            } else {
+                                "START GAME"
+                            };
+                            lobby_button(row, MenuAction::PinSubmit, label, 160.0, enabled);
+                        });
+                    lobby_button(content, MenuAction::Back, "CANCEL", 140.0, true);
+                });
+        });
+}
+
 fn options_screen(
     parent: &mut ChildSpawnerCommands,
     assets: &AssetServer,
@@ -647,7 +1355,11 @@ fn options_screen(
         });
 }
 
-fn pause_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
+fn pause_screen(
+    parent: &mut ChildSpawnerCommands,
+    assets: &AssetServer,
+    actions: &[(MenuAction, &str)],
+) {
     parent
         .spawn((
             Node {
@@ -664,9 +1376,32 @@ fn pause_screen(parent: &mut ChildSpawnerCommands, assets: &AssetServer) {
         ))
         .with_children(|content| {
             text(content, "PAUSED", 52.0, GOLD);
-            for (index, (action, label)) in PAUSE_ACTIONS.into_iter().enumerate() {
+            for (index, &(action, label)) in actions.iter().enumerate() {
                 button(content, assets, action, label, 46.0, index == 0);
             }
+        });
+}
+
+fn online_game_over_screen(parent: &mut ChildSpawnerCommands, outcome: Outcome) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            row_gap: Val::Px(24.0),
+            ..default()
+        })
+        .with_children(|content| {
+            text(
+                content,
+                match outcome {
+                    Outcome::Win => "YOU WIN!",
+                    Outcome::Lose => "YOU LOSE",
+                    Outcome::Draw => "DRAW",
+                },
+                52.0,
+                GOLD,
+            );
+            lobby_button(content, MenuAction::LeaveRoom, "LEAVE ROOM", 160.0, true);
         });
 }
 
@@ -949,6 +1684,355 @@ mod tests {
     }
 
     #[test]
+    fn lobby_pin_actions_queue_a_locked_room_and_cannot_start_a_match() {
+        let mut frontend = Frontend::default();
+        let mut audio = AudioSettings::default();
+        let mut help = help::Help::default();
+        let mut online = Online::default();
+        online.connection = Connection::Connected;
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::Online,
+        );
+        assert_eq!(frontend.screen, Screen::Lobby);
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::CreateRoom,
+        );
+        assert_eq!(frontend.screen, Screen::Pin);
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::PinDigit(0),
+        );
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::PinSubmit,
+        );
+        assert_eq!(online.status, "Enter three digits");
+        assert!(online.outgoing.is_empty());
+        for digit in [1, 2] {
+            activate_action(
+                &mut frontend,
+                &mut audio,
+                &mut help,
+                Some(&mut online),
+                MenuAction::PinDigit(digit),
+            );
+        }
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::PinSubmit,
+        );
+        assert!(
+            matches!(online.outgoing.as_slice(), [ClientMessage::CreateRoom { pin: Some(pin) }] if pin == "012")
+        );
+        assert!(!frontend.match_in_progress);
+    }
+
+    #[test]
+    fn room_start_button_tracks_host_and_opponent_and_leave_uses_lobby_style() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<InventoryImages>()
+            .init_resource::<Online>();
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud))
+            .add_systems(Update, render_screen);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .show(Screen::Room);
+        let online = &mut *app.world_mut().resource_mut::<Online>();
+        online.connection = Connection::Connected;
+        online.room_id = Some("room".into());
+        online.seat = Some(Seat::Host);
+        online.occupancy = 1;
+        app.update();
+
+        let start_count = |app: &mut App| {
+            let world = app.world_mut();
+            world
+                .query_filtered::<&MenuAction, With<Button>>()
+                .iter(world)
+                .filter(|action| **action == MenuAction::StartOnlineGame)
+                .count()
+        };
+        let start_label_count = |app: &mut App| {
+            let world = app.world_mut();
+            world
+                .query::<&Text>()
+                .iter(world)
+                .filter(|text| text.0 == "START GAME")
+                .count()
+        };
+        assert_eq!(start_label_count(&mut app), 1);
+        assert_eq!(start_count(&mut app), 0);
+
+        let world = app.world_mut();
+        let leave = world
+            .query::<(&MenuAction, &Children)>()
+            .iter(world)
+            .find_map(|(action, children)| {
+                (*action == MenuAction::LeaveRoom).then(|| children.to_vec())
+            })
+            .unwrap();
+        assert!(
+            leave
+                .iter()
+                .all(|child| world.get::<MenuButtonArt>(*child).is_none())
+        );
+
+        let online = &mut *world.resource_mut::<Online>();
+        online.occupancy = 2;
+        online.opponent_online = true;
+        app.update();
+        assert_eq!(start_count(&mut app), 1);
+
+        app.world_mut().resource_mut::<Online>().opponent_online = false;
+        app.update();
+        assert_eq!(start_label_count(&mut app), 1);
+        assert_eq!(start_count(&mut app), 0);
+
+        let online = &mut *app.world_mut().resource_mut::<Online>();
+        online.opponent_online = true;
+        online.seat = Some(Seat::Guest);
+        app.update();
+        assert_eq!(start_label_count(&mut app), 0);
+        assert_eq!(start_count(&mut app), 0);
+    }
+
+    #[test]
+    fn starting_online_game_requests_the_server_without_starting_a_local_match() {
+        let mut frontend = Frontend::default();
+        frontend.show(Screen::Room);
+        let mut audio = AudioSettings::default();
+        let mut help = help::Help::default();
+        let mut online = Online::default();
+        online.connection = Connection::Connected;
+        online.room_id = Some("room".into());
+        online.seat = Some(Seat::Host);
+        online.occupancy = 1;
+        online.status.clear();
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::StartOnlineGame,
+        );
+        assert!(online.status.is_empty());
+
+        online.occupancy = 2;
+        online.opponent_online = true;
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::StartOnlineGame,
+        );
+        assert!(matches!(
+            online.outgoing.as_slice(),
+            [ClientMessage::StartMatch]
+        ));
+        assert_eq!(frontend.screen, Screen::Room);
+        assert!(!frontend.match_in_progress);
+    }
+
+    #[test]
+    fn clearing_pin_allows_open_creation_but_join_requires_three_digits() {
+        let mut frontend = Frontend::default();
+        let mut audio = AudioSettings::default();
+        let mut help = help::Help::default();
+        let mut online = Online::default();
+        online.connection = Connection::Connected;
+        online.pin = "12".into();
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::PinClear,
+        );
+        assert!(online.pin.is_empty());
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::PinSubmit,
+        );
+        assert!(matches!(
+            online.outgoing.as_slice(),
+            [ClientMessage::CreateRoom { pin: None }]
+        ));
+
+        online.outgoing.clear();
+        online.pending = false;
+        online.pin_room = Some("room".into());
+        activate_action(
+            &mut frontend,
+            &mut audio,
+            &mut help,
+            Some(&mut online),
+            MenuAction::PinSubmit,
+        );
+        assert!(online.outgoing.is_empty());
+        assert_eq!(online.status, "Enter three digits");
+    }
+
+    #[test]
+    fn create_dialog_submit_is_only_clickable_for_an_empty_or_complete_pin() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<InventoryImages>()
+            .init_resource::<Online>();
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud))
+            .add_systems(Update, render_screen);
+        app.world_mut().resource_mut::<Frontend>().show(Screen::Pin);
+        app.world_mut().resource_mut::<Online>().connection = Connection::Connected;
+        app.update();
+        let submit_count = |app: &mut App| {
+            let world = app.world_mut();
+            world
+                .query_filtered::<&MenuAction, With<Button>>()
+                .iter(world)
+                .filter(|action| **action == MenuAction::PinSubmit)
+                .count()
+        };
+        assert_eq!(submit_count(&mut app), 1);
+        app.world_mut().resource_mut::<Online>().pin = "12".into();
+        app.update();
+        assert_eq!(submit_count(&mut app), 0);
+        app.world_mut().resource_mut::<Online>().pin = "123".into();
+        app.update();
+        assert_eq!(submit_count(&mut app), 1);
+    }
+
+    #[test]
+    fn lobby_renders_all_rooms_and_preserves_scroll_when_the_list_updates() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_resource::<Frontend>()
+            .init_resource::<AudioSettings>()
+            .init_resource::<InventoryImages>()
+            .init_resource::<Online>();
+        let hud = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(Hud(hud))
+            .add_systems(Update, render_screen);
+        app.world_mut()
+            .resource_mut::<Frontend>()
+            .show(Screen::Lobby);
+        let online = &mut *app.world_mut().resource_mut::<Online>();
+        online.connection = Connection::Connected;
+        online.status = "Lobby status".into();
+        online.rooms = (0..7)
+            .map(|index| volatile_online_protocol::RoomInfo {
+                id: format!("{index:032x}"),
+                name: format!("Room {index}"),
+                locked: index == 0,
+                occupancy: if index == 1 { 2 } else { 1 },
+                online: 1,
+            })
+            .collect();
+        app.update();
+        let world = app.world_mut();
+        assert_eq!(
+            world
+                .query_filtered::<&MenuAction, With<Button>>()
+                .iter(world)
+                .filter(|action| matches!(action, MenuAction::JoinRoom(_)))
+                .count(),
+            7
+        );
+        let texts: Vec<_> = world
+            .query::<&Text>()
+            .iter(world)
+            .map(|t| t.0.as_str())
+            .collect();
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| **text == "Waiting for opponent")
+                .count(),
+            6
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| **text == "Game in progress")
+                .count(),
+            1
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| *text == "1/2" || *text == "1 online")
+        );
+        let status_parent = world
+            .query::<(&Text, &ChildOf)>()
+            .iter(world)
+            .find_map(|(text, parent)| (text.0 == "Lobby status").then(|| parent.parent()))
+            .unwrap();
+        let footer = world.get::<Node>(status_parent).unwrap();
+        assert_eq!(footer.left, Val::Px(3.0 * GRID_BLOCK_SIZE));
+        assert_eq!(footer.top, Val::Px(8.0 * GRID_BLOCK_SIZE));
+        assert_eq!(footer.width, Val::Px(10.0 * GRID_BLOCK_SIZE));
+        assert_eq!(footer.justify_content, JustifyContent::Center);
+        let viewport = world
+            .query_filtered::<Entity, With<LobbyViewport>>()
+            .single(world)
+            .unwrap();
+        world.get_mut::<ScrollPosition>(viewport).unwrap().y = 120.0;
+        let mut online = world.resource_mut::<Online>();
+        online.status = "Updated".into();
+        online.rooms[1].occupancy = 1;
+        app.update();
+        let world = app.world_mut();
+        let viewport = world
+            .query_filtered::<&ScrollPosition, With<LobbyViewport>>()
+            .single(world)
+            .unwrap();
+        assert_eq!(viewport.y, 120.0);
+        assert_eq!(
+            world
+                .query::<&Text>()
+                .iter(world)
+                .filter(|text| text.0 == "Waiting for opponent")
+                .count(),
+            7
+        );
+        assert!(
+            !world
+                .query::<&Text>()
+                .iter(world)
+                .any(|text| text.0 == "Game in progress")
+        );
+    }
+
+    #[test]
     fn options_support_keyboard_pointer_and_shared_settings_across_screens() {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
@@ -1085,9 +2169,9 @@ mod tests {
         assert_eq!(cover_node.height, Val::Percent(100.0));
         let mut buttons = world.query_filtered::<(&MenuAction, &Node, &Children), With<Button>>();
         let buttons: Vec<_> = buttons.iter(world).collect();
-        assert_eq!(buttons.len(), 4);
+        assert_eq!(buttons.len(), TITLE_ACTIONS.len());
         for (action, node, children) in buttons {
-            assert_eq!(node.height, Val::Px(52.0));
+            assert_eq!(node.height, Val::Px(44.0));
             let image = children
                 .iter()
                 .find_map(|child| world.get::<ImageNode>(child))
@@ -1141,7 +2225,7 @@ mod tests {
         let world = app.world_mut();
         let mut buttons = world.query_filtered::<(&MenuAction, &Node, &Children), With<Button>>();
         let buttons: Vec<_> = buttons.iter(world).collect();
-        assert_eq!(buttons.len(), 5);
+        assert_eq!(buttons.len(), ACTIVE_TITLE_ACTIONS.len());
         for (action, node, children) in buttons {
             assert_eq!(node.height, Val::Px(44.0));
             let image = children
@@ -1281,6 +2365,23 @@ mod tests {
             assert_eq!(frontend.screen, Screen::Game);
             assert!(frontend.take_restart_request());
             assert_eq!(frontend.outcome, None);
+        }
+    }
+
+    #[test]
+    fn online_outcome_is_relative_to_the_receiving_seat() {
+        for (seat, expected) in [(Seat::Host, Outcome::Lose), (Seat::Guest, Outcome::Win)] {
+            let mut frontend = Frontend::default();
+            frontend.enter_online_match();
+            let mut online = Online::default();
+            online.seat = Some(seat);
+            let mut app = App::new();
+            app.insert_resource(frontend)
+                .insert_resource(online)
+                .insert_resource(PlayerHealth([0, 5]))
+                .add_systems(Update, detect_game_over);
+            app.update();
+            assert_eq!(app.world().resource::<Frontend>().outcome, Some(expected));
         }
     }
 

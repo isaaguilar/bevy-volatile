@@ -52,6 +52,26 @@ pub struct AquaticCreature {
 }
 
 impl AquaticCreature {
+    pub(crate) fn from_visual(visual: &AquaticVisual) -> Self {
+        Self {
+            id: visual.id,
+            origin: visual.origin,
+            arms: std::array::from_fn(|index| {
+                let direction = DIRECTIONS[index];
+                Arm {
+                    direction,
+                    segments: (1..=visual.lengths[index])
+                        .map(|distance| Segment {
+                            cell: visual.origin + direction * distance as i32,
+                        })
+                        .collect(),
+                    stopped: false,
+                }
+            }),
+            age: 0,
+        }
+    }
+
     pub fn new(origin: IVec2, id: u64) -> Self {
         Self {
             id,

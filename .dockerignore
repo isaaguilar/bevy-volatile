@@ -1,0 +1,8 @@
+.git
+.DS_Store
+.env.local
+target
+server/target
+game-rules/target
+online-protocol/target
+game.zip

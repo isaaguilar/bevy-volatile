@@ -5551,6 +5551,27 @@ dependencies = [
  "bevy_rand",
  "rand",
  "rodio",
+ "serde_json",
+ "volatile-game-rules",
+ "volatile-online-protocol",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "volatile-game-rules"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_rand",
+ "rand",
+]
+
+[[package]]
+name = "volatile-online-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

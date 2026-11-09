@@ -6,7 +6,10 @@ use bevy::{
 };
 use bevy_aspect_ratio_mask::Hud;
 
-use crate::{BOARD_ROWS, GRID_BLOCK_SIZE, HEALTH_PANEL_INSET, InventoryImages, menu};
+use crate::{
+    BOARD_ROWS, GRID_BLOCK_SIZE, HEALTH_PANEL_INSET, InventoryImages, menu, online, online_game,
+};
+use volatile_online_protocol::{HistoryEntry, Seat};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Entry {
@@ -41,26 +44,49 @@ struct HistoryViewport;
 struct HistoryPanel;
 
 #[derive(Component)]
+struct HistoryTitle;
+
+#[derive(Component)]
 struct HistoryScrollbar;
+
+#[derive(Resource, Default)]
+struct OnlineHistory {
+    seat: Option<Seat>,
+    entries: Vec<HistoryEntry>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistorySource {
+    Computer,
+    Online,
+}
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct HistorySystems;
 
 pub(crate) fn plugin(app: &mut App) {
     app.init_resource::<ComputerHistory>()
+        .init_resource::<OnlineHistory>()
         .add_systems(Startup, setup.after(crate::setup))
         .add_systems(
             Update,
+            update_panel
+                .after(menu::GameplaySystems)
+                .in_set(HistorySystems),
+        )
+        .add_systems(
+            Update,
             (
-                update_panel,
+                sync_online_history,
                 render,
                 scroll::<HistoryViewport>,
                 update_scrollbar::<HistoryViewport, HistoryScrollbar>,
             )
                 .chain()
+                .after(update_panel)
                 .after(menu::GameplaySystems)
                 .in_set(HistorySystems)
-                .run_if(menu::in_game),
+                .run_if(menu::in_game_or_online_game_over),
         );
 }
 
@@ -69,6 +95,7 @@ fn setup(mut commands: Commands, hud: Res<Hud>) {
         parent
             .spawn((
                 HistoryPanel,
+                GlobalZIndex(0),
                 Node {
                     position_type: PositionType::Absolute,
                     right: Val::Px(HEALTH_PANEL_INSET),
@@ -86,6 +113,7 @@ fn setup(mut commands: Commands, hud: Res<Hud>) {
             ))
             .with_children(|panel| {
                 panel.spawn((
+                    HistoryTitle,
                     Text::new("COMPUTER LOG"),
                     TextFont {
                         font_size: FontSize::Px(9.0),
@@ -151,26 +179,106 @@ fn setup(mut commands: Commands, hud: Res<Hud>) {
 
 fn update_panel(
     frontend: Res<menu::Frontend>,
-    mut panels: Query<&mut Visibility, With<HistoryPanel>>,
+    online: Option<Res<online::Online>>,
+    mut panels: Query<(&mut Visibility, &mut Node, &mut GlobalZIndex), With<HistoryPanel>>,
+    mut titles: Query<&mut Text, With<HistoryTitle>>,
 ) {
-    for mut visibility in &mut panels {
-        *visibility = if frontend.computer_game() {
+    let online_visible = frontend.online_history_visible();
+    for (mut visibility, mut node, mut z_index) in &mut panels {
+        *visibility = if frontend.computer_game() || online_visible {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+        let left =
+            online_visible && online.as_ref().and_then(|online| online.seat) == Some(Seat::Guest);
+        node.left = if left {
+            Val::Px(HEALTH_PANEL_INSET)
+        } else {
+            Val::Auto
+        };
+        node.right = if left {
+            Val::Auto
+        } else {
+            Val::Px(HEALTH_PANEL_INSET)
+        };
+        *z_index = GlobalZIndex(if frontend.online_game_over() { 101 } else { 0 });
+    }
+    for mut title in &mut titles {
+        let label = if online_visible {
+            "GAME LOG"
+        } else {
+            "COMPUTER LOG"
+        };
+        if title.0 != label {
+            title.0 = label.into();
+        }
+    }
+}
+
+fn sync_online_history(
+    frontend: Res<menu::Frontend>,
+    online: Option<Res<online::Online>>,
+    applied: Option<Res<online_game::AppliedMatch>>,
+    mut history: ResMut<OnlineHistory>,
+) {
+    if !frontend.online_history_visible() {
+        return;
+    }
+    let (Some(online), Some(applied)) = (online, applied) else {
+        return;
+    };
+    if applied.is_current(&online)
+        && (history.seat != online.seat || history.entries != online.history)
+    {
+        history.seat = online.seat;
+        history.entries.clone_from(&online.history);
     }
 }
 
 fn render(
     mut commands: Commands,
     history: Res<ComputerHistory>,
+    frontend: Res<menu::Frontend>,
+    online_history: Option<Res<OnlineHistory>>,
     images: Res<InventoryImages>,
+    mut last_source: Local<Option<HistorySource>>,
     mut viewport: Query<(Entity, Option<&Children>, &mut ScrollPosition), With<HistoryViewport>>,
 ) {
-    if !history.is_changed() {
+    let is_online = frontend.online_history_visible();
+    let source = if is_online {
+        HistorySource::Online
+    } else {
+        HistorySource::Computer
+    };
+    if *last_source == Some(source)
+        && !(is_online
+            && online_history
+                .as_ref()
+                .is_some_and(|history| history.is_changed()))
+        && !(!is_online && history.is_changed())
+    {
         return;
     }
+    *last_source = Some(source);
+    let entries: Vec<Entry> = if is_online {
+        online_history.as_ref().map_or_else(Vec::new, |history| {
+            history
+                .entries
+                .iter()
+                .map(|entry| Entry {
+                    text: match entry.seat {
+                        Some(seat) if Some(seat) == history.seat => format!("You: {}", entry.text),
+                        Some(_) => format!("Opponent: {}", entry.text),
+                        None => entry.text.clone(),
+                    },
+                    item: entry.item,
+                })
+                .collect()
+        })
+    } else {
+        history.entries.clone()
+    };
     let Ok((entity, children, mut position)) = viewport.single_mut() else {
         return;
     };
@@ -181,7 +289,7 @@ fn render(
         }
     }
     commands.entity(entity).with_children(|viewport| {
-        for entry in history.entries.iter().rev() {
+        for entry in entries.iter().rev() {
             viewport
                 .spawn((
                     Node {
@@ -265,6 +373,7 @@ pub(crate) fn update_scrollbar<V: Component, S: Component>(
 mod tests {
     use super::*;
     use crate::{PlayerHealth, SUNSTONE_ITEM_INDEX};
+    use bevy::ecs::system::RunSystemOnce;
 
     #[test]
     fn labels_use_playing_board_coordinates() {
@@ -307,6 +416,173 @@ mod tests {
         assert_eq!(
             images.single(world).unwrap().rect,
             Some(InventoryImages::rect(SUNSTONE_ITEM_INDEX))
+        );
+    }
+
+    #[test]
+    fn online_history_is_on_the_opponents_side_and_remains_visible_after_game_over() {
+        let mut frontend = menu::Frontend::default();
+        frontend.enter_online_match();
+        let mut app = App::new();
+        app.insert_resource(frontend)
+            .init_resource::<online::Online>()
+            .init_resource::<PlayerHealth>()
+            .add_systems(Update, update_panel);
+        let panel = app
+            .world_mut()
+            .spawn((
+                HistoryPanel,
+                Node::default(),
+                Visibility::Hidden,
+                GlobalZIndex(0),
+            ))
+            .id();
+        let title = app.world_mut().spawn((HistoryTitle, Text::default())).id();
+
+        app.world_mut().resource_mut::<online::Online>().seat = Some(Seat::Host);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().right,
+            Val::Px(HEALTH_PANEL_INSET)
+        );
+        assert_eq!(app.world().get::<Node>(panel).unwrap().left, Val::Auto);
+        assert_eq!(app.world().get::<Text>(title).unwrap().0, "GAME LOG");
+
+        app.world_mut().resource_mut::<online::Online>().seat = Some(Seat::Guest);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().left,
+            Val::Px(HEALTH_PANEL_INSET)
+        );
+        assert_eq!(app.world().get::<Node>(panel).unwrap().right, Val::Auto);
+
+        app.world_mut().resource_mut::<PlayerHealth>().0[0] = 0;
+        app.world_mut()
+            .run_system_once(menu::detect_game_over)
+            .unwrap();
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(panel).unwrap(),
+            Visibility::Visible
+        );
+        assert_eq!(
+            *app.world().get::<GlobalZIndex>(panel).unwrap(),
+            GlobalZIndex(101)
+        );
+
+        app.world_mut()
+            .resource_mut::<menu::Frontend>()
+            .end_online_match(true);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(panel).unwrap(),
+            Visibility::Hidden
+        );
+        assert_eq!(
+            *app.world().get::<GlobalZIndex>(panel).unwrap(),
+            GlobalZIndex(0)
+        );
+    }
+
+    #[test]
+    fn online_history_labels_both_players_from_the_local_seat() {
+        let mut frontend = menu::Frontend::default();
+        frontend.enter_online_match();
+        let mut app = App::new();
+        app.insert_resource(frontend)
+            .init_resource::<ComputerHistory>()
+            .init_resource::<InventoryImages>()
+            .insert_resource(OnlineHistory {
+                seat: Some(Seat::Guest),
+                entries: vec![
+                    HistoryEntry {
+                        seat: Some(Seat::Host),
+                        text: "moved to D4".into(),
+                        item: None,
+                    },
+                    HistoryEntry {
+                        seat: Some(Seat::Guest),
+                        text: "rested at H4".into(),
+                        item: None,
+                    },
+                ],
+            })
+            .add_systems(Update, render);
+        app.world_mut()
+            .spawn((HistoryViewport, Node::default(), ScrollPosition::default()));
+        app.update();
+        let world = app.world_mut();
+        let text: Vec<_> = world
+            .query::<&Text>()
+            .iter(world)
+            .map(|text| text.0.clone())
+            .collect();
+        assert!(text.contains(&"Opponent: moved to D4".into()));
+        assert!(text.contains(&"You: rested at H4".into()));
+    }
+
+    #[test]
+    fn frontend_changes_do_not_reset_the_history_scroll() {
+        let mut frontend = menu::Frontend::default();
+        frontend.enter_online_match();
+        let mut app = App::new();
+        app.insert_resource(frontend)
+            .init_resource::<ComputerHistory>()
+            .init_resource::<InventoryImages>()
+            .init_resource::<OnlineHistory>()
+            .add_systems(Update, render);
+        let viewport = app
+            .world_mut()
+            .spawn((HistoryViewport, Node::default(), ScrollPosition::default()))
+            .id();
+        app.update();
+        app.world_mut()
+            .get_mut::<ScrollPosition>(viewport)
+            .unwrap()
+            .y = 24.0;
+        app.world_mut()
+            .resource_mut::<menu::Frontend>()
+            .set_changed();
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(viewport).unwrap().y, 24.0);
+    }
+
+    #[test]
+    fn final_online_event_is_rendered_before_game_over() {
+        fn finish_match(mut health: ResMut<PlayerHealth>) {
+            health.0[1] = 0;
+        }
+        let mut frontend = menu::Frontend::default();
+        frontend.enter_online_match();
+        let mut app = App::new();
+        app.insert_resource(frontend)
+            .init_resource::<ComputerHistory>()
+            .init_resource::<PlayerHealth>()
+            .init_resource::<InventoryImages>()
+            .insert_resource(OnlineHistory {
+                seat: Some(Seat::Host),
+                entries: vec![HistoryEntry {
+                    seat: Some(Seat::Host),
+                    text: "won the match".into(),
+                    item: None,
+                }],
+            })
+            .add_systems(Update, finish_match.in_set(menu::GameplaySystems))
+            .add_systems(
+                Update,
+                render.in_set(HistorySystems).after(menu::GameplaySystems),
+            )
+            .add_systems(Update, menu::detect_game_over.after(HistorySystems));
+        app.world_mut()
+            .spawn((HistoryViewport, Node::default(), ScrollPosition::default()));
+        app.update();
+        assert!(app.world().resource::<menu::Frontend>().online_game_over());
+        let world = app.world_mut();
+        assert!(
+            world
+                .query::<&Text>()
+                .iter(world)
+                .any(|text| text.0 == "You: won the match")
         );
     }
 

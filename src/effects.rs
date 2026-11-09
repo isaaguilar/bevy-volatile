@@ -12,7 +12,7 @@ use crate::{
 
 const FRAME_SECONDS: f32 = 0.15;
 const FRAMES: usize = 6;
-const DURATION: f32 = FRAME_SECONDS * FRAMES as f32;
+pub(crate) const DURATION: f32 = FRAME_SECONDS * FRAMES as f32;
 const FRAME_SIZE: f32 = 48.0;
 
 fn overlap_delay(frames: usize) -> f32 {
@@ -53,6 +53,42 @@ impl Effect {
         let x = frame as f32 * FRAME_SIZE;
         let y = self.row() as f32 * FRAME_SIZE;
         Rect::new(x, y, x + FRAME_SIZE, y + FRAME_SIZE)
+    }
+}
+
+impl From<Effect> for volatile_online_protocol::VisualEffect {
+    fn from(effect: Effect) -> Self {
+        use volatile_online_protocol::VisualEffect;
+        match effect {
+            Effect::Water => VisualEffect::Water,
+            Effect::Acid => VisualEffect::Acid,
+            Effect::Poison => VisualEffect::Poison,
+            Effect::Fuel => VisualEffect::Fuel,
+            Effect::Freeze => VisualEffect::Freeze,
+            Effect::Electric => VisualEffect::Electric,
+            Effect::RidgeDust => VisualEffect::RidgeDust,
+            Effect::Void => VisualEffect::Void,
+            Effect::Steam => VisualEffect::Steam,
+            Effect::Explosion => VisualEffect::Explosion,
+        }
+    }
+}
+
+impl From<volatile_online_protocol::VisualEffect> for Effect {
+    fn from(effect: volatile_online_protocol::VisualEffect) -> Self {
+        use volatile_online_protocol::VisualEffect;
+        match effect {
+            VisualEffect::Water => Effect::Water,
+            VisualEffect::Acid => Effect::Acid,
+            VisualEffect::Poison => Effect::Poison,
+            VisualEffect::Fuel => Effect::Fuel,
+            VisualEffect::Freeze => Effect::Freeze,
+            VisualEffect::Electric => Effect::Electric,
+            VisualEffect::RidgeDust => Effect::RidgeDust,
+            VisualEffect::Void => Effect::Void,
+            VisualEffect::Steam => Effect::Steam,
+            VisualEffect::Explosion => Effect::Explosion,
+        }
     }
 }
 
@@ -202,8 +238,13 @@ pub(crate) fn capture(
     mut effects: ResMut<Effects>,
     flashes: Query<FlashQuery, FlashFilter>,
     signals: Query<(Entity, &EffectSignal)>,
-    mut sounds: Option<ResMut<sound::SoundCues>>,
+    output: (
+        Option<ResMut<sound::SoundCues>>,
+        Option<ResMut<crate::headless::AnimationLog>>,
+        Res<Time>,
+    ),
 ) {
+    let (mut sounds, mut animations, time) = output;
     let current: Vec<_> = cells()
         .map(|cell| TileState::read(&board, &turn, cell))
         .collect();
@@ -344,6 +385,16 @@ pub(crate) fn capture(
             let layer = predecessors()
                 .map(|playing| playing.layer + 0.0001)
                 .fold(1.7 + effect.row() as f32 * 0.001, f32::max);
+            if let Some(log) = &mut animations {
+                log.record(
+                    time.elapsed() + std::time::Duration::from_secs_f32(delay),
+                    volatile_online_protocol::Animation::Effect {
+                        effect: effect.into(),
+                        x: cell.x,
+                        y: cell.y,
+                    },
+                );
+            }
             let center = cell_center(cell);
             let entity = commands
                 .spawn((
@@ -372,6 +423,24 @@ pub(crate) fn capture(
         }
     }
     turn.effects_active = !effects.playing.is_empty();
+}
+
+pub(crate) fn visual_sprite(effects: &Effects, effect: Effect) -> Sprite {
+    Sprite {
+        image: effects.image.clone(),
+        rect: Some(effect.rect(0)),
+        custom_size: Some(Vec2::splat(GRID_BLOCK_SIZE)),
+        ..default()
+    }
+}
+
+pub(crate) fn visual_layer(effect: Effect) -> f32 {
+    1.7 + effect.row() as f32 * 0.001
+}
+
+pub(crate) fn visual_frame(sprite: &mut Sprite, effect: Effect, elapsed: f32) {
+    let frame = (elapsed / FRAME_SECONDS) as usize;
+    sprite.rect = Some(effect.rect(frame.min(FRAMES - 1)));
 }
 
 pub(crate) fn advance(

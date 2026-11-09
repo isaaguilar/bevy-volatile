@@ -8,7 +8,7 @@ use rand::{RngExt, SeedableRng};
 use crate::{
     AcidTile, Board, FrozenTile, GRID_BLOCK_SIZE, Ground, GroundTile, PoisonTile,
     TerrainGrowthKind, ThornTile, TurnState, VoidGrowthTile, effects, help, menu,
-    spawn_board_terrain, update_aquatic_visuals,
+    spawn_board_terrain,
 };
 
 const TERRAIN_SHEET: &str = "basictilesheet.png";
@@ -116,7 +116,7 @@ pub(crate) fn plugin(app: &mut App) {
                 animate_poison_bubbles,
             )
                 .chain()
-                .after(update_aquatic_visuals)
+                .after(crate::AquaticVisualSystems)
                 .in_set(menu::GameplaySystems)
                 .run_if(menu::in_game)
                 .run_if(help::closed),

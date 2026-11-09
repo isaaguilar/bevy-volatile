@@ -1,6 +1,7 @@
 use bevy::{audio::Volume, prelude::*};
 
 use crate::{Board, PlayerHealth, effects::Effect};
+use volatile_online_protocol::SoundEffect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -53,6 +54,50 @@ impl SoundCues {
     pub(crate) fn reset_match(&mut self) {
         self.previous_health = None;
         self.previous_aquatic.clear();
+    }
+
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending.fill(false);
+    }
+
+    pub(crate) fn take_gameplay_events(&mut self) -> Vec<SoundEffect> {
+        CUES.iter()
+            .filter_map(|(cue, _)| {
+                if !std::mem::take(&mut self.pending[*cue as usize]) {
+                    return None;
+                }
+                match cue {
+                    Cue::Pop => Some(SoundEffect::Pop),
+                    Cue::Whoosh => Some(SoundEffect::Whoosh),
+                    Cue::Water => Some(SoundEffect::Water),
+                    Cue::Chime => Some(SoundEffect::Chime),
+                    Cue::Ice => Some(SoundEffect::Ice),
+                    Cue::Electric => Some(SoundEffect::Electric),
+                    Cue::Sizzle => Some(SoundEffect::Sizzle),
+                    Cue::Explosion => Some(SoundEffect::Explosion),
+                    Cue::Stone => Some(SoundEffect::Stone),
+                    Cue::Organic => Some(SoundEffect::Organic),
+                    Cue::Impact => Some(SoundEffect::Impact),
+                    Cue::Select | Cue::Reject | Cue::MenuOption => None,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn request_gameplay(&mut self, sound: SoundEffect) {
+        self.request(match sound {
+            SoundEffect::Pop => Cue::Pop,
+            SoundEffect::Whoosh => Cue::Whoosh,
+            SoundEffect::Water => Cue::Water,
+            SoundEffect::Chime => Cue::Chime,
+            SoundEffect::Ice => Cue::Ice,
+            SoundEffect::Electric => Cue::Electric,
+            SoundEffect::Sizzle => Cue::Sizzle,
+            SoundEffect::Explosion => Cue::Explosion,
+            SoundEffect::Stone => Cue::Stone,
+            SoundEffect::Organic => Cue::Organic,
+            SoundEffect::Impact => Cue::Impact,
+        });
     }
 
     #[cfg(test)]
