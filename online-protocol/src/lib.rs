@@ -220,6 +220,13 @@ pub struct HistoryEntry {
     pub item: Option<usize>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TurnClock {
+    pub remaining_ms: u32,
+    pub starts_in_ms: u32,
+    pub running: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -249,6 +256,8 @@ pub enum ServerMessage {
         sounds: Vec<SoundEffect>,
         #[serde(default)]
         animations: Vec<AnimationEvent>,
+        #[serde(default)]
+        turn_clock: Option<TurnClock>,
         #[serde(default)]
         history_start: usize,
         #[serde(default)]

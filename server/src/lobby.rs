@@ -5,9 +5,9 @@ use std::{
 };
 
 use tokio::sync::{mpsc, watch};
-use volatile::headless::HeadlessMatch;
+use volatile::headless::{HeadlessMatch, animation_playback_duration};
 use volatile_online_protocol::{
-    ClientMessage, GameAction, RoomInfo, Seat, ServerMessage, SoundEffect,
+    ClientMessage, GameAction, RoomInfo, Seat, ServerMessage, SoundEffect, TurnClock,
 };
 
 const ROOM_NAMES: [&str; 9] = [
@@ -39,6 +39,7 @@ const MAX_ROOMS: usize = 7;
 const MAX_CLOSED_ROOMS: usize = 64;
 const RECONNECT_GRACE: Duration = Duration::from_secs(5 * 60);
 const GAME_ACTION_INTERVAL: Duration = Duration::from_millis(100);
+const TURN_DURATION: Duration = Duration::from_secs(30);
 
 pub struct Client {
     pub outgoing: mpsc::Sender<ServerMessage>,
@@ -65,6 +66,61 @@ struct Match {
     engine: HeadlessMatch,
     revision: u64,
     last_action: [Option<Instant>; 2],
+    clock: MatchClock,
+}
+
+#[derive(Clone)]
+struct MatchClock {
+    remaining: Duration,
+    delay: Duration,
+    since: Option<Instant>,
+}
+
+impl MatchClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            remaining: TURN_DURATION,
+            delay: Duration::ZERO,
+            since: Some(now),
+        }
+    }
+
+    fn advance(&mut self, now: Instant) {
+        if let Some(since) = self.since {
+            let elapsed = now.saturating_duration_since(since);
+            let delay = self.delay.min(elapsed);
+            self.delay -= delay;
+            self.remaining = self.remaining.saturating_sub(elapsed - delay);
+            self.since = Some(now);
+        }
+    }
+
+    fn pause(&mut self, now: Instant) {
+        self.advance(now);
+        self.since = None;
+    }
+
+    fn resume(&mut self, now: Instant) {
+        if self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        let mut clock = self.clone();
+        clock.advance(now);
+        clock.since.is_some() && clock.remaining.is_zero()
+    }
+
+    fn snapshot(&self, now: Instant) -> TurnClock {
+        let mut clock = self.clone();
+        clock.advance(now);
+        TurnClock {
+            remaining_ms: u32::try_from(clock.remaining.as_millis()).unwrap_or(u32::MAX),
+            starts_in_ms: u32::try_from(clock.delay.as_millis()).unwrap_or(u32::MAX),
+            running: clock.since.is_some(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -382,6 +438,7 @@ impl Lobby {
             engine,
             revision: 0,
             last_action: [None, None],
+            clock: MatchClock::new(Instant::now()),
         });
         self.send_match_views(&room_id, &[], &[], 0);
     }
@@ -399,6 +456,7 @@ impl Lobby {
         let Some(game) = &mut room.game else {
             return;
         };
+        let turn_clock = (!game.engine.is_finished()).then(|| game.clock.snapshot(Instant::now()));
         let views = catch_unwind(AssertUnwindSafe(|| {
             let host = room.host.connection.map(|id| {
                 (
@@ -409,6 +467,7 @@ impl Lobby {
                         state: game.engine.view(Seat::Host),
                         sounds: sounds.to_vec(),
                         animations: animations.to_vec(),
+                        turn_clock: turn_clock.clone(),
                         history_start,
                         history: game.engine.history()[history_start..].to_vec(),
                     },
@@ -427,6 +486,7 @@ impl Lobby {
                             state: game.engine.view(Seat::Guest),
                             sounds: sounds.to_vec(),
                             animations: animations.to_vec(),
+                            turn_clock: turn_clock.clone(),
                             history_start,
                             history: game.engine.history()[history_start..].to_vec(),
                         },
@@ -468,6 +528,7 @@ impl Lobby {
         let Some(room_id) = self.room_for_connection(id) else {
             return self.error(id, "Join a room first");
         };
+        self.expire_turn(&room_id, Instant::now());
         let room = self.rooms.get_mut(&room_id).expect("connected room exists");
         let seat = if room.host.connection == Some(id) {
             Seat::Host
@@ -499,32 +560,96 @@ impl Lobby {
             return self.error(id, "Please wait before another action");
         }
         game.last_action[index] = Some(now);
+        self.apply_action(&room_id, seat, action, Some(id), now);
+    }
+
+    fn apply_action(
+        &mut self,
+        room_id: &str,
+        seat: Seat,
+        action: GameAction,
+        actor: Option<u64>,
+        now: Instant,
+    ) {
+        let game = self.rooms.get_mut(room_id).unwrap().game.as_mut().unwrap();
+        game.clock.advance(now);
+        let active = game.engine.active_seat();
         let history_start = game.engine.history().len();
-        let result = catch_unwind(AssertUnwindSafe(|| game.engine.perform(seat, action)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if actor.is_none() {
+                game.engine.timeout_rest(seat)
+            } else {
+                game.engine.perform(seat, action)
+            }
+        }));
         let result = match result {
             Ok(result) => result,
             Err(_) => {
                 eprintln!("match simulation panicked for room {room_id}");
-                self.end_match(&room_id, "The match could not continue");
+                self.end_match(room_id, "The match could not continue");
                 return;
             }
         };
         if let Err(error) = result {
             if game.engine.is_broken() {
-                self.end_match(&room_id, &error);
+                self.end_match(room_id, &error);
             } else {
-                self.error(id, &error);
+                if actor.is_none() {
+                    eprintln!("automatic rest failed for room {room_id}: {error}");
+                    self.end_match(room_id, "The match could not continue");
+                } else if let Some(id) = actor {
+                    self.error(id, &error);
+                }
             }
             return;
         }
         let Some(revision) = game.revision.checked_add(1) else {
-            self.end_match(&room_id, "The match could not continue");
+            self.end_match(room_id, "The match could not continue");
             return;
         };
         game.revision = revision;
         let sounds = game.engine.take_sounds();
         let animations = game.engine.take_animations();
-        self.send_match_views(&room_id, &sounds, &animations, history_start);
+        if game.engine.active_seat() != active {
+            game.clock.remaining = TURN_DURATION;
+            game.clock.delay = Duration::ZERO;
+        }
+        game.clock.delay += animation_playback_duration(&animations);
+        game.clock.since = (!game.engine.is_finished()).then(Instant::now);
+        self.send_match_views(room_id, &sounds, &animations, history_start);
+    }
+
+    fn expire_turn(&mut self, room_id: &str, now: Instant) {
+        let Some(room) = self.rooms.get(room_id) else {
+            return;
+        };
+        let Some(game) = &room.game else {
+            return;
+        };
+        if room.host.connection.is_some()
+            && room
+                .guest
+                .as_ref()
+                .is_some_and(|guest| guest.connection.is_some())
+            && !game.engine.is_finished()
+            && game.clock.expired(now)
+        {
+            self.apply_action(
+                room_id,
+                game.engine.active_seat(),
+                GameAction::Rest,
+                None,
+                now,
+            );
+        }
+    }
+
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        let rooms: Vec<_> = self.rooms.keys().cloned().collect();
+        for room_id in rooms {
+            self.expire_turn(&room_id, now);
+        }
     }
 
     fn reconnect(&mut self, id: u64, credential: String) {
@@ -576,6 +701,16 @@ impl Lobby {
         let previous = player.connection;
         player.connection = Some(id);
         player.disconnected_at = None;
+        if room.host.connection.is_some()
+            && room
+                .guest
+                .as_ref()
+                .is_some_and(|guest| guest.connection.is_some())
+            && let Some(game) = &mut room.game
+            && !game.engine.is_finished()
+        {
+            game.clock.resume(Instant::now());
+        }
         if let Some(previous) = previous
             && let Some(client) = self.clients.get(&previous)
         {
@@ -641,7 +776,11 @@ impl Lobby {
     pub fn disconnect(&mut self, id: u64) {
         self.clients.remove(&id);
         if let Some(room_id) = self.room_for_connection(id) {
+            self.expire_turn(&room_id, Instant::now());
             let room = self.rooms.get_mut(&room_id).unwrap();
+            if let Some(game) = &mut room.game {
+                game.clock.pause(Instant::now());
+            }
             let player = if room.host.connection == Some(id) {
                 &mut room.host
             } else {
@@ -651,6 +790,7 @@ impl Lobby {
             player.disconnected_at = Some(Instant::now());
             self.notify_room(&room_id);
             self.broadcast_rooms();
+            self.send_match_views(&room_id, &[], &[], 0);
         }
     }
 
@@ -738,6 +878,174 @@ mod tests {
             messages.push(message);
         }
         messages
+    }
+
+    fn timed_match() -> (
+        Lobby,
+        String,
+        String,
+        mpsc::Receiver<ServerMessage>,
+        mpsc::Receiver<ServerMessage>,
+    ) {
+        let mut lobby = Lobby::default();
+        let (mut host, _) = client(&mut lobby, 1);
+        let (mut guest, _) = client(&mut lobby, 2);
+        lobby.handle(1, ClientMessage::CreateRoom { pin: None });
+        let (room_id, _, _) = joined(&mut host);
+        lobby.handle(
+            2,
+            ClientMessage::JoinRoom {
+                room_id: room_id.clone(),
+                pin: None,
+            },
+        );
+        let (_, guest_token, _) = joined(&mut guest);
+        lobby.handle(1, ClientMessage::StartMatch);
+        drain(&mut host);
+        drain(&mut guest);
+        (lobby, room_id, guest_token, host, guest)
+    }
+
+    #[test]
+    fn clock_pauses_during_animation_and_disconnect() {
+        let now = Instant::now();
+        let mut clock = MatchClock::new(now);
+        clock.delay = Duration::from_secs(5);
+        clock.advance(now + Duration::from_secs(3));
+        assert_eq!(clock.remaining, TURN_DURATION);
+        assert_eq!(clock.delay, Duration::from_secs(2));
+        clock.pause(now + Duration::from_secs(4));
+        assert_eq!(clock.delay, Duration::from_secs(1));
+        assert!(!clock.expired(now + Duration::from_secs(100)));
+        clock.resume(now + Duration::from_secs(100));
+        let snapshot = clock.snapshot(now + Duration::from_secs(102));
+        assert_eq!(snapshot.remaining_ms, 29_000);
+        assert_eq!(snapshot.starts_in_ms, 0);
+        assert!(snapshot.running);
+        assert!(clock.expired(now + Duration::from_secs(131)));
+    }
+
+    #[test]
+    fn timeout_is_authoritative_even_if_an_action_arrives_before_the_tick() {
+        let (mut lobby, room_id, _, mut host, mut guest) = timed_match();
+        let game = lobby
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        game.clock.since = Some(Instant::now() - TURN_DURATION);
+        lobby.handle(
+            1,
+            ClientMessage::GameAction {
+                revision: 0,
+                action: GameAction::Rest,
+            },
+        );
+        let host_messages = drain(&mut host);
+        let guest_messages = drain(&mut guest);
+        for messages in [&host_messages, &guest_messages] {
+            assert!(messages.iter().any(|message| matches!(
+                message,
+                ServerMessage::MatchState {
+                    revision: 1,
+                    state,
+                    turn_clock: Some(clock),
+                    history,
+                    ..
+                } if state.active == Seat::Guest
+                    && clock.remaining_ms > 29_000
+                    && history.iter().any(|entry| entry.text.contains("ran out of time"))
+            )));
+        }
+        assert!(host_messages.iter().any(|message| matches!(
+            message, ServerMessage::Error { message } if message.contains("changed")
+        )));
+        lobby.tick();
+        assert_eq!(lobby.rooms[&room_id].game.as_ref().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn first_action_keeps_remaining_time_and_reconnect_resumes_it() {
+        let (mut lobby, room_id, guest_token, mut host, mut guest) = timed_match();
+        let game = lobby
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        game.clock.since = Some(Instant::now() - Duration::from_secs(10));
+        let position = game.engine.view(Seat::Host).players[0].clone();
+        lobby.handle(
+            1,
+            ClientMessage::GameAction {
+                revision: 0,
+                action: GameAction::Place {
+                    ingredient: 0,
+                    x: position.x,
+                    y: position.y,
+                },
+            },
+        );
+        let game = lobby.rooms[&room_id].game.as_ref().unwrap();
+        assert_eq!(game.revision, 1);
+        assert!(game.clock.remaining < Duration::from_secs(21));
+        assert!(game.clock.remaining > Duration::from_secs(18));
+        drain(&mut host);
+        drain(&mut guest);
+        lobby.disconnect(2);
+        let game = lobby.rooms[&room_id].game.as_ref().unwrap();
+        let paused = game
+            .clock
+            .snapshot(Instant::now() + Duration::from_secs(300));
+        assert!(!paused.running);
+        assert!(drain(&mut host).iter().any(|message| matches!(
+            message, ServerMessage::MatchState { turn_clock: Some(clock), .. } if !clock.running
+        )));
+        lobby.tick();
+        assert_eq!(lobby.rooms[&room_id].game.as_ref().unwrap().revision, 1);
+        let (mut returning, _) = client(&mut lobby, 3);
+        lobby.handle(
+            3,
+            ClientMessage::Reconnect {
+                credential: guest_token,
+            },
+        );
+        let game = lobby.rooms[&room_id].game.as_ref().unwrap();
+        assert!(game.clock.since.is_some());
+        assert!(game.clock.remaining <= Duration::from_millis(u64::from(paused.remaining_ms) + 1));
+        assert!(drain(&mut returning).iter().any(|message| matches!(
+            message, ServerMessage::MatchState { turn_clock: Some(clock), .. } if clock.running
+        )));
+        let game = lobby
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        game.clock.remaining = Duration::ZERO;
+        game.clock.delay = Duration::ZERO;
+        lobby.tick();
+        let game = lobby
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        assert_eq!(game.revision, 2);
+        let view = game.engine.view(Seat::Host);
+        assert_eq!(view.active, Seat::Guest);
+        assert!(view.pending_item.is_none());
+        assert!(
+            game.engine
+                .history()
+                .iter()
+                .any(|entry| entry.text.contains("ran out of time"))
+        );
     }
 
     #[test]

@@ -1892,6 +1892,31 @@ fn spawn_side_avatars(commands: &mut Commands, hud: Entity, player_sheet: Handle
                 Visibility::Hidden,
                 Pickable::IGNORE,
             ));
+            let mut timer_node = Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(17.0),
+                width: Val::Px(GRID_BLOCK_SIZE),
+                justify_content: JustifyContent::Center,
+                ..default()
+            };
+            if owner == PlayerId::One {
+                timer_node.left = Val::Px(4.0 * GRID_BLOCK_SIZE);
+            } else {
+                timer_node.right = Val::Px(4.0 * GRID_BLOCK_SIZE);
+            }
+            parent.spawn((
+                online_game::TurnTimer(owner),
+                Text::default(),
+                TextFont {
+                    font_size: FontSize::Px(20.0),
+                    ..default()
+                },
+                TextLayout::justify(Justify::Center),
+                TextColor(Color::srgb(0.1, 0.07, 0.04)),
+                timer_node,
+                Visibility::Hidden,
+                Pickable::IGNORE,
+            ));
         }
     });
 }
@@ -2973,20 +2998,23 @@ struct ActionOutput<'w, 's> {
     events: Option<ResMut<'w, headless::MatchEvents>>,
 }
 
+type ActionInput<'w> = (
+    Res<'w, ButtonInput<MouseButton>>,
+    Res<'w, BoardCursor>,
+    Option<Res<'w, ai::BotController>>,
+    Option<Res<'w, headless::TimeoutRest>>,
+);
+
 fn handle_actions(
     mut commands: Commands,
-    input: (
-        Res<ButtonInput<MouseButton>>,
-        Res<BoardCursor>,
-        Option<Res<ai::BotController>>,
-    ),
+    input: ActionInput,
     game: (ResMut<TurnState>, ResMut<Board>, ResMut<PlayerHealth>),
     mut selection: ResMut<Selection>,
     players: Query<(&Player, &Transform)>,
     collectibles: Query<(Entity, &Collectible, Option<&Visibility>)>,
     output: ActionOutput,
 ) {
-    let (mouse, cursor, bot) = input;
+    let (mouse, cursor, bot, timeout_rest) = input;
     let (mut turn, mut board, mut health) = game;
     let ActionOutput {
         mut feedback,
@@ -3104,7 +3132,13 @@ fn handle_actions(
         return;
     }
     if action == Action::Rest.row() {
-        match finish_rest(&mut turn, &mut board, &mut health, &players) {
+        match finish_rest(
+            &mut turn,
+            &mut board,
+            &mut health,
+            &players,
+            timeout_rest.is_some(),
+        ) {
             Ok(()) => {
                 if bot_turn && let Some(history) = &mut history {
                     history.add("Computer rested".into(), None);
@@ -6719,7 +6753,7 @@ fn rest(
         && !turn.animation_active()
         && !turn.pending_placement.as_ref().is_some_and(|p| p.ready)
     {
-        match finish_rest(&mut turn, &mut board, &mut health, &players) {
+        match finish_rest(&mut turn, &mut board, &mut health, &players, false) {
             Ok(()) => {
                 clear_selection(&mut commands, &mut selection);
                 sound::request(&mut sounds, sound::Cue::Chime);
@@ -6739,14 +6773,18 @@ fn finish_rest(
     board: &mut Board,
     health: &mut PlayerHealth,
     players: &Query<(&Player, &Transform)>,
+    timeout: bool,
 ) -> Result<(), &'static str> {
     assert!(
         players.iter().any(|(player, _)| player.0 == turn.active),
         "active player must exist"
     );
-    if players.iter().any(|(player, transform)| {
-        player.0 == turn.active && must_land(turn, board, transform.translation.truncate())
-    }) {
+    // A timeout must end the turn; finish_action preserves magic over unsafe terrain.
+    if !timeout
+        && players.iter().any(|(player, transform)| {
+            player.0 == turn.active && must_land(turn, board, transform.translation.truncate())
+        })
+    {
         return Err("Land on safe ground before magic runs out");
     }
     if let Some(pending) = &mut turn.pending_placement {

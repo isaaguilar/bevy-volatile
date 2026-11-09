@@ -14,6 +14,30 @@ pub struct HeadlessMatch {
     history: Vec<HistoryEntry>,
 }
 
+#[derive(Resource)]
+pub(crate) struct TimeoutRest;
+
+pub fn animation_duration(animation: &Animation) -> f32 {
+    match animation {
+        Animation::MovePlayer { .. } => 0.0,
+        Animation::Throw { .. } => ITEM_FLIGHT_SECONDS,
+        Animation::Effect { .. } => effects::DURATION,
+        Animation::Serpents { .. } | Animation::Aquatic { .. } => 0.0,
+        Animation::Weather { .. } => WEATHER_ANIMATION_SECONDS,
+    }
+}
+
+pub fn animation_playback_duration(events: &[AnimationEvent]) -> Duration {
+    events
+        .iter()
+        .map(|event| {
+            Duration::from_millis(u64::from(event.at_ms))
+                + Duration::from_secs_f32(animation_duration(&event.animation))
+        })
+        .max()
+        .unwrap_or_default()
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct MatchEvents {
     entries: Vec<HistoryEntry>,
@@ -99,6 +123,18 @@ struct ActionState {
 }
 
 impl HeadlessMatch {
+    pub fn active_seat(&self) -> Seat {
+        if self.app.world().resource::<TurnState>().active == PlayerId::One {
+            Seat::Host
+        } else {
+            Seat::Guest
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.app.world().resource::<PlayerHealth>().0.contains(&0)
+    }
+
     pub fn new(seed: [u8; 8]) -> Self {
         let mut app = App::new();
         app.add_plugins(EntropyPlugin::<WyRand>::with_seed(seed))
@@ -312,6 +348,22 @@ impl HeadlessMatch {
     }
 
     pub fn perform(&mut self, seat: Seat, action: GameAction) -> Result<(), String> {
+        self.perform_inner(seat, action, false)
+    }
+
+    pub fn timeout_rest(&mut self, seat: Seat) -> Result<(), String> {
+        self.app.world_mut().insert_resource(TimeoutRest);
+        let result = self.perform_inner(seat, GameAction::Rest, true);
+        self.app.world_mut().remove_resource::<TimeoutRest>();
+        result
+    }
+
+    fn perform_inner(
+        &mut self,
+        seat: Seat,
+        action: GameAction,
+        timed_out: bool,
+    ) -> Result<(), String> {
         let world = self.app.world_mut();
         let start = world.resource::<Time>().elapsed();
         world.resource_mut::<Time>().advance_by(Duration::ZERO);
@@ -396,7 +448,18 @@ impl HeadlessMatch {
                     (items.len() == 1).then(|| items[0].ingredient),
                 )
             }
-            GameAction::Rest => (format!("rested at {}", history::cell_label(position)), None),
+            GameAction::Rest => (
+                format!(
+                    "{}rested at {}",
+                    if timed_out {
+                        "ran out of time and "
+                    } else {
+                        ""
+                    },
+                    history::cell_label(position)
+                ),
+                None,
+            ),
             GameAction::Undo => ("undid the previous action".into(), None),
             GameAction::ToggleHover => (
                 format!(
@@ -851,6 +914,61 @@ mod tests {
         assert!(sounds.contains(&SoundEffect::Water));
         assert!(sounds.contains(&SoundEffect::Chime));
         assert!(game.take_sounds().is_empty());
+    }
+
+    #[test]
+    fn timeout_rest_uses_full_or_partial_rest_and_resolves_queued_items() {
+        let mut full = HeadlessMatch::new([7; 8]);
+        full.app.world_mut().resource_mut::<TurnState>().strength[0] = 1;
+        full.timeout_rest(Seat::Host).unwrap();
+        let view = full.view(Seat::Host);
+        assert_eq!(view.active, Seat::Guest);
+        assert_eq!(view.players[0].energy, MAX_STRENGTH);
+        assert!(
+            full.history()
+                .iter()
+                .any(|entry| entry.text.contains("ran out of time"))
+        );
+
+        let mut partial = HeadlessMatch::new([7; 8]);
+        partial.app.world_mut().resource_mut::<TurnState>().strength[0] = 1;
+        let cell = PLAYER_STARTS[0];
+        partial
+            .perform(
+                Seat::Host,
+                GameAction::Place {
+                    ingredient: WATER_ITEM_INDEX,
+                    x: cell.x,
+                    y: cell.y,
+                },
+            )
+            .unwrap();
+        partial.timeout_rest(Seat::Host).unwrap();
+        let view = partial.view(Seat::Host);
+        assert_eq!(view.active, Seat::Guest);
+        assert_eq!(view.players[0].energy, 1 + PARTIAL_REST_RECOVERY);
+        assert!(view.pending_item.is_none());
+        assert!(partial.app.world().resource::<Board>().is_water(cell));
+    }
+
+    #[test]
+    fn timeout_rest_can_end_an_unsafe_hover_turn_without_stranding_the_match() {
+        let mut game = HeadlessMatch::new([7; 8]);
+        game.app
+            .world_mut()
+            .resource_mut::<Board>()
+            .set(PLAYER_STARTS[0], Ground::Hole);
+        {
+            let mut turn = game.app.world_mut().resource_mut::<TurnState>();
+            turn.hovering[0] = true;
+            turn.magic[0] = 1;
+        }
+        assert!(game.perform(Seat::Host, GameAction::Rest).is_err());
+        game.timeout_rest(Seat::Host).unwrap();
+        let view = game.view(Seat::Host);
+        assert_eq!(view.active, Seat::Guest);
+        assert!(view.players[0].hovering);
+        assert_eq!(view.players[0].magic, 1);
     }
 
     #[test]

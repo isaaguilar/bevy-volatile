@@ -174,6 +174,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             lobby.lock().await.expire();
         }
     });
+    let lobby = state.lobby.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let lobby = lobby.clone();
+            if let Err(error) =
+                tokio::task::spawn_blocking(move || lobby.blocking_lock().tick()).await
+            {
+                eprintln!("turn timer failed: {error}");
+            }
+        }
+    });
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!("volatile lobby listening on {address}");
     let app = Router::new().route("/ws", get(upgrade)).with_state(state);

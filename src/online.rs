@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use volatile_online_protocol::{
     AnimationEvent, ClientMessage, HistoryEntry, MatchView, RoomInfo, Seat, ServerMessage,
-    SoundEffect,
+    SoundEffect, TurnClock,
 };
 
 #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
@@ -34,6 +34,8 @@ pub(crate) struct Online {
     sounds: Vec<SoundEffect>,
     pub(crate) animations: Vec<Vec<AnimationEvent>>,
     pub(crate) history: Vec<HistoryEntry>,
+    pub(crate) turn_clock: Option<TurnClock>,
+    pub(crate) clock_generation: u64,
     rejected_action: bool,
 }
 
@@ -64,6 +66,8 @@ impl Default for Online {
             sounds: Vec::new(),
             animations: Vec::new(),
             history: Vec::new(),
+            turn_clock: None,
+            clock_generation: 0,
             rejected_action: false,
         }
     }
@@ -126,6 +130,7 @@ impl Online {
                 state,
                 sounds,
                 animations,
+                turn_clock,
                 history_start,
                 history,
             } => {
@@ -163,6 +168,8 @@ impl Online {
                         }
                     }
                     self.game = Some(OnlineMatch { revision, state });
+                    self.turn_clock = turn_clock;
+                    self.clock_generation = self.clock_generation.wrapping_add(1);
                     self.pending = false;
                     self.status.clear();
                 }
@@ -171,6 +178,7 @@ impl Online {
                 let was_playing = self.game.take().is_some();
                 self.animations.clear();
                 self.history.clear();
+                self.turn_clock = None;
                 let was_starting = self.pending && !self.reconnecting;
                 self.pending = false;
                 if was_playing || was_starting {
@@ -201,6 +209,7 @@ impl Online {
         self.sounds.clear();
         self.animations.clear();
         self.history.clear();
+        self.turn_clock = None;
         self.rejected_action = false;
     }
 }
@@ -231,6 +240,12 @@ pub(crate) fn plugin(app: &mut App) {
             play_gameplay_sounds.before(crate::menu::GameplaySystems),
         )
         .add_systems(Update, crate::online_game::update_side_avatars);
+    app.add_systems(
+        Update,
+        crate::online_game::update_turn_timer
+            .after(crate::online_game::play_animations)
+            .after(crate::online_game::apply_snapshot),
+    );
     #[cfg(target_family = "wasm")]
     app.insert_non_send(browser::Transport::default())
         .add_systems(
@@ -503,6 +518,7 @@ mod tests {
             state: view.clone(),
             sounds,
             animations: Vec::new(),
+            turn_clock: None,
             history_start: 0,
             history: Vec::new(),
         };
@@ -530,6 +546,40 @@ mod tests {
     }
 
     #[test]
+    fn clock_resynchronizes_on_same_revision_and_ignores_stale_snapshots() {
+        let mut engine = crate::headless::HeadlessMatch::new([7; 8]);
+        let view = engine.view(Seat::Host);
+        let mut online = Online {
+            room_id: Some("room".into()),
+            ..default()
+        };
+        let snapshot = |revision, remaining_ms, running| ServerMessage::MatchState {
+            room_id: "room".into(),
+            revision,
+            state: view.clone(),
+            sounds: vec![],
+            animations: vec![],
+            turn_clock: Some(TurnClock {
+                remaining_ms,
+                starts_in_ms: 0,
+                running,
+            }),
+            history_start: 0,
+            history: vec![],
+        };
+        online.receive(snapshot(1, 25_000, true));
+        let generation = online.clock_generation;
+        online.receive(snapshot(1, 20_000, false));
+        assert_ne!(online.clock_generation, generation);
+        assert_eq!(online.turn_clock.as_ref().unwrap().remaining_ms, 20_000);
+        assert!(!online.turn_clock.as_ref().unwrap().running);
+        online.receive(snapshot(0, 30_000, true));
+        assert_eq!(online.turn_clock.as_ref().unwrap().remaining_ms, 20_000);
+        online.clear_room();
+        assert!(online.turn_clock.is_none());
+    }
+
+    #[test]
     fn animation_events_are_queued_once_and_cleared_on_room_exit() {
         use volatile_online_protocol::{Animation, AnimationEvent, VisualEffect};
 
@@ -553,6 +603,7 @@ mod tests {
             state: view.clone(),
             sounds: vec![],
             animations,
+            turn_clock: None,
             history_start: 0,
             history: Vec::new(),
         };
@@ -587,6 +638,7 @@ mod tests {
             state: view.clone(),
             sounds: vec![],
             animations: vec![],
+            turn_clock: None,
             history_start,
             history,
         };

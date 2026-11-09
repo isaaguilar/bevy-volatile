@@ -68,16 +68,6 @@ fn valid_cell((x, y): (i32, i32)) -> bool {
     (0..COLUMNS as i32).contains(&x) && (0..ROWS as i32).contains(&y)
 }
 
-fn animation_duration(animation: &Animation) -> f32 {
-    match animation {
-        Animation::MovePlayer { .. } => 0.0,
-        Animation::Throw { .. } => ITEM_FLIGHT_SECONDS,
-        Animation::Effect { .. } => effects::DURATION,
-        Animation::Serpents { .. } | Animation::Aquatic { .. } => 0.0,
-        Animation::Weather { .. } => WEATHER_ANIMATION_SECONDS,
-    }
-}
-
 fn valid_animation(event: &AnimationEvent) -> bool {
     event.at_ms <= 256_000
         && match &event.animation {
@@ -165,7 +155,7 @@ pub(crate) fn play_animations(
             let at = start + event.at_ms as f32 / 1000.0;
             playback.until = playback
                 .until
-                .max(at + animation_duration(&event.animation));
+                .max(at + headless::animation_duration(&event.animation));
             playback.scheduled.push_back((at, event.animation));
         }
     }
@@ -281,7 +271,7 @@ pub(crate) fn play_animations(
     }
     for (entity, animation, mut sprite, mut transform) in &mut sprites {
         let elapsed = (playback.elapsed - animation.start).max(0.0);
-        if elapsed >= animation_duration(&animation.kind) {
+        if elapsed >= headless::animation_duration(&animation.kind) {
             commands.entity(entity).despawn();
             continue;
         }
@@ -328,6 +318,63 @@ pub(crate) struct TurnIndicator;
 
 #[derive(Component)]
 pub(crate) struct SideAvatar;
+
+#[derive(Component)]
+pub(crate) struct TurnTimer(pub PlayerId);
+
+#[derive(Default)]
+pub(crate) struct DisplayClock {
+    generation: Option<u64>,
+    observed: std::time::Duration,
+}
+
+pub(crate) fn update_turn_timer(
+    time: Res<Time<Real>>,
+    frontend: Res<menu::Frontend>,
+    online: Res<online::Online>,
+    applied: Res<AppliedMatch>,
+    playback: Res<AnimationPlayback>,
+    mut display: Local<DisplayClock>,
+    mut timers: Query<(&TurnTimer, &mut Text, &mut Visibility)>,
+) {
+    if display.generation != Some(online.clock_generation) {
+        display.generation = Some(online.clock_generation);
+        display.observed = time.elapsed();
+    }
+    let remaining = online.turn_clock.as_ref().map(|clock| {
+        let elapsed = if clock.running {
+            time.elapsed()
+                .saturating_sub(display.observed)
+                .as_millis()
+                .saturating_sub(u128::from(clock.starts_in_ms))
+        } else {
+            0
+        };
+        u128::from(clock.remaining_ms).saturating_sub(elapsed)
+    });
+    for (timer, mut text, mut visibility) in &mut timers {
+        let active = online.game.as_ref().is_some_and(|game| {
+            timer.0
+                == if game.state.active == Seat::Host {
+                    PlayerId::One
+                } else {
+                    PlayerId::Two
+                }
+        });
+        if frontend.online_game()
+            && online.connection == online::Connection::Connected
+            && applied.is_current(&online)
+            && !playback.active()
+            && active
+            && let Some(remaining) = remaining
+        {
+            text.0 = format!("{}s", remaining.div_ceil(1000));
+            *visibility = Visibility::Visible;
+        } else {
+            *visibility = Visibility::Hidden;
+        }
+    }
+}
 
 pub(crate) fn update_side_avatars(
     frontend: Res<menu::Frontend>,
@@ -1124,6 +1171,102 @@ mod tests {
         assert_eq!(avatars[0].1.height, avatars[0].1.width);
         assert_eq!(avatars[1].1.width, avatars[0].1.width);
         assert_eq!(avatars[1].1.height, avatars[0].1.height);
+    }
+
+    #[test]
+    fn turn_timer_displays_only_the_active_seat_and_pauses() {
+        use volatile_online_protocol::TurnClock;
+
+        let mut game = headless::HeadlessMatch::new([7; 8]);
+        let mut app = client(&mut game, Seat::Host);
+        app.init_resource::<Time<Real>>()
+            .add_systems(Update, update_turn_timer);
+        let hud = app.world().resource::<Hud>().0;
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                spawn_side_avatars(&mut commands, hud, Handle::default());
+            })
+            .unwrap();
+        {
+            let mut online = app.world_mut().resource_mut::<online::Online>();
+            online.turn_clock = Some(TurnClock {
+                remaining_ms: 30_000,
+                starts_in_ms: 2_000,
+                running: true,
+            });
+            online.clock_generation += 1;
+        }
+        app.update();
+        let timers = |app: &mut App| {
+            let world = app.world_mut();
+            world
+                .query::<(&TurnTimer, &Text, &Visibility, &Node)>()
+                .iter(world)
+                .map(|(timer, text, visibility, node)| {
+                    (timer.0, text.0.clone(), *visibility, node.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let initial = timers(&mut app);
+        let host = initial
+            .iter()
+            .find(|timer| timer.0 == PlayerId::One)
+            .unwrap();
+        let guest = initial
+            .iter()
+            .find(|timer| timer.0 == PlayerId::Two)
+            .unwrap();
+        assert_eq!((host.1.as_str(), host.2), ("30s", Visibility::Visible));
+        assert_eq!(guest.2, Visibility::Hidden);
+        assert_eq!(host.3.left, Val::Px(4.0 * GRID_BLOCK_SIZE));
+        assert_eq!(guest.3.right, Val::Px(4.0 * GRID_BLOCK_SIZE));
+
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .advance_by(std::time::Duration::from_secs(3));
+        app.update();
+        assert_eq!(
+            timers(&mut app)
+                .iter()
+                .find(|timer| timer.0 == PlayerId::One)
+                .unwrap()
+                .1,
+            "29s"
+        );
+        {
+            let mut online = app.world_mut().resource_mut::<online::Online>();
+            online.game.as_mut().unwrap().state.active = Seat::Guest;
+            online.turn_clock = Some(TurnClock {
+                remaining_ms: 12_000,
+                starts_in_ms: 0,
+                running: false,
+            });
+            online.clock_generation += 1;
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .advance_by(std::time::Duration::from_secs(5));
+        app.update();
+        let paused = timers(&mut app);
+        let host = paused
+            .iter()
+            .find(|timer| timer.0 == PlayerId::One)
+            .unwrap();
+        let guest = paused
+            .iter()
+            .find(|timer| timer.0 == PlayerId::Two)
+            .unwrap();
+        assert_eq!(host.2, Visibility::Hidden);
+        assert_eq!((guest.1.as_str(), guest.2), ("12s", Visibility::Visible));
+        app.world_mut().resource_mut::<online::Online>().connection =
+            online::Connection::Disconnected;
+        app.update();
+        assert!(
+            timers(&mut app)
+                .iter()
+                .all(|timer| timer.2 == Visibility::Hidden)
+        );
     }
 
     fn client_unstarted(game: &mut headless::HeadlessMatch, seat: Seat) -> App {
